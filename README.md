@@ -1,4 +1,4 @@
-# Blindspot monitoring
+  # Blindspot Monitor Camera System
 
 A multi-camera blindspot monitoring system optimized for Raspberry Pi, designed for blind-spot monitoring on cargo vehicles. Features real-time video streaming with GStreamer acceleration, dynamic performance tuning, hot-plug support.
 
