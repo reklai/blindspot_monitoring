@@ -29,6 +29,40 @@ fi
 
 SUDO_USER="${SUDO_USER:-$(whoami)}"
 
+# ---------- 0b) power settings ----------
+
+# echo_section "0b) Configuring USB and PSU current"
+
+CONFIG_TXT="/boot/firmware/config.txt"
+if [[ -f "$CONFIG_TXT" ]]; then
+  sed -i "/^usb_max_current_enable=/d" "$CONFIG_TXT"
+  if grep -q "^auto_initramfs" "$CONFIG_TXT"; then
+    sed -i "/^auto_initramfs/ a usb_max_current_enable=1" "$CONFIG_TXT"
+    echo "Added usb_max_current_enable=1 under auto_initramfs"
+  else
+    echo "usb_max_current_enable=1" >> "$CONFIG_TXT"
+    echo "Added usb_max_current_enable=1 to config.txt"
+  fi
+else
+  echo "Warning: $CONFIG_TXT not found; skipping usb_max_current_enable"
+fi
+
+if command -v rpi-eeprom-config >/dev/null 2>&1; then
+  EEPROM_TMP="$(mktemp)"
+  rpi-eeprom-config > "$EEPROM_TMP"
+  if grep -q "^PSU_MAX_CURRENT=" "$EEPROM_TMP"; then
+    sed -i "s/^PSU_MAX_CURRENT=.*/PSU_MAX_CURRENT=5000/" "$EEPROM_TMP"
+    echo "Updated PSU_MAX_CURRENT=5000 in EEPROM config"
+  else
+    echo "PSU_MAX_CURRENT=5000" >> "$EEPROM_TMP"
+    echo "Added PSU_MAX_CURRENT=5000 to EEPROM config"
+  fi
+  rpi-eeprom-config --apply "$EEPROM_TMP"
+  rm -f "$EEPROM_TMP"
+else
+  echo "Warning: rpi-eeprom-config not available; skipping PSU_MAX_CURRENT"
+fi
+
 echo_section() {
   echo
   echo "========================================"
