@@ -37,11 +37,16 @@ CONFIG_TXT="/boot/firmware/config.txt"
 if [[ -f "$CONFIG_TXT" ]]; then
   sed -i "/^usb_max_current_enable=/d" "$CONFIG_TXT"
   if grep -q "^auto_initramfs" "$CONFIG_TXT"; then
-    sed -i "/^auto_initramfs/ a usb_max_current_enable=1" "$CONFIG_TXT"
-    echo "Added usb_max_current_enable=1 under auto_initramfs"
+    sed -i "/^auto_initramfs/ a usb_max_current_enable=1\ndtoverlay=disable-wifi\ndtoverlay=disable-bt\ndtoverlay=vc4-kms-v3d,noaudio" "$CONFIG_TXT"
+    echo "Added usb_max_current_enable=1 and dtoverlays under auto_initramfs"
   else
-    echo "usb_max_current_enable=1" >> "$CONFIG_TXT"
-    echo "Added usb_max_current_enable=1 to config.txt"
+    cat >> "$CONFIG_TXT" <<EOF
+usb_max_current_enable=1
+dtoverlay=disable-wifi
+dtoverlay=disable-bt
+dtoverlay=vc4-kms-v3d,noaudio
+EOF
+    echo "Added usb_max_current_enable=1 and dtoverlays to config.txt"
   fi
 else
   echo "Warning: $CONFIG_TXT not found; skipping usb_max_current_enable"
