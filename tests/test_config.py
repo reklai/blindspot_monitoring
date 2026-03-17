@@ -142,7 +142,7 @@ class TestChooseProfile:
         assert len(result) == 4
 
     def test_choose_profile_values(self, save_restore_config):
-        """Test choose_profile returns configured values with dynamic scaling."""
+        """Test choose_profile returns configured values without camera-count scaling."""
         # Set known values
         config.PROFILE_CAPTURE_WIDTH = 640
         config.PROFILE_CAPTURE_HEIGHT = 480
@@ -158,19 +158,19 @@ class TestChooseProfile:
         assert fps == 20
         assert ui_fps == 15
         
-        # Test with 3 cameras (slight fps reduction, 90% scale)
+        # Test with 3 cameras (same configured values; runtime dynamic FPS handles load)
         w, h, fps, ui_fps = config.choose_profile(3)
-        assert w == 640  # Resolution stays same for 2-3 cameras
+        assert w == 640
         assert h == 480
-        assert fps == 18  # 20 * 0.9 = 18
-        assert ui_fps == 13  # 15 * 0.9 = 13.5 -> 13
+        assert fps == 20
+        assert ui_fps == 15
         
-        # Test with 6 cameras (significant scaling, 50% res, 60% fps)
+        # Test with 6 cameras (same configured values; runtime dynamic FPS handles load)
         w, h, fps, ui_fps = config.choose_profile(6)
-        assert w == 320  # 640 * 0.5 = 320
-        assert h == 240  # 480 * 0.5 = 240
-        assert fps == 12  # 20 * 0.6 = 12
-        assert ui_fps == 10  # 15 * 0.6 = 9 -> clamped to MIN_DYNAMIC_UI_FPS (10)
+        assert w == 640
+        assert h == 480
+        assert fps == 20
+        assert ui_fps == 15
 
 
 class TestConfigDefaults:
