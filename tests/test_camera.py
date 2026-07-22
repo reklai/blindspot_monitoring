@@ -8,6 +8,19 @@ from unittest.mock import MagicMock, patch, PropertyMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_by_path(tmp_path, monkeypatch):
+    """Point BY_PATH_DIR at a nonexistent tmp path for every test in this
+    module, so tests that (transitively, via find_working_cameras) touch
+    /dev/v4l/by-path stay environment-independent instead of reading
+    whatever real by-path tree happens to exist on the machine running
+    them."""
+    import core.camera as camera_module
+
+    monkeypatch.setattr(camera_module, "BY_PATH_DIR", str(tmp_path / "does-not-exist"))
+    monkeypatch.setattr(camera_module, "_by_path_degraded_warned", False)
+
+
 class TestGetVideoIndexes:
     """Test video device index discovery."""
 

@@ -639,9 +639,11 @@ def list_by_path_nodes(
     Returns {port_path: [(video_index, entry_name), ...]}, each group's
     nodes sorted ascending by index. A port_path is a by-path entry name
     with its trailing "-video-indexN" suffix stripped. Entries that don't
-    match that naming pattern, or whose resolved target isn't a
-    /dev/videoN node, are skipped. A missing/unreadable directory (or one
-    with no matching entries) returns {}.
+    match that naming pattern, whose resolved target isn't a /dev/videoN
+    node, or whose resolved target doesn't exist (a dangling symlink --
+    the device was unplugged but the by-path node hasn't been cleaned up
+    yet), are skipped. A missing/unreadable directory (or one with no
+    matching entries) returns {}.
 
     `by_path_dir=None` means "use BY_PATH_DIR", read from the module
     attribute at call time so tests can monkeypatch it.
@@ -659,6 +661,8 @@ def list_by_path_nodes(
             continue
         port_path = match.group(1)
         resolved = os.path.realpath(os.path.join(directory, name))
+        if not os.path.exists(resolved):
+            continue
         node_match = re.search(r"video(\d+)$", resolved)
         if not node_match:
             continue

@@ -80,6 +80,23 @@ class TestListByPathNodes:
 
         assert list_by_path_nodes(str(tmp_path / "does-not-exist")) == {}
 
+    def test_dangling_symlink_is_skipped(self, fake_by_path):
+        """A by-path entry whose realpath target doesn't exist (device was
+        unplugged but the symlink hasn't been cleaned up yet) must be
+        skipped rather than surfaced as a phantom camera group."""
+        by_path_dir = fake_by_path["by_path_dir"]
+        dev_dir = fake_by_path["dev_dir"]
+
+        # Symlink to a video node that was never created (dangling target),
+        # named so it still matches the "-video-indexN" pattern.
+        (by_path_dir / f"{PORT_A}-video-index0").symlink_to(dev_dir / "video0")
+
+        from core.camera import list_by_path_nodes
+
+        groups = list_by_path_nodes(str(by_path_dir))
+
+        assert groups == {}
+
 
 class TestTestIdentity:
     """Requirements 2-3: metadata-node dedupe and lowest-index-wins."""
