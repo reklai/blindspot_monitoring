@@ -10,6 +10,7 @@ from __future__ import annotations
 import configparser
 import logging
 import os
+import re
 import sys
 from logging.handlers import RotatingFileHandler
 from typing import Any, Callable, NamedTuple, Optional
@@ -67,6 +68,11 @@ FAILED_CAMERA_COOLDOWN_SEC = 30.0
 CAMERA_SLOT_COUNT = 3
 HEALTH_LOG_INTERVAL_SEC = 30.0
 KILL_DEVICE_HOLDERS = True
+
+# Optional [slots] pinning: {slot_index: pin_substring}. Parsed by
+# _parse_slot_pins(); consumed by core.camera's assign_slots /
+# choose_slot_for_identity. Empty when no [slots] section is configured.
+SLOT_PINS: dict[int, str] = {}
 
 PROFILE_CAPTURE_WIDTH = 640
 PROFILE_CAPTURE_HEIGHT = 480
@@ -136,6 +142,51 @@ def _as_float(
     if max_value is not None:
         parsed = min(max_value, parsed)
     return parsed
+
+
+def _parse_slot_pins(parser: configparser.ConfigParser) -> dict[int, str]:
+    """Parse the optional [slots] pinning section into {slot_index: pin}.
+
+    Keys must fullmatch `slot(\\d+)` with the index in
+    [0, CAMERA_SLOT_COUNT - 1] (the already-applied value: call this
+    AFTER the table loop has finalized CAMERA_SLOT_COUNT). Values are
+    stripped and must be non-empty. Invalid key format, an out-of-range
+    index, or an empty value are skipped with a warning. Two different
+    slots pinned to the identical value are both kept (matching is
+    resolved at assignment time), but logged since only one can actually
+    match a camera.
+    """
+    pins: dict[int, str] = {}
+    if not parser.has_section("slots"):
+        return pins
+
+    slot_by_value: dict[str, int] = {}
+    for key, raw_value in parser.items("slots"):
+        match = re.fullmatch(r"slot(\d+)", key)
+        if not match:
+            logging.warning("Ignoring [slots] key %r: expected 'slotN'", key)
+            continue
+        index = int(match.group(1))
+        if not (0 <= index < CAMERA_SLOT_COUNT):
+            logging.warning(
+                "Ignoring [slots] key %r: index out of range [0, %d)",
+                key, CAMERA_SLOT_COUNT,
+            )
+            continue
+        value = raw_value.strip()
+        if not value:
+            logging.warning("Ignoring [slots] key %r: empty value", key)
+            continue
+        if value in slot_by_value:
+            logging.warning(
+                "slot%d and slot%d are both pinned to %r; only one can match a camera",
+                slot_by_value[value], index, value,
+            )
+        else:
+            slot_by_value[value] = index
+        pins[index] = value
+
+    return pins
 
 
 def load_config(path: Optional[str] = None) -> configparser.ConfigParser:
@@ -217,7 +268,7 @@ def apply_config(parser: configparser.ConfigParser) -> None:
     # LOG_LEVEL/LOG_FILE are raw string passthroughs (no converter), so they
     # stay outside the table and need the `global` statement for direct
     # assignment. The table loop below assigns via globals()[...] instead.
-    global LOG_LEVEL, LOG_FILE
+    global LOG_LEVEL, LOG_FILE, SLOT_PINS
 
     if parser.has_section("logging"):
         LOG_LEVEL = parser.get("logging", "level", fallback=LOG_LEVEL)
@@ -235,6 +286,11 @@ def apply_config(parser: configparser.ConfigParser) -> None:
                 raw, current, min_value=entry.min_value, max_value=entry.max_value
             )
         globals()[entry.global_name] = value
+
+    # SLOT_PINS is a custom parser (not a converter table row) that must
+    # run AFTER the loop above so CAMERA_SLOT_COUNT is final; always
+    # assigned as a fresh dict, never mutated in place.
+    SLOT_PINS = _parse_slot_pins(parser)
 
     if LOG_FILE_ENV:
         LOG_FILE = LOG_FILE_ENV

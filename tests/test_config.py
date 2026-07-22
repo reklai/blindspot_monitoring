@@ -3,6 +3,7 @@ Tests for core/config.py - Configuration parsing and validation.
 """
 
 import configparser
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -159,6 +160,119 @@ class TestChooseProfile:
             assert h == 480
             assert fps == 20
             assert ui_fps == 15
+
+
+class TestSlotPins:
+    """Test [slots] pinning section parsing into config.SLOT_PINS."""
+
+    def test_valid_pins_parsed(self, tmp_path, save_restore_config):
+        """Valid slotN keys are parsed into an int-keyed dict."""
+        config_file = tmp_path / "test.ini"
+        config_file.write_text(
+            """
+[camera]
+slot_count = 3
+
+[slots]
+slot0 = usb-0:1.1
+slot1 = usb-0:1.2
+"""
+        )
+        parser = config.load_config(str(config_file))
+        config.apply_config(parser)
+
+        assert config.SLOT_PINS == {0: "usb-0:1.1", 1: "usb-0:1.2"}
+
+    def test_absent_section_yields_empty_dict(self, tmp_path, save_restore_config):
+        """No [slots] section at all -> SLOT_PINS is {}."""
+        config_file = tmp_path / "test.ini"
+        config_file.write_text(
+            """
+[camera]
+slot_count = 3
+"""
+        )
+        parser = config.load_config(str(config_file))
+        config.apply_config(parser)
+
+        assert config.SLOT_PINS == {}
+
+    def test_invalid_key_format_skipped_with_warning(self, tmp_path, save_restore_config, caplog):
+        """A key that doesn't fullmatch 'slot(\\d+)' is skipped and warned."""
+        config_file = tmp_path / "test.ini"
+        config_file.write_text(
+            """
+[camera]
+slot_count = 3
+
+[slots]
+slotx = usb-0:1.1
+"""
+        )
+        parser = config.load_config(str(config_file))
+        with caplog.at_level(logging.WARNING):
+            config.apply_config(parser)
+
+        assert config.SLOT_PINS == {}
+        assert any("slotx" in r.getMessage() for r in caplog.records)
+
+    def test_out_of_range_index_skipped_with_warning(self, tmp_path, save_restore_config, caplog):
+        """A slot index beyond CAMERA_SLOT_COUNT - 1 is skipped and warned."""
+        config_file = tmp_path / "test.ini"
+        config_file.write_text(
+            """
+[camera]
+slot_count = 3
+
+[slots]
+slot99 = usb-0:1.1
+"""
+        )
+        parser = config.load_config(str(config_file))
+        with caplog.at_level(logging.WARNING):
+            config.apply_config(parser)
+
+        assert config.SLOT_PINS == {}
+        assert any("slot99" in r.getMessage() for r in caplog.records)
+
+    def test_empty_value_skipped_with_warning(self, tmp_path, save_restore_config, caplog):
+        """An empty (whitespace-only) value is skipped and warned."""
+        config_file = tmp_path / "test.ini"
+        config_file.write_text(
+            """
+[camera]
+slot_count = 3
+
+[slots]
+slot0 =
+"""
+        )
+        parser = config.load_config(str(config_file))
+        with caplog.at_level(logging.WARNING):
+            config.apply_config(parser)
+
+        assert config.SLOT_PINS == {}
+        assert any("slot0" in r.getMessage() for r in caplog.records)
+
+    def test_repeated_apply_config_produces_fresh_dict(self, tmp_path, save_restore_config):
+        """apply_config never mutates the previous SLOT_PINS dict in place."""
+        config_file = tmp_path / "test.ini"
+        config_file.write_text(
+            """
+[camera]
+slot_count = 3
+
+[slots]
+slot0 = usb-0:1.1
+"""
+        )
+        parser = config.load_config(str(config_file))
+        config.apply_config(parser)
+
+        config.SLOT_PINS["slot1"] = "mutated-in-place"  # mutate the returned dict
+        config.apply_config(parser)
+
+        assert config.SLOT_PINS == {0: "usb-0:1.1"}
 
 
 class TestConfigDefaults:
