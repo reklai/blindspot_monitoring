@@ -20,14 +20,67 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import QTimer
 
 from core import (
+    CameraIdentity,
+    assign_slots,
+    choose_slot_for_identity,
     config,
-    find_working_cameras,
-    get_video_indexes,
+    discover_camera_identities,
+    find_working_camera_identities,
     is_system_stressed,
     test_single_camera,
 )
 from ui import CameraWidget, get_smart_grid
 from utils import log_health_summary
+
+
+def _plan_rescan_attachments(
+    results: list[tuple[CameraIdentity, Optional[int]]],
+    free_slot_indexes: list[int],
+    pins: dict[int, str],
+    last_slot_by_port: dict[str, int],
+    active_ports: set[str],
+    failed_ports: dict[str, float],
+    now: float,
+) -> list[tuple[CameraIdentity, int]]:
+    """Decide which probed identity attaches to which slot (pure-ish planner).
+
+    Consumes `results` (each a (CameraIdentity, resolved_index_or_None)
+    from a rescan probe) and returns the list of (identity, slot_index)
+    attachments the Qt side should perform, in order. Bookkeeping is
+    applied in place so the closure only has to do the Qt attach:
+      - a successful probe that wins a slot: `active_ports.add(port)`,
+        `last_slot_by_port[port] = slot`, `failed_ports.pop(port, None)`;
+      - a failed probe (index is None): `failed_ports[port] = now`;
+      - a successful probe with NO slot available (all free slots are
+        pinned to other ports): SKIPPED, NOT failed -- a reserved-slot
+        wait is not a failure, so the camera is retried next tick;
+      - a port already in `active_ports`: skipped defensively.
+
+    Slot choice per identity goes through `choose_slot_for_identity`
+    (pinned-slot > last-slot memory > lowest free unpinned > None). Free
+    slots are consumed as they are assigned so a batch never double-books
+    a slot.
+    """
+    free = sorted(free_slot_indexes)
+    attachments: list[tuple[CameraIdentity, int]] = []
+    for identity, resolved_index in results:
+        port = identity.port_path
+        if resolved_index is None:
+            failed_ports[port] = now
+            continue
+        if port in active_ports:
+            continue
+        slot = choose_slot_for_identity(identity, free, pins, last_slot_by_port)
+        if slot is None:
+            # Only reserved (pinned-to-other-port) slots remain: wait, do
+            # not mark failed so this port is retried on the next tick.
+            continue
+        attachments.append((identity, slot))
+        free.remove(slot)
+        active_ports.add(port)
+        last_slot_by_port[port] = slot
+        failed_ports.pop(port, None)
+    return attachments
 
 
 def _step_widget_fps(w: CameraWidget, stress: bool, profile_ui_fps: int) -> bool:
@@ -121,12 +174,17 @@ def main() -> None:
     QtCore.QTimer.singleShot(50, force_fullscreen)
     QtCore.QTimer.singleShot(300, force_fullscreen)
 
-    working_cameras = find_working_cameras()
-    logging.info("Found %d cameras", len(working_cameras))
+    identities = find_working_camera_identities()
+    logging.info("Found %d cameras", len(identities))
+    slot_assignment = assign_slots(
+        identities, config.CAMERA_SLOT_COUNT, config.SLOT_PINS
+    )
 
-    known_indexes = set(get_video_indexes())
-    active_indexes = set(working_cameras)
-    failed_indexes = {idx: time.time() for idx in (known_indexes - active_indexes)}
+    # Identity-keyed bookkeeping (all keyed on the stable USB port_path).
+    active_ports: set[str] = set()  # port_paths currently attached
+    failed_ports: dict[str, float] = {}  # port_path -> last-failed timestamp
+    last_slot_by_port: dict[str, int] = {}  # port_path -> slot (reattach memory)
+    port_of_widget: dict[CameraWidget, str] = {}  # widget -> port_path
 
     layout = QtWidgets.QGridLayout(central_widget)
     layout.setContentsMargins(0, 0, 0, 0)
@@ -184,20 +242,25 @@ def main() -> None:
     cap_w, cap_h, cap_fps, ui_fps = config.choose_profile()
     logging.info("Profile: %dx%d @ %d FPS (UI %d FPS)", cap_w, cap_h, cap_fps, ui_fps)
 
-    # Exactly N camera slots at all times (based on config)
+    # Exactly N camera slots at all times (based on config). Each slot is
+    # bound to its deterministic identity (or reserved/empty placeholder).
     for slot_idx in range(config.CAMERA_SLOT_COUNT):
-        if slot_idx < len(working_cameras):
-            cam_index = working_cameras[slot_idx]
+        identity = slot_assignment[slot_idx]
+        if identity is not None:
             cw = CameraWidget(
-                cam_index,
+                identity.stream_target,
                 parent=central_widget,
                 target_fps=cap_fps,
                 request_capture_size=(cap_w, cap_h),
                 ui_fps=ui_fps,
                 enable_capture=True,
             )
+            cw.slot_index = slot_idx
             cw.set_night_mode(night_mode_state["enabled"])
             camera_widgets.append(cw)
+            active_ports.add(identity.port_path)
+            last_slot_by_port[identity.port_path] = slot_idx
+            port_of_widget[cw] = identity.port_path
         else:
             cw = CameraWidget(
                 stream_link=None,
@@ -208,9 +271,20 @@ def main() -> None:
                 enable_capture=False,
                 placeholder_text="DISCONNECTED",
             )
+            cw.slot_index = slot_idx
             cw.set_night_mode(night_mode_state["enabled"])
             placeholder_slots.append(cw)
         all_widgets.append(cw)
+
+    slot_table = {
+        slot_idx: (
+            slot_assignment[slot_idx].port_path
+            if slot_assignment[slot_idx] is not None
+            else ("RESERVED" if slot_idx in config.SLOT_PINS else "EMPTY")
+        )
+        for slot_idx in range(config.CAMERA_SLOT_COUNT)
+    }
+    logging.info("Slot assignment (slot -> port): %s", slot_table)
 
     rows, cols = get_smart_grid(len(all_widgets))
 
@@ -294,38 +368,59 @@ def main() -> None:
         except Exception:
             pass
 
-    def _apply_rescan_results(results: list[tuple[int, Optional[int]]]) -> None:
+    def _apply_rescan_results(
+        results: list[tuple[CameraIdentity, Optional[int]]]
+    ) -> None:
         rescan_inflight["active"] = False
         if shutdown_state["active"]:
             return
         now = time.time()
-        for idx, ok in results:
-            if not placeholder_slots:
-                break
-            if ok is not None:
-                slot = placeholder_slots.pop(0)
-                cap_w, cap_h, cap_fps, ui_fps = config.choose_profile()
-                slot.attach_camera(ok, cap_fps, (cap_w, cap_h), ui_fps=ui_fps)
-                slot.set_night_mode(night_mode_state["enabled"])
-                camera_widgets.append(slot)
-                active_indexes.add(ok)
-                failed_indexes.pop(ok, None)
-                logging.info("Attached camera %d to empty slot", ok)
-                if config.DYNAMIC_FPS_ENABLED:
-                    ensure_perf_timer()
-            else:
-                failed_indexes[idx] = now
+        free_slot_indexes = sorted(w.slot_index for w in placeholder_slots)
+        # Planner mutates active_ports/last_slot_by_port/failed_ports in place
+        # and returns which identity attaches to which slot.
+        attachments = _plan_rescan_attachments(
+            results,
+            free_slot_indexes,
+            config.SLOT_PINS,
+            last_slot_by_port,
+            active_ports,
+            failed_ports,
+            now,
+        )
+        slot_to_widget = {w.slot_index: w for w in placeholder_slots}
+        for identity, slot_index in attachments:
+            widget = slot_to_widget.get(slot_index)
+            if widget is None:
+                continue
+            placeholder_slots.remove(widget)
+            cap_w, cap_h, cap_fps, ui_fps = config.choose_profile()
+            widget.attach_camera(
+                identity.stream_target, cap_fps, (cap_w, cap_h), ui_fps=ui_fps
+            )
+            widget.set_night_mode(night_mode_state["enabled"])
+            camera_widgets.append(widget)
+            port_of_widget[widget] = identity.port_path
+            logging.info(
+                "Attached camera port %s (/dev/video%d) to slot %d",
+                identity.port_path,
+                identity.index,
+                slot_index,
+            )
+            if config.DYNAMIC_FPS_ENABLED:
+                ensure_perf_timer()
 
-    def _run_rescan_tests(candidates: list[int]) -> list[tuple[int, Optional[int]]]:
-        results: list[tuple[int, Optional[int]]] = []
-        for idx in candidates:
+    def _run_rescan_tests(
+        candidates: list[CameraIdentity],
+    ) -> list[tuple[CameraIdentity, Optional[int]]]:
+        results: list[tuple[CameraIdentity, Optional[int]]] = []
+        for identity in candidates:
             ok = test_single_camera(
-                idx,
+                identity.stream_target,
                 retries=2,
                 retry_delay=0.15,
                 allow_kill=False,
             )
-            results.append((idx, ok))
+            results.append((identity, ok))
         return results
 
     def rescan_and_attach():
@@ -344,11 +439,18 @@ def main() -> None:
                 if detached_idx is not None:
                     camera_widgets.remove(w)
                     placeholder_slots.append(w)
-                    active_indexes.discard(detached_idx)
-                    failed_indexes[detached_idx] = now
+                    # Reclaim the port; keep last_slot_by_port as reattach
+                    # memory so a replug returns to this same slot.
+                    port = port_of_widget.pop(w, None)
+                    if port is not None:
+                        active_ports.discard(port)
+                        failed_ports[port] = now
                     logging.info(
-                        "Camera %d detached after prolonged failure, slot available for reuse",
-                        detached_idx
+                        "Camera port %s (was %s) detached from slot %d after "
+                        "prolonged failure, slot available for reuse",
+                        port,
+                        detached_idx,
+                        w.slot_index,
                     )
                     # Restart rescan timer if it was stopped
                     if rescan_timer is not None and not rescan_timer.isActive():
@@ -363,19 +465,23 @@ def main() -> None:
             return
 
         now = time.time()
-        indexes = get_video_indexes()
+        # Cheap, non-probing discovery: each tick's snapshot carries a
+        # freshly resolved index, so a same-port-new-index replug is handled
+        # automatically.
+        discovered = discover_camera_identities()
 
         candidates = []
-        for idx in indexes:
-            if idx in active_indexes:
+        for identity in discovered:
+            port = identity.port_path
+            if port in active_ports:
                 continue
-            last_failed = failed_indexes.get(idx)
+            last_failed = failed_ports.get(port)
             if (
                 last_failed
                 and (now - last_failed) < config.FAILED_CAMERA_COOLDOWN_SEC
             ):
                 continue
-            candidates.append(idx)
+            candidates.append(identity)
 
         if not candidates:
             return
@@ -408,8 +514,8 @@ def main() -> None:
             lambda: log_health_summary(
                 camera_widgets,
                 placeholder_slots,
-                active_indexes,
-                failed_indexes,
+                active_ports,
+                failed_ports,
             )
         )
         health_timer.start()
