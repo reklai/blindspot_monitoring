@@ -21,7 +21,12 @@ __all__ = [
     "HEALTH_LOG_INTERVAL_SEC",
     # camera module exports
     "CaptureWorker",
+    "CameraIdentity",
     "find_working_cameras",
+    "find_working_camera_identities",
+    "discover_camera_identities",
+    "assign_slots",
+    "choose_slot_for_identity",
     "get_video_indexes",
     "test_single_camera",
     # performance module exports
@@ -46,5 +51,15 @@ from .config import (
     FAILED_CAMERA_COOLDOWN_SEC,
     HEALTH_LOG_INTERVAL_SEC,
 )
-from .camera import CaptureWorker, find_working_cameras, get_video_indexes, test_single_camera
+from .camera import (
+    CaptureWorker,
+    CameraIdentity,
+    assign_slots,
+    choose_slot_for_identity,
+    discover_camera_identities,
+    find_working_cameras,
+    find_working_camera_identities,
+    get_video_indexes,
+    test_single_camera,
+)
 from .performance import is_system_stressed
