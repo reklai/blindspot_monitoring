@@ -268,6 +268,10 @@ class CameraWidget(QtWidgets.QWidget):
         self._scaled_pixmap_cache_size = None
         self._night_gray = None
         self._night_bgr = None
+        # Reusable brightness output buffer (lazily (re)allocated per
+        # resolution, like the night-mode buffers). Keeps the brightness LUT
+        # out of self._latest_frame so re-rendering never double-applies.
+        self._brightness_buffer = None
         # Pre-computed LUT for night mode brightness (1.6x gain, clamped to 255)
         self._night_lut = np.clip(np.arange(256, dtype=np.float32) * 1.6, 0, 255).astype(np.uint8)
         # Brightness LUT - computed dynamically based on brightness setting
@@ -816,19 +820,20 @@ class CameraWidget(QtWidgets.QWidget):
                 except Exception:
                     logging.debug("Night mode processing failed", exc_info=True)
 
-            # Apply brightness adjustment (if not 1.0)
+            # Apply brightness adjustment (if not 1.0). One whole-array LUT: a
+            # 256-entry uint8 LUT applies element-wise to every channel, so a
+            # single cv2.LUT replaces the per-channel loop. Output goes into a
+            # reusable buffer, leaving self._latest_frame untouched (no
+            # double-apply when the same frame re-renders).
             if self.brightness != 1.0:
                 try:
-                    if frame_bgr.ndim == 2:
-                        temp = np.empty_like(frame_bgr)
-                        cv2.LUT(frame_bgr, self._brightness_lut, dst=temp)
-                        frame_bgr = temp
-                    else:
-                        # Apply to each channel
-                        for i in range(3):
-                            temp = np.empty_like(frame_bgr[:, :, i])
-                            cv2.LUT(frame_bgr[:, :, i], self._brightness_lut, dst=temp)
-                            frame_bgr[:, :, i] = temp
+                    if (
+                        self._brightness_buffer is None
+                        or self._brightness_buffer.shape != frame_bgr.shape
+                    ):
+                        self._brightness_buffer = np.empty_like(frame_bgr, order='C')
+                    cv2.LUT(frame_bgr, self._brightness_lut, dst=self._brightness_buffer)
+                    frame_bgr = self._brightness_buffer
                 except Exception:
                     logging.debug("Brightness processing failed", exc_info=True)
 

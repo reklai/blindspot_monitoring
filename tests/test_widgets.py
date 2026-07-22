@@ -607,6 +607,84 @@ class TestEmitRateAlignment:
             widget.cleanup()
 
 
+class TestBrightnessRendering:
+    """Brightness is one whole-array LUT into a reusable buffer, leaving the
+    stored latest frame untouched (fixes the double-apply-on-re-render bug)."""
+
+    @pytest.mark.requires_display
+    def test_single_lut_matches_independent_numpy_result(self, qapp):
+        """The single 3-channel LUT output equals the per-channel result,
+        computed here independently as lut[frame] (cv2.LUT == fancy index)."""
+        from ui.widgets import CameraWidget
+
+        widget = CameraWidget(stream_link=None, enable_capture=False)
+        widget.resize(200, 150)
+        widget.show()
+
+        frame = (np.arange(48 * 64 * 3).reshape(48, 64, 3) % 256).astype(np.uint8)
+        original = frame.copy()
+        widget.on_frame(frame)
+        widget.set_brightness(1.5)
+
+        # Independent expected: apply the widget's LUT to every channel.
+        expected = widget._brightness_lut[original]
+
+        widget._render_latest_frame()
+
+        assert widget._brightness_buffer is not None
+        assert np.array_equal(widget._brightness_buffer, expected)
+
+        widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_brightness_does_not_mutate_latest_frame(self, qapp):
+        """Rendering with brightness != 1.0 leaves self._latest_frame bytes
+        unchanged; re-rendering the SAME frame does not double-apply."""
+        from ui.widgets import CameraWidget
+
+        widget = CameraWidget(stream_link=None, enable_capture=False)
+        widget.resize(200, 150)
+        widget.show()
+
+        frame = (np.arange(48 * 64 * 3).reshape(48, 64, 3) % 256).astype(np.uint8)
+        original = frame.copy()
+        widget.on_frame(frame)
+        widget.set_brightness(1.5)
+
+        widget._render_latest_frame()
+        assert np.array_equal(widget._latest_frame, original)
+
+        # Force a re-render of the same frame (as a size-change would).
+        widget._last_rendered_id = -1
+        widget._last_rendered_size = None
+        widget._render_latest_frame()
+        assert np.array_equal(widget._latest_frame, original)
+
+        widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_brightness_buffer_reused_across_renders(self, qapp):
+        """The brightness buffer is allocated once per resolution and reused,
+        mirroring the night-mode buffer pattern."""
+        from ui.widgets import CameraWidget
+
+        widget = CameraWidget(stream_link=None, enable_capture=False)
+        widget.resize(200, 150)
+        widget.show()
+
+        frame = np.zeros((48, 64, 3), dtype=np.uint8)
+        widget.on_frame(frame)
+        widget.set_brightness(1.5)
+
+        widget._render_latest_frame()
+        buf1 = widget._brightness_buffer
+        widget._last_rendered_id = -1
+        widget._render_latest_frame()
+        assert widget._brightness_buffer is buf1
+
+        widget.cleanup()
+
+
 class TestBlitScaled:
     """Characterization tests pinning the scaled-pixmap blit path in
     _render_latest_frame, for both grid and fullscreen targets.
