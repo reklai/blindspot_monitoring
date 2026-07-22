@@ -371,7 +371,9 @@ class TestCaptureWorker:
         worker._close_capture.assert_not_called()
         worker.terminate.assert_called_once()
         assert worker.is_leaked is True
-        assert "leaking capture handle" in caplog.text
+        # Log states the honest recovery path (no in-process reclaim exists).
+        assert "leaking its fd" in caplog.text
+        assert "replug" in caplog.text
 
     def test_stop_terminate_then_wait_succeeds_closes_capture(self):
         """First wait fails, terminate() called, second wait succeeds ->

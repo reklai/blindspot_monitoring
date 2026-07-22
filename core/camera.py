@@ -140,7 +140,8 @@ class CaptureWorker(QThread):
         self._device_fps = (
             float(target_fps) if (target_fps and target_fps > 0) else 30.0
         )
-        self._emit_interval = 1.0 / 30.0
+        # _recompute_emit_interval_locked() assigns _emit_interval
+        # unconditionally from _device_fps/_ui_fps -- no seed value needed.
         self._recompute_emit_interval_locked()
         self.capture_width = capture_width
         self.capture_height = capture_height
@@ -554,10 +555,15 @@ class CaptureWorker(QThread):
             _close_capture() may NOT have run; the handle can still be open.
             The thread is confirmed dead here, so we release it ourselves.
           * thread STILL alive after terminate() -> we must NOT release; we
-            leak the handle instead. Device-level cleanup is handled
-            elsewhere: kill_device_holders() on the next probe of this device
-            (allow_kill=True) and the app-level identity rescan/detach reclaim
-            the resource without racing a live grab().
+            leak the handle instead. There is NO in-process reclaim of this
+            fd: it is held open by THIS process's zombie capture thread, and
+            runtime rescan probes run with allow_kill=False while
+            kill_device_holders() deliberately excludes our own PID -- so
+            neither the rescan nor kill_device_holders can free it. Real
+            recovery is a physical replug (udev issues a fresh /dev/videoN
+            node the zombie doesn't hold, which the reconnect loop picks up)
+            or a process restart. The app-level detach only frees the tile
+            for reuse; it does not reclaim the leaked device fd.
         """
         self._running = False
         self._stop_event.set()
@@ -579,11 +585,14 @@ class CaptureWorker(QThread):
             return True
 
         # Thread is STILL alive -- releasing the capture here would race a
-        # live grab() (segfault). Leak the handle and let device-level rescan
-        # cleanup (kill_device_holders / app rescan) reclaim it safely.
+        # live grab() (segfault). Leak the handle: the fd stays open on our
+        # own zombie thread, so nothing in this process can reclaim it
+        # (rescan probes run allow_kill=False; kill_device_holders skips our
+        # PID). Recovery is a physical replug (fresh udev node) or a restart.
         logging.error(
-            "Camera %s thread could not be terminated; leaking capture handle "
-            "for device cleanup by rescan",
+            "Camera %s capture thread could not be terminated; leaking its fd "
+            "(held by our own zombie thread -- not reclaimable in-process). "
+            "Recover by physically replugging the camera or restarting.",
             self.stream_link,
         )
         self._leaked = True

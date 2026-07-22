@@ -107,6 +107,11 @@ class CameraWidget(QtWidgets.QWidget):
         id_label = stream_link[-24:] if isinstance(stream_link, str) else stream_link
         self.widget_id = f"cam{id_label}_{id(self)}"
 
+        # Grid slot this tile occupies. Real value is assigned by main.py at
+        # slot creation; the identity/rescan machinery relies on its
+        # uniqueness across tiles. -1 means "not yet placed in a slot".
+        self.slot_index: int = -1
+
         # State used for fullscreen toggle + drag/hold swap mode.
         self.is_fullscreen = False
         self.grid_position = None
