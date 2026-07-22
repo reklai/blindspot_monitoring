@@ -181,6 +181,52 @@ class TestTestSingleCamera:
 
         assert result is None
 
+    def test_single_camera_str_target_post_kill_success_returns_numeric_index(
+        self, tmp_path, save_restore_config
+    ):
+        """str target that fails the initial retries but succeeds after
+        kill_device_holders must return the parsed NUMERIC index (an
+        int), never the original path string -- honoring the
+        -> Optional[int] contract regardless of which retry loop
+        succeeded."""
+        from core import config
+
+        video_node = tmp_path / "video9"
+        video_node.write_text("")
+        symlink = tmp_path / "by-path-camera"
+        symlink.symlink_to(video_node)
+
+        config.KILL_DEVICE_HOLDERS = True
+
+        call_count = 0
+
+        def mock_is_opened():
+            nonlocal call_count
+            call_count += 1
+            # Fail every initial-retry attempt; succeed only once kill
+            # has been attempted (i.e. on the post-kill retry loop).
+            return call_count > 1
+
+        with patch("cv2.VideoCapture") as mock_cap:
+            instance = MagicMock()
+            instance.isOpened.side_effect = mock_is_opened
+            instance.grab.return_value = True
+            mock_cap.return_value = instance
+
+            with patch("core.camera.kill_device_holders", return_value=True):
+                from core.camera import test_single_camera
+                result = test_single_camera(
+                    str(symlink),
+                    retries=1,
+                    retry_delay=0.01,
+                    allow_kill=True,
+                    post_kill_retries=2,
+                    post_kill_delay=0.01,
+                )
+
+        assert result == 9
+        assert isinstance(result, int)
+
 
 class TestBuildGstreamerPipeline:
     """Test the extracted GStreamer pipeline string builder."""

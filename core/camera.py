@@ -631,7 +631,7 @@ def test_single_camera(
         if killed:
             for _ in range(post_kill_retries):
                 if try_open():
-                    return cam_index
+                    return result_index
                 time.sleep(post_kill_delay)
 
     return None
