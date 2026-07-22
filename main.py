@@ -335,28 +335,23 @@ def main() -> None:
         for w in list(camera_widgets):
             if not w.capture_enabled:
                 continue
-            # Check if widget has exceeded restart limit and is in extended cooldown
-            # We detect this by checking if _restart_limit_logged is set
-            if getattr(w, '_restart_limit_logged', False):
-                # Check if extended cooldown has passed (2x restart window)
-                extended_cooldown = w._restart_window_sec * 2
-                now = time.time()
-                if (now - w._last_restart_ts) >= extended_cooldown:
-                    # Camera has been disconnected long enough, detach it
-                    detached_idx = w.detach_camera()
-                    if detached_idx is not None:
-                        camera_widgets.remove(w)
-                        placeholder_slots.append(w)
-                        active_indexes.discard(detached_idx)
-                        failed_indexes[detached_idx] = now
-                        logging.info(
-                            "Camera %d detached after prolonged failure, slot available for reuse",
-                            detached_idx
-                        )
-                        # Restart rescan timer if it was stopped
-                        if rescan_timer is not None and not rescan_timer.isActive():
-                            rescan_timer.start()
-                            logging.info("Restarted rescan timer for detached camera slot")
+            now = time.time()
+            if w.is_permanently_failed(now):
+                # Camera has been disconnected long enough, detach it
+                detached_idx = w.detach_camera()
+                if detached_idx is not None:
+                    camera_widgets.remove(w)
+                    placeholder_slots.append(w)
+                    active_indexes.discard(detached_idx)
+                    failed_indexes[detached_idx] = now
+                    logging.info(
+                        "Camera %d detached after prolonged failure, slot available for reuse",
+                        detached_idx
+                    )
+                    # Restart rescan timer if it was stopped
+                    if rescan_timer is not None and not rescan_timer.isActive():
+                        rescan_timer.start()
+                        logging.info("Restarted rescan timer for detached camera slot")
         
         if not placeholder_slots:
             # All slots filled, stop the timer

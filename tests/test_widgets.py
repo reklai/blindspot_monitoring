@@ -309,6 +309,54 @@ class TestDynamicFPS:
         widget.cleanup()
 
 
+class TestPermanentFailure:
+    """Truth table for is_permanently_failed: limit-logged AND extended
+    cooldown elapsed must both hold before a widget is treated as
+    permanently failed.
+    """
+
+    @pytest.mark.requires_display
+    def test_limit_not_logged_is_not_permanently_failed(self, qapp):
+        """Restart limit never hit -> never permanently failed, regardless of timing."""
+        from ui.widgets import CameraWidget
+
+        widget = CameraWidget(stream_link=None, enable_capture=False)
+        widget._restart_limit_logged = False
+        widget._last_restart_ts = 0.0
+
+        assert widget.is_permanently_failed(time.time()) is False
+
+        widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_limit_logged_but_cooldown_not_elapsed_is_not_permanently_failed(self, qapp):
+        """Limit hit but extended cooldown hasn't passed yet -> not permanently failed."""
+        from ui.widgets import CameraWidget
+
+        widget = CameraWidget(stream_link=None, enable_capture=False)
+        widget._restart_limit_logged = True
+        now = time.time()
+        widget._last_restart_ts = now
+
+        assert widget.is_permanently_failed(now) is False
+
+        widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_limit_logged_and_cooldown_elapsed_is_permanently_failed(self, qapp):
+        """Limit hit and extended cooldown has passed -> permanently failed."""
+        from ui.widgets import CameraWidget
+
+        widget = CameraWidget(stream_link=None, enable_capture=False)
+        widget._restart_limit_logged = True
+        now = time.time()
+        widget._last_restart_ts = now - widget._extended_cooldown_sec
+
+        assert widget.is_permanently_failed(now) is True
+
+        widget.cleanup()
+
+
 class TestSpawnWorker:
     """Characterization tests pinning CaptureWorker construction/wiring/start
     at each of the three call sites (__init__, attach_camera,

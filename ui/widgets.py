@@ -917,6 +917,19 @@ class CameraWidget(QtWidgets.QWidget):
         except Exception:
             logging.exception("set_dynamic_ui_fps")
 
+    @property
+    def _extended_cooldown_sec(self) -> float:
+        """Extended cooldown applied once the restart limit is hit (2x the restart window)."""
+        return self._restart_window_sec * 2
+
+    def is_permanently_failed(self, now: float) -> bool:
+        """Return True once the restart limit has been logged and the
+        extended cooldown has elapsed since the last restart attempt.
+        """
+        if not self._restart_limit_logged:
+            return False
+        return (now - self._last_restart_ts) >= self._extended_cooldown_sec
+
     def _restart_capture_if_stale(self) -> None:
         """Restart the capture worker after a stale frame timeout."""
         if not self.capture_enabled or not self.worker:
@@ -929,7 +942,7 @@ class CameraWidget(QtWidgets.QWidget):
         ]
         if len(recent) >= self._max_restarts_per_window:
             # Don't give up forever - schedule a retry after extended cooldown
-            extended_cooldown = self._restart_window_sec * 2  # 60 seconds
+            extended_cooldown = self._extended_cooldown_sec
             if (now - self._last_restart_ts) < extended_cooldown:
                 if not getattr(self, '_restart_limit_logged', False):
                     logging.warning(
