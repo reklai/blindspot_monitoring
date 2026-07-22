@@ -333,6 +333,81 @@ class TestCaptureWorker:
         worker.stop()
         assert worker._running is False
 
+    def test_stop_thread_exits_within_wait_closes_capture(self):
+        """wait(2000) succeeds -> thread confirmed dead, capture closed from
+        stop() (belt-and-braces), returns True, not leaked."""
+        from core.camera import CaptureWorker
+
+        worker = CaptureWorker(stream_link=0, parent=None)
+        worker.wait = MagicMock(return_value=True)
+        worker.terminate = MagicMock()
+        worker._close_capture = MagicMock()
+
+        result = worker.stop()
+
+        assert result is True
+        worker._close_capture.assert_called_once()
+        worker.terminate.assert_not_called()
+        assert worker.is_leaked is False
+
+    def test_stop_unkillable_thread_leaks_capture(self, caplog):
+        """Both waits fail and isRunning stays True -> DO NOT release capture
+        from the main thread (segfault risk); returns False, leaked flag set,
+        ERROR logged."""
+        import logging
+
+        from core.camera import CaptureWorker
+
+        worker = CaptureWorker(stream_link="/dev/video0", parent=None)
+        worker.wait = MagicMock(return_value=False)
+        worker.isRunning = MagicMock(return_value=True)
+        worker.terminate = MagicMock()
+        worker._close_capture = MagicMock()
+
+        with caplog.at_level(logging.ERROR):
+            result = worker.stop()
+
+        assert result is False
+        worker._close_capture.assert_not_called()
+        worker.terminate.assert_called_once()
+        assert worker.is_leaked is True
+        assert "leaking capture handle" in caplog.text
+
+    def test_stop_terminate_then_wait_succeeds_closes_capture(self):
+        """First wait fails, terminate() called, second wait succeeds ->
+        thread gone, capture closed from stop(), returns True, not leaked."""
+        from core.camera import CaptureWorker
+
+        worker = CaptureWorker(stream_link=0, parent=None)
+        worker.wait = MagicMock(side_effect=[False, True])
+        worker.isRunning = MagicMock(return_value=True)
+        worker.terminate = MagicMock()
+        worker._close_capture = MagicMock()
+
+        result = worker.stop()
+
+        assert result is True
+        worker.terminate.assert_called_once()
+        worker._close_capture.assert_called_once()
+        assert worker.is_leaked is False
+
+    def test_stop_terminate_then_not_running_closes_capture(self):
+        """Second wait times out but isRunning() is False -> thread gone
+        anyway, capture closed, returns True."""
+        from core.camera import CaptureWorker
+
+        worker = CaptureWorker(stream_link=0, parent=None)
+        worker.wait = MagicMock(side_effect=[False, False])
+        worker.isRunning = MagicMock(return_value=False)
+        worker.terminate = MagicMock()
+        worker._close_capture = MagicMock()
+
+        result = worker.stop()
+
+        assert result is True
+        worker._close_capture.assert_called_once()
+        assert worker.is_leaked is False
+
     def test_resolve_stream_target_int_passthrough(self):
         """int stream_link resolves to itself, unchanged."""
         from core.camera import CaptureWorker

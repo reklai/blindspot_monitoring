@@ -144,6 +144,9 @@ class CaptureWorker(QThread):
         # Lock protects changes to FPS/emit interval from other threads.
         self._fps_lock = threading.Lock()
         self._stop_event = threading.Event()
+        # Set True by stop() when the thread could not be terminated and the
+        # capture handle was intentionally leaked (see stop() for rationale).
+        self._leaked = False
         
         # Pre-allocated frame pool to reduce memory allocations/GC pressure
         self._frame_pool: deque[NDArray[np.uint8]] = deque(maxlen=self.FRAME_POOL_SIZE)
@@ -509,34 +512,70 @@ class CaptureWorker(QThread):
             self._cap = None
             self._using_gstreamer = False
 
-    def stop(self) -> None:
-        """Stop capture loop and wait briefly for thread exit.
-        
-        The wait allows the run() loop to exit cleanly, which includes
-        calling _close_capture() from within the thread context.
-        If the thread doesn't stop gracefully, we terminate it forcefully.
+    @property
+    def is_leaked(self) -> bool:
+        """True if stop() gave up terminating the thread and deliberately
+        leaked the capture handle (device cleanup deferred to rescan)."""
+        return self._leaked
+
+    def stop(self) -> bool:
+        """Stop the capture loop and release the device, safely.
+
+        Returns True if the thread fully stopped and the capture handle was
+        closed; False if the thread could not be terminated and the handle
+        was intentionally leaked.
+
+        Threading / race-window rationale: _close_capture() calls
+        cv2.VideoCapture.release(). release() is NOT safe to call from this
+        (the main) thread while the capture thread may still be executing
+        inside grab()/retrieve() on the same handle -- that data race is a
+        segfault vector, and a segfault takes down the whole safety display.
+        So we only ever release the handle once the capture thread is
+        CONFIRMED dead:
+          * wait(2000) succeeds  -> run() returned; it already called
+            _close_capture() on its way out (line ~263), so the handle is
+            typically None already. The thread is confirmed dead, so this
+            extra release is safe belt-and-braces (a None handle is a no-op).
+          * terminate() + a wait/isRunning check confirming the thread is
+            gone -> terminate() abandons run() mid-flight, so its exit-time
+            _close_capture() may NOT have run; the handle can still be open.
+            The thread is confirmed dead here, so we release it ourselves.
+          * thread STILL alive after terminate() -> we must NOT release; we
+            leak the handle instead. Device-level cleanup is handled
+            elsewhere: kill_device_holders() on the next probe of this device
+            (allow_kill=True) and the app-level identity rescan/detach reclaim
+            the resource without racing a live grab().
         """
         self._running = False
         self._stop_event.set()
-        
-        # Wait for thread to finish (includes cleanup in run())
-        if not self.wait(2000):
-            logging.warning(
-                "Camera %s thread did not stop in 2s, attempting terminate",
-                self.stream_link
-            )
-            # Force terminate the thread - last resort
-            self.terminate()
-            # Give it a moment to actually terminate
-            if not self.wait(500):
-                logging.error(
-                    "Camera %s thread could not be terminated - potential resource leak",
-                    self.stream_link
-                )
-        
-        # Ensure capture is closed even if thread didn't exit cleanly
-        self._close_capture()
-    
+
+        # Graceful exit: run() returned on its own, thread confirmed dead.
+        if self.wait(2000):
+            self._close_capture()
+            return True
+
+        logging.warning(
+            "Camera %s thread did not stop in 2s, attempting terminate",
+            self.stream_link,
+        )
+        # Force terminate the thread - last resort.
+        self.terminate()
+        # Thread confirmed gone (wait succeeded, or it is no longer running)?
+        if self.wait(500) or not self.isRunning():
+            self._close_capture()
+            return True
+
+        # Thread is STILL alive -- releasing the capture here would race a
+        # live grab() (segfault). Leak the handle and let device-level rescan
+        # cleanup (kill_device_holders / app rescan) reclaim it safely.
+        logging.error(
+            "Camera %s thread could not be terminated; leaking capture handle "
+            "for device cleanup by rescan",
+            self.stream_link,
+        )
+        self._leaked = True
+        return False
+
     def is_healthy(self) -> bool:
         """Check if the worker thread is alive and responsive.
         
