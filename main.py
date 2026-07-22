@@ -29,6 +29,7 @@ from core import (
     is_system_stressed,
     test_single_camera,
 )
+from core.camera import _test_identity, list_by_path_nodes
 from ui import CameraWidget, get_smart_grid
 from utils import log_health_summary
 
@@ -81,6 +82,76 @@ def _plan_rescan_attachments(
         last_slot_by_port[port] = slot
         failed_ports.pop(port, None)
     return attachments
+
+
+def _rescan_probe_group_fallback(
+    identity: CameraIdentity,
+) -> Optional[tuple[CameraIdentity, int]]:
+    """Fallback probe when a by-path group's provisional (lowest) node fails.
+
+    `discover_camera_identities` uses a by-path group's LOWEST node as the
+    provisional capture node, but that node may be a UVC metadata node that
+    fails grab() while the real capture node has a higher index. When the
+    fast single-node probe fails, re-derive the group's nodes for this one
+    port via `list_by_path_nodes` (smaller change than threading the full
+    node list through discovery) and probe the REMAINING nodes ascending
+    with `_test_identity`, exactly as startup does. Returns
+    (rebuilt_identity, resolved_index) for whichever node passes, else None.
+
+    Fallback (`index:N`, device_path None) identities have a single node and
+    no group to expand, so they return None immediately (behavior unchanged).
+    """
+    if identity.device_path is None:
+        return None
+    nodes = list_by_path_nodes().get(identity.port_path)
+    if not nodes:
+        return None
+    # Skip the provisional node we already probed in the fast path.
+    remaining = [(idx, name) for idx, name in nodes if idx != identity.index]
+    if not remaining:
+        return None
+    rebuilt = _test_identity(
+        identity.port_path,
+        remaining,
+        None,
+        retries=2,
+        retry_delay=0.15,
+        allow_kill=False,
+    )
+    if rebuilt is None:
+        return None
+    return (rebuilt, rebuilt.index)
+
+
+def _run_rescan_tests(
+    candidates: list[CameraIdentity],
+) -> list[tuple[CameraIdentity, Optional[int]]]:
+    """Probe each candidate identity for a working capture node (runs off the
+    Qt thread in the rescan executor).
+
+    Cheap single-node fast path first: probe the provisional
+    `identity.stream_target`. On failure, fall back to probing the group's
+    remaining nodes (`_rescan_probe_group_fallback`) so a camera whose
+    capture node isn't its group's lowest can still hot-plug reattach.
+    Result entries are (identity, resolved_index_or_None) for the planner.
+    """
+    results: list[tuple[CameraIdentity, Optional[int]]] = []
+    for identity in candidates:
+        ok = test_single_camera(
+            identity.stream_target,
+            retries=2,
+            retry_delay=0.15,
+            allow_kill=False,
+        )
+        if ok is not None:
+            results.append((identity, ok))
+            continue
+        fallback = _rescan_probe_group_fallback(identity)
+        if fallback is not None:
+            results.append(fallback)
+        else:
+            results.append((identity, None))
+    return results
 
 
 def _plan_detach_sweep(
@@ -456,20 +527,6 @@ def main() -> None:
             )
             if config.DYNAMIC_FPS_ENABLED:
                 ensure_perf_timer()
-
-    def _run_rescan_tests(
-        candidates: list[CameraIdentity],
-    ) -> list[tuple[CameraIdentity, Optional[int]]]:
-        results: list[tuple[CameraIdentity, Optional[int]]] = []
-        for identity in candidates:
-            ok = test_single_camera(
-                identity.stream_target,
-                retries=2,
-                retry_delay=0.15,
-                allow_kill=False,
-            )
-            results.append((identity, ok))
-        return results
 
     def rescan_and_attach():
         """Scan for new cameras and attach them to placeholders.

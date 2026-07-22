@@ -14,12 +14,104 @@ SAFETY RULES under test:
   - a reserved-slot wait (no slot available) is NOT a failure.
 """
 
+from unittest.mock import patch
+
+import pytest
+
 from core.camera import CameraIdentity
-from main import _plan_detach_sweep, _plan_rescan_attachments
+from main import _plan_detach_sweep, _plan_rescan_attachments, _run_rescan_tests
 
 
 PORT_A = "platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0"
 PORT_B = "platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.4:1.0"
+
+
+@pytest.fixture
+def fake_by_path(tmp_path, monkeypatch):
+    """Build a fake /dev/v4l/by-path tree (mirrors test_camera_identity)."""
+    dev_dir = tmp_path / "dev"
+    dev_dir.mkdir()
+    by_path_dir = dev_dir / "by-path"
+    by_path_dir.mkdir()
+
+    def make_link(entry_name: str, video_index: int):
+        node = dev_dir / f"video{video_index}"
+        if not node.exists():
+            node.touch()
+        (by_path_dir / entry_name).symlink_to(node)
+
+    import core.camera as camera_module
+
+    monkeypatch.setattr(camera_module, "BY_PATH_DIR", str(by_path_dir))
+    monkeypatch.setattr(camera_module, "_by_path_degraded_warned", False)
+
+    return {"dev_dir": dev_dir, "by_path_dir": by_path_dir, "make_link": make_link}
+
+
+class TestRunRescanTests:
+    """Finding 2: the rescan reattach probe must not give up after only the
+    group's provisional (lowest) node fails -- it falls back to probing the
+    group's remaining nodes, exactly as startup does, so a camera whose
+    capture node isn't the lowest can still hot-plug reattach.
+    """
+
+    def test_fallback_probes_higher_node_when_lowest_fails(self, fake_by_path):
+        by_path_dir = fake_by_path["by_path_dir"]
+        make_link = fake_by_path["make_link"]
+        make_link(f"{PORT_A}-video-index0", 0)  # metadata node, fails grab()
+        make_link(f"{PORT_A}-video-index1", 1)  # real capture node
+
+        # Provisional identity from discover_camera_identities = lowest node.
+        provisional = CameraIdentity(
+            PORT_A, str(by_path_dir / f"{PORT_A}-video-index0"), 0
+        )
+
+        def fake_test(target, **kw):
+            # Fast path probes the provisional device_path (node0) -> fails.
+            if isinstance(target, str):
+                return None
+            # Fallback probes remaining group nodes by index -> node1 works.
+            return target if target == 1 else None
+
+        with patch("main.test_single_camera", side_effect=fake_test), patch(
+            "core.camera.test_single_camera", side_effect=fake_test
+        ):
+            results = _run_rescan_tests([provisional])
+
+        assert len(results) == 1
+        identity, resolved_index = results[0]
+        assert resolved_index == 1
+        assert identity.port_path == PORT_A
+        assert identity.index == 1
+        assert identity.device_path == str(by_path_dir / f"{PORT_A}-video-index1")
+
+    def test_fast_path_success_skips_fallback(self, fake_by_path):
+        by_path_dir = fake_by_path["by_path_dir"]
+        make_link = fake_by_path["make_link"]
+        make_link(f"{PORT_A}-video-index0", 0)
+
+        provisional = CameraIdentity(
+            PORT_A, str(by_path_dir / f"{PORT_A}-video-index0"), 0
+        )
+
+        with patch("main.test_single_camera", return_value=0) as fast, patch(
+            "core.camera.test_single_camera"
+        ) as fallback:
+            results = _run_rescan_tests([provisional])
+
+        assert results == [(provisional, 0)]
+        assert fast.call_count == 1
+        fallback.assert_not_called()
+
+    def test_fallback_identity_has_no_group_expansion(self):
+        # An index:N fallback identity (device_path None) has a single node;
+        # a failed probe stays failed, no group to expand.
+        ident = CameraIdentity("index:5", None, 5)
+
+        with patch("main.test_single_camera", return_value=None):
+            results = _run_rescan_tests([ident])
+
+        assert results == [(ident, None)]
 
 
 class _FakeWidget:
