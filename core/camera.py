@@ -835,6 +835,131 @@ def find_working_camera_identities(by_path_dir: Optional[str] = None) -> list[Ca
     return survivors
 
 
+# ============================================================
+# SLOT ASSIGNMENT (DETERMINISTIC TILE BINDING)
+# ============================================================
+#
+# Pure functions: no Qt, no cv2, no I/O other than logging. SAFETY RULE
+# that drives the precedence below: a pinned slot must NEVER surface a
+# different camera than its pin. An honest empty/reserved tile beats
+# showing the wrong camera in a safety-relevant tile, so a pin that
+# matches nothing stays None and is never backfilled by another camera.
+
+
+def _pin_matches(pin: str, port_path: str) -> bool:
+    """Shared predicate: does `pin` (a [slots] config value) match `port_path`?
+
+    `index:N` pins are the fallback pseudo-key form (used when there is
+    no /dev/v4l/by-path) and must match `port_path` EXACTLY -- otherwise
+    pin "index:1" would wrongly claim "index:10" via substring matching.
+    Any other pin matches if it's a substring of `port_path` (the
+    documented use is the stable "usb-0:1.3" port tail).
+    """
+    if pin.startswith("index:"):
+        return pin == port_path
+    return pin in port_path
+
+
+def assign_slots(
+    identities: list[CameraIdentity],
+    slot_count: int,
+    pins: dict[int, str],
+) -> list[Optional[CameraIdentity]]:
+    """Deterministically map discovered identities to `slot_count` tiles.
+
+    Returns exactly `slot_count` entries. Precedence:
+      1. Pinned slots claim first, ascending slot index. Each pin claims
+         the first unclaimed identity whose port_path matches the pin
+         (see `_pin_matches`). If several identities match one pin, the
+         natural-sort-first one (by port_path) wins and a WARNING
+         ("ambiguous pin") is logged.
+      2. Remaining identities (in their given order -- discovery order is
+         already sorted) fill the remaining UNPINNED slots, ascending.
+      3. A pinned slot whose pin matched nothing stays None -- NEVER
+         backfilled by an unpinned camera (safety rule above).
+      4. Identities left over once all slots are filled/reserved are
+         dropped, with an INFO log.
+    """
+    slots: list[Optional[CameraIdentity]] = [None] * slot_count
+    claimed: set[int] = set()  # id() of identities already placed in a slot
+
+    for slot_index in sorted(pins):
+        if not (0 <= slot_index < slot_count):
+            continue
+        pin = pins[slot_index]
+        matches = [
+            identity
+            for identity in identities
+            if id(identity) not in claimed and _pin_matches(pin, identity.port_path)
+        ]
+        if not matches:
+            continue
+        matches.sort(key=lambda identity: _natural_key(identity.port_path))
+        winner = matches[0]
+        if len(matches) > 1:
+            logging.warning(
+                "ambiguous pin: slot%d=%r matches %d cameras, using %s",
+                slot_index, pin, len(matches), winner.port_path,
+            )
+        slots[slot_index] = winner
+        claimed.add(id(winner))
+
+    unpinned_slot_indexes = [i for i in range(slot_count) if i not in pins]
+    remaining = [identity for identity in identities if id(identity) not in claimed]
+
+    for slot_index, identity in zip(unpinned_slot_indexes, remaining):
+        slots[slot_index] = identity
+        claimed.add(id(identity))
+
+    dropped = len(remaining) - len(unpinned_slot_indexes)
+    if dropped > 0:
+        logging.info("%d discovered camera(s) dropped: no free slot", dropped)
+
+    return slots
+
+
+def choose_slot_for_identity(
+    identity: CameraIdentity,
+    free_slot_indexes: list[int],
+    pins: dict[int, str],
+    last_slot_by_port: dict[str, int],
+) -> Optional[int]:
+    """Pick a slot for one identity during rescan/reattach (pure, no side effects).
+
+    Precedence, first hit wins:
+      1. A free PINNED slot whose pin matches `identity.port_path` (lowest
+         index if several match).
+      2. `last_slot_by_port[identity.port_path]`, if that slot is free AND
+         is either unpinned or its pin still matches this identity -- a
+         replug returns to its previous tile, but never steals a slot now
+         reserved for a different port.
+      3. The lowest free UNPINNED slot.
+      4. None -- the only free slots are pinned to other ports, so the
+         camera waits rather than stealing a reserved tile.
+    """
+    free_set = set(free_slot_indexes)
+
+    pinned_matches = sorted(
+        slot_index
+        for slot_index in free_set
+        if slot_index in pins and _pin_matches(pins[slot_index], identity.port_path)
+    )
+    if pinned_matches:
+        return pinned_matches[0]
+
+    last_slot = last_slot_by_port.get(identity.port_path)
+    if last_slot is not None and last_slot in free_set:
+        pin = pins.get(last_slot)
+        if pin is None or _pin_matches(pin, identity.port_path):
+            return last_slot
+
+    unpinned_free = sorted(slot_index for slot_index in free_set if slot_index not in pins)
+    if unpinned_free:
+        return unpinned_free[0]
+
+    return None
+
+
 def find_working_cameras() -> list[int]:
     """Return a list of camera indices that can capture frames.
 
