@@ -249,6 +249,14 @@ class CameraWidget(QtWidgets.QWidget):
         self._restart_events = deque(maxlen=config.MAX_RESTARTS_PER_WINDOW * 2)
         self._last_restart_ts = 0.0
         self._restart_limit_logged = False
+        # First-frame watchdog: timestamp of the most recent successful
+        # (re)attach. Set here, in attach_camera, and on successful restart
+        # in _restart_capture_if_stale. Used by _render_latest_frame to
+        # detect a worker that attached but never delivered a frame (a
+        # wedged first grab()) -- not covered by the stale-frame check
+        # below, which only runs once a frame has arrived at least once.
+        self._attach_ts = 0.0
+        self._first_frame_timeout_sec = config.FIRST_FRAME_TIMEOUT_SEC
         # Set True when a stale restart bails out because the old worker could
         # not be stopped (leaked/zombie thread). Marks the widget detachable so
         # the app-level rescan can reclaim its slot (see is_permanently_failed).
@@ -273,6 +281,7 @@ class CameraWidget(QtWidgets.QWidget):
         self.worker = None
         if self.capture_enabled and stream_link is not None:
             self._spawn_worker(stream_link, target_fps, request_capture_size)
+            self._attach_ts = time.time()
         elif not self.settings_mode:
             # No capture: set placeholder immediately
             self._latest_frame = None
@@ -379,6 +388,7 @@ class CameraWidget(QtWidgets.QWidget):
             self.base_ui_fps = max(1, int(ui_fps))  # Store original for FPS recovery
 
         self._spawn_worker(stream_link, target_fps, request_capture_size)
+        self._attach_ts = time.time()
 
         if self.ui_timer is None and config.UI_FPS_LOGGING:
             self.ui_timer = QTimer(self)
@@ -733,6 +743,18 @@ class CameraWidget(QtWidgets.QWidget):
             frame_bgr = self._latest_frame
             if frame_bgr is None:
                 self._render_placeholder(self.placeholder_text or "DISCONNECTED")
+                # First-frame watchdog: a worker that attached but has never
+                # delivered a frame is invisible to the stale-frame check
+                # below (it only runs once _last_frame_ts has been set by a
+                # first frame). Settings tiles never reach here (early
+                # return above); capture_enabled/worker guard against
+                # placeholder/detached slots.
+                if (
+                    self.capture_enabled
+                    and self.worker is not None
+                    and (time.time() - self._attach_ts) > self._first_frame_timeout_sec
+                ):
+                    self._restart_capture_if_stale()
                 return
 
             if (
@@ -1037,6 +1059,7 @@ class CameraWidget(QtWidgets.QWidget):
             return
 
         self._spawn_worker(self.camera_stream_link, target_fps, (cap_w, cap_h))
+        self._attach_ts = time.time()
         self._render_placeholder("CONNECTING...")
 
     def _log_status(self) -> None:

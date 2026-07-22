@@ -605,3 +605,183 @@ class TestBlitScaled:
 
         widget.exit_fullscreen()
         widget.cleanup()
+
+
+class TestFirstFrameWatchdog:
+    """First-frame watchdog: a worker that attaches but never emits a frame
+    must eventually trigger _restart_capture_if_stale() itself -- recovery
+    can't rely solely on the worker's internal reconnect loop, which covers
+    open-failures but not a wedged first grab().
+    """
+
+    @pytest.mark.requires_display
+    def test_attach_ts_set_on_init(self, qapp):
+        """__init__ stamps _attach_ts when it spawns a worker."""
+        from ui.widgets import CameraWidget
+
+        with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
+            mock_worker_cls.return_value = MagicMock()
+            before = time.time()
+            widget = CameraWidget(stream_link=0, enable_capture=True)
+            after = time.time()
+
+            assert before <= widget._attach_ts <= after
+
+            widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_attach_ts_set_on_attach_camera(self, qapp):
+        """attach_camera stamps _attach_ts when it spawns a new worker."""
+        from ui.widgets import CameraWidget
+
+        with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
+            widget = CameraWidget(stream_link=None, enable_capture=False)
+            widget._attach_ts = 0.0
+            mock_worker_cls.return_value = MagicMock()
+
+            before = time.time()
+            widget.attach_camera(
+                stream_link=1, target_fps=15.0, request_capture_size=(320, 240)
+            )
+            after = time.time()
+
+            assert before <= widget._attach_ts <= after
+
+            widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_attach_ts_set_on_successful_restart(self, qapp):
+        """_restart_capture_if_stale stamps _attach_ts on the success path."""
+        from ui.widgets import CameraWidget
+
+        with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
+            old_worker = MagicMock()
+            old_worker.stop.return_value = True
+            mock_worker_cls.return_value = old_worker
+
+            widget = CameraWidget(
+                stream_link=2,
+                enable_capture=True,
+                target_fps=10.0,
+                request_capture_size=(320, 240),
+            )
+            widget._last_restart_ts = 0.0
+            widget._attach_ts = 0.0
+            mock_worker_cls.return_value = MagicMock()
+
+            before = time.time()
+            widget._restart_capture_if_stale()
+            after = time.time()
+
+            assert before <= widget._attach_ts <= after
+
+            widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_attach_ts_not_bumped_on_restart_bail_out(self, qapp):
+        """The bail-out path (stop() -> False) does not spawn a replacement,
+        so _attach_ts must not be touched."""
+        from ui.widgets import CameraWidget
+
+        with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
+            old_worker = MagicMock()
+            old_worker.stop.return_value = False
+            mock_worker_cls.return_value = old_worker
+
+            widget = CameraWidget(
+                stream_link=2,
+                enable_capture=True,
+                target_fps=10.0,
+                request_capture_size=(320, 240),
+            )
+            widget._last_restart_ts = 0.0
+            widget._attach_ts = 123.0
+
+            widget._restart_capture_if_stale()
+
+            assert widget._attach_ts == 123.0
+
+            widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_watchdog_triggers_restart_after_timeout(self, qapp):
+        """No frame ever received; once FIRST_FRAME_TIMEOUT_SEC elapses since
+        attach, the render tick calls _restart_capture_if_stale()."""
+        from ui.widgets import CameraWidget
+
+        with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
+            mock_worker_cls.return_value = MagicMock()
+            widget = CameraWidget(stream_link=0, enable_capture=True)
+            widget._attach_ts = time.time() - widget._first_frame_timeout_sec - 1.0
+
+            with patch.object(widget, "_restart_capture_if_stale") as mock_restart:
+                widget._render_latest_frame()
+                mock_restart.assert_called_once()
+
+            widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_watchdog_does_not_trigger_before_timeout(self, qapp):
+        """A recent attach must not trigger the watchdog."""
+        from ui.widgets import CameraWidget
+
+        with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
+            mock_worker_cls.return_value = MagicMock()
+            widget = CameraWidget(stream_link=0, enable_capture=True)
+            widget._attach_ts = time.time()
+
+            with patch.object(widget, "_restart_capture_if_stale") as mock_restart:
+                widget._render_latest_frame()
+                mock_restart.assert_not_called()
+
+            widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_watchdog_ignored_for_settings_tile(self, qapp):
+        """Settings tiles never run the watchdog (or any frame rendering)."""
+        from ui.widgets import CameraWidget
+
+        widget = CameraWidget(
+            stream_link=None, enable_capture=False, settings_mode=True
+        )
+        widget._attach_ts = 0.0  # arbitrarily stale
+
+        with patch.object(widget, "_restart_capture_if_stale") as mock_restart:
+            widget._render_latest_frame()
+            mock_restart.assert_not_called()
+
+        widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_watchdog_ignored_when_capture_disabled(self, qapp):
+        """capture_enabled False suppresses the watchdog even with a stale
+        _attach_ts and a worker reference (e.g. mid-detach)."""
+        from ui.widgets import CameraWidget
+
+        with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
+            mock_worker_cls.return_value = MagicMock()
+            widget = CameraWidget(stream_link=0, enable_capture=True)
+            widget._attach_ts = 0.0
+            widget.capture_enabled = False
+
+            with patch.object(widget, "_restart_capture_if_stale") as mock_restart:
+                widget._render_latest_frame()
+                mock_restart.assert_not_called()
+
+            widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_watchdog_ignored_when_worker_none(self, qapp):
+        """worker is None suppresses the watchdog even with a stale _attach_ts."""
+        from ui.widgets import CameraWidget
+
+        widget = CameraWidget(stream_link=None, enable_capture=False)
+        widget.capture_enabled = True  # force the other guard open
+        widget._attach_ts = 0.0
+        assert widget.worker is None
+
+        with patch.object(widget, "_restart_capture_if_stale") as mock_restart:
+            widget._render_latest_frame()
+            mock_restart.assert_not_called()
+
+        widget.cleanup()

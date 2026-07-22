@@ -142,6 +142,36 @@ class TestChooseProfile:
         assert isinstance(result, tuple)
         assert len(result) == 4
 
+
+class TestFirstFrameTimeoutConfig:
+    """Test parsing of [performance] first_frame_timeout_sec."""
+
+    def test_default_value(self):
+        """Default is 10.0 seconds, field-tunable like stale_frame_timeout_sec."""
+        assert config.FIRST_FRAME_TIMEOUT_SEC == 10.0
+
+    def test_parses_configured_value(self, tmp_path, save_restore_config):
+        """A configured value overrides the default."""
+        config_file = tmp_path / "test.ini"
+        config_file.write_text(
+            "[performance]\nfirst_frame_timeout_sec = 20.0\n"
+        )
+        parser = config.load_config(str(config_file))
+        config.apply_config(parser)
+
+        assert config.FIRST_FRAME_TIMEOUT_SEC == 20.0
+
+    def test_enforces_minimum_bound(self, tmp_path, save_restore_config):
+        """Values below the 2.0s minimum are clamped."""
+        config_file = tmp_path / "test.ini"
+        config_file.write_text(
+            "[performance]\nfirst_frame_timeout_sec = 0.1\n"
+        )
+        parser = config.load_config(str(config_file))
+        config.apply_config(parser)
+
+        assert config.FIRST_FRAME_TIMEOUT_SEC >= 2.0
+
     def test_choose_profile_values(self, save_restore_config):
         """Test choose_profile returns configured values unchanged, consistently."""
         # Set known values

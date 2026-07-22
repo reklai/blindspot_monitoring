@@ -54,6 +54,12 @@ RESTART_COOLDOWN_SEC = 5.0
 MAX_RESTARTS_PER_WINDOW = 3
 RESTART_WINDOW_SEC = 30.0
 
+# First-frame watchdog: how long a freshly (re)attached worker may go
+# without ever delivering a frame before the widget treats it as wedged
+# and calls _restart_capture_if_stale() itself (covers a hang in the
+# worker's first grab(), which its own reconnect loop does not see).
+FIRST_FRAME_TIMEOUT_SEC = 10.0
+
 
 # ============================================================
 # CAMERA RESCAN (HOT-PLUG SUPPORT)
@@ -247,6 +253,7 @@ _CONFIG_TABLE: tuple[_ConfigEntry, ...] = (
     _ConfigEntry("performance", "restart_cooldown_sec", "RESTART_COOLDOWN_SEC", _as_float, RESTART_COOLDOWN_SEC, min_value=1.0),
     _ConfigEntry("performance", "max_restarts_per_window", "MAX_RESTARTS_PER_WINDOW", _as_int, MAX_RESTARTS_PER_WINDOW, min_value=1),
     _ConfigEntry("performance", "restart_window_sec", "RESTART_WINDOW_SEC", _as_float, RESTART_WINDOW_SEC, min_value=5.0),
+    _ConfigEntry("performance", "first_frame_timeout_sec", "FIRST_FRAME_TIMEOUT_SEC", _as_float, FIRST_FRAME_TIMEOUT_SEC, min_value=2.0),
 
     _ConfigEntry("camera", "rescan_interval_ms", "RESCAN_INTERVAL_MS", _as_int, RESCAN_INTERVAL_MS, min_value=500),
     _ConfigEntry("camera", "failed_camera_cooldown_sec", "FAILED_CAMERA_COOLDOWN_SEC", _as_float, FAILED_CAMERA_COOLDOWN_SEC, min_value=1.0),
