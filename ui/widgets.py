@@ -688,6 +688,34 @@ class CameraWidget(QtWidgets.QWidget):
         if self.swap_active:
             self.setStyleSheet(self.swap_ready_style)
 
+    def _blit_scaled(
+        self,
+        target_label: QtWidgets.QLabel,
+        target_size: QtCore.QSize,
+        needs_scale: bool,
+    ) -> None:
+        """Blit `self._pixmap_cache` onto `target_label`, scaling into
+        `target_size` via the cached scaled pixmap when `needs_scale` is True.
+        """
+        if needs_scale:
+            if (
+                self._scaled_pixmap_cache is None
+                or self._scaled_pixmap_cache_size != target_size
+            ):
+                self._scaled_pixmap_cache = QtGui.QPixmap(target_size)
+                self._scaled_pixmap_cache_size = target_size
+            self._scaled_pixmap_cache.fill(Qt.GlobalColor.black)
+            target_rect = QtCore.QRect(
+                0, 0, target_size.width(), target_size.height()
+            )
+            painter = QtGui.QPainter(self._scaled_pixmap_cache)
+            painter.drawPixmap(target_rect, self._pixmap_cache)
+            painter.end()
+            target_label.setPixmap(self._scaled_pixmap_cache)
+        else:
+            target_label.setPixmap(self._pixmap_cache)
+        target_label.setText("")
+
     def _render_latest_frame(self) -> None:
         """Convert latest frame to QPixmap and display it."""
         if self.settings_mode:
@@ -804,47 +832,15 @@ class CameraWidget(QtWidgets.QWidget):
 
             # Fullscreen scales to screen size; grid uses label size.
             if self.is_fullscreen and self._fs_overlay:
-                if target_size.width() > 0 and target_size.height() > 0:
-                    if (
-                        self._scaled_pixmap_cache is None
-                        or self._scaled_pixmap_cache_size != target_size
-                    ):
-                        self._scaled_pixmap_cache = QtGui.QPixmap(target_size)
-                        self._scaled_pixmap_cache_size = target_size
-                    self._scaled_pixmap_cache.fill(Qt.GlobalColor.black)
-                    target_rect = QtCore.QRect(
-                        0, 0, target_size.width(), target_size.height()
-                    )
-                    painter = QtGui.QPainter(self._scaled_pixmap_cache)
-                    painter.drawPixmap(target_rect, self._pixmap_cache)
-                    painter.end()
-                    self._fs_overlay.label.setPixmap(self._scaled_pixmap_cache)
-                else:
-                    self._fs_overlay.label.setPixmap(self._pixmap_cache)
-                self._fs_overlay.label.setText("")
+                needs_scale = target_size.width() > 0 and target_size.height() > 0
+                self._blit_scaled(self._fs_overlay.label, target_size, needs_scale)
             else:
-                if (
+                needs_scale = (
                     target_size.width() > 0
                     and target_size.height() > 0
                     and self._pixmap_cache.size() != target_size
-                ):
-                    if (
-                        self._scaled_pixmap_cache is None
-                        or self._scaled_pixmap_cache_size != target_size
-                    ):
-                        self._scaled_pixmap_cache = QtGui.QPixmap(target_size)
-                        self._scaled_pixmap_cache_size = target_size
-                    self._scaled_pixmap_cache.fill(Qt.GlobalColor.black)
-                    target_rect = QtCore.QRect(
-                        0, 0, target_size.width(), target_size.height()
-                    )
-                    painter = QtGui.QPainter(self._scaled_pixmap_cache)
-                    painter.drawPixmap(target_rect, self._pixmap_cache)
-                    painter.end()
-                    self.video_label.setPixmap(self._scaled_pixmap_cache)
-                else:
-                    self.video_label.setPixmap(self._pixmap_cache)
-                self.video_label.setText("")
+                )
+                self._blit_scaled(self.video_label, target_size, needs_scale)
 
             self._last_rendered_id = self._frame_id
             self._last_rendered_size = target_size

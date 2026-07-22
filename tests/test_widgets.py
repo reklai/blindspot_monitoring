@@ -5,6 +5,7 @@ Tests for ui/widgets.py - Widget lifecycle and fullscreen behavior.
 import time
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 
@@ -424,3 +425,55 @@ class TestSpawnWorker:
             new_worker.start.assert_called_once()
 
             widget.cleanup()
+
+
+class TestBlitScaled:
+    """Characterization tests pinning the scaled-pixmap blit path in
+    _render_latest_frame, for both grid and fullscreen targets.
+    """
+
+    @pytest.mark.requires_display
+    def test_render_latest_frame_blits_grid_pixmap(self, qapp):
+        """Feeding a frame produces a pixmap on the grid video_label."""
+        from ui.widgets import CameraWidget
+
+        widget = CameraWidget(
+            stream_link=None,
+            enable_capture=False,
+        )
+        widget.resize(200, 150)
+        widget.show()
+
+        frame = np.zeros((48, 64, 3), dtype=np.uint8)
+        widget.on_frame(frame)
+        widget._render_latest_frame()
+
+        pixmap = widget.video_label.pixmap()
+        assert pixmap is not None
+        assert not pixmap.isNull()
+        assert widget.video_label.text() == ""
+
+        widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_render_latest_frame_blits_fullscreen_pixmap(self, qapp):
+        """Feeding a frame while fullscreen produces a pixmap on the overlay label."""
+        from ui.widgets import CameraWidget
+
+        widget = CameraWidget(
+            stream_link=None,
+            enable_capture=False,
+        )
+        widget.go_fullscreen()
+
+        frame = np.zeros((48, 64, 3), dtype=np.uint8)
+        widget.on_frame(frame)
+        widget._render_latest_frame()
+
+        pixmap = widget._fs_overlay.label.pixmap()
+        assert pixmap is not None
+        assert not pixmap.isNull()
+        assert widget._fs_overlay.label.text() == ""
+
+        widget.exit_fullscreen()
+        widget.cleanup()
