@@ -171,8 +171,11 @@ cat > "$SYSTEMD_DIR/camera-dashboard.service" <<EOF
 Description=Camera Dashboard
 After=default.target
 Wants=default.target
-StartLimitIntervalSec=60
-StartLimitBurst=5
+# Never give up restarting: a dead monitor is worse than a restart loop for
+# a driver-facing safety display. StartLimitIntervalSec=0 disables systemd's
+# crash-loop lockout entirely; Restart=always + RestartSec=5 below keeps
+# retrying forever, 5s apart.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
