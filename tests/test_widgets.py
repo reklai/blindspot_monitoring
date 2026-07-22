@@ -304,5 +304,123 @@ class TestDynamicFPS:
         widget.set_dynamic_ui_fps(10)
         # Just verify it's at or above minimum
         assert widget.ui_render_fps >= config.MIN_DYNAMIC_UI_FPS
-        
+
         widget.cleanup()
+
+
+class TestSpawnWorker:
+    """Characterization tests pinning CaptureWorker construction/wiring/start
+    at each of the three call sites (__init__, attach_camera,
+    _restart_capture_if_stale), before/after the _spawn_worker extraction.
+    """
+
+    @pytest.mark.requires_display
+    def test_init_spawns_and_wires_worker(self, qapp):
+        """__init__ constructs, wires, and starts a CaptureWorker when capture is enabled."""
+        from ui.widgets import CameraWidget
+
+        with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
+            mock_worker = MagicMock()
+            mock_worker_cls.return_value = mock_worker
+
+            widget = CameraWidget(
+                stream_link=0,
+                enable_capture=True,
+                target_fps=20.0,
+                request_capture_size=(640, 480),
+            )
+
+            mock_worker_cls.assert_called_once_with(
+                0,
+                parent=widget,
+                target_fps=20.0,
+                capture_width=640,
+                capture_height=480,
+            )
+            assert widget.worker is mock_worker
+            mock_worker.frame_ready.connect.assert_called_once_with(widget.on_frame)
+            mock_worker.status_changed.connect.assert_called_once_with(
+                widget.on_status_changed
+            )
+            mock_worker.start.assert_called_once()
+
+            widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_attach_camera_spawns_and_wires_worker(self, qapp):
+        """attach_camera constructs, wires, and starts a new CaptureWorker."""
+        from ui.widgets import CameraWidget
+
+        with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
+            widget = CameraWidget(
+                stream_link=None,
+                enable_capture=False,
+            )
+            mock_worker_cls.reset_mock()
+            mock_worker = MagicMock()
+            mock_worker_cls.return_value = mock_worker
+
+            widget.attach_camera(
+                stream_link=1,
+                target_fps=15.0,
+                request_capture_size=(320, 240),
+            )
+
+            mock_worker_cls.assert_called_once_with(
+                1,
+                parent=widget,
+                target_fps=15.0,
+                capture_width=320,
+                capture_height=240,
+            )
+            assert widget.worker is mock_worker
+            mock_worker.frame_ready.connect.assert_called_once_with(widget.on_frame)
+            mock_worker.status_changed.connect.assert_called_once_with(
+                widget.on_status_changed
+            )
+            mock_worker.start.assert_called_once()
+
+            widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_restart_capture_if_stale_spawns_and_wires_worker(self, qapp):
+        """_restart_capture_if_stale replaces a stopped worker with a new one,
+        reading the previous capture size back off the old worker via getattr.
+        """
+        from ui.widgets import CameraWidget
+
+        with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
+            old_worker = MagicMock()
+            old_worker.isRunning.return_value = False
+            old_worker.capture_width = 320
+            old_worker.capture_height = 240
+            mock_worker_cls.return_value = old_worker
+
+            widget = CameraWidget(
+                stream_link=2,
+                enable_capture=True,
+                target_fps=10.0,
+                request_capture_size=(320, 240),
+            )
+
+            new_worker = MagicMock()
+            mock_worker_cls.reset_mock()
+            mock_worker_cls.return_value = new_worker
+
+            widget._restart_capture_if_stale()
+
+            mock_worker_cls.assert_called_once_with(
+                2,
+                parent=widget,
+                target_fps=10.0,
+                capture_width=320,
+                capture_height=240,
+            )
+            assert widget.worker is new_worker
+            new_worker.frame_ready.connect.assert_called_once_with(widget.on_frame)
+            new_worker.status_changed.connect.assert_called_once_with(
+                widget.on_status_changed
+            )
+            new_worker.start.assert_called_once()
+
+            widget.cleanup()

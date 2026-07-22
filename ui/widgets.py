@@ -264,19 +264,7 @@ class CameraWidget(QtWidgets.QWidget):
         # Start capture worker in background thread (if enabled)
         self.worker = None
         if self.capture_enabled and stream_link is not None:
-            cap_w, cap_h = (
-                request_capture_size if request_capture_size else (None, None)
-            )
-            self.worker = CaptureWorker(
-                stream_link,
-                parent=self,
-                target_fps=target_fps,
-                capture_width=cap_w,
-                capture_height=cap_h,
-            )
-            self.worker.frame_ready.connect(self.on_frame)
-            self.worker.status_changed.connect(self.on_status_changed)
-            self.worker.start()
+            self._spawn_worker(stream_link, target_fps, request_capture_size)
         elif not self.settings_mode:
             # No capture: set placeholder immediately
             self._latest_frame = None
@@ -338,6 +326,25 @@ class CameraWidget(QtWidgets.QWidget):
             interval = max(1, int(1000 / self.ui_render_fps) - config.RENDER_OVERHEAD_MS)
             self.render_timer.setInterval(interval)
 
+    def _spawn_worker(
+        self,
+        stream_link: Union[int, str],
+        target_fps: Optional[float],
+        capture_size: Optional[tuple[int, int]],
+    ) -> None:
+        """Construct, wire, and start a CaptureWorker; assigns self.worker."""
+        cap_w, cap_h = capture_size if capture_size else (None, None)
+        self.worker = CaptureWorker(
+            stream_link,
+            parent=self,
+            target_fps=target_fps,
+            capture_width=cap_w,
+            capture_height=cap_h,
+        )
+        self.worker.frame_ready.connect(self.on_frame)
+        self.worker.status_changed.connect(self.on_status_changed)
+        self.worker.start()
+
     def attach_camera(
         self,
         stream_link: int,
@@ -362,17 +369,7 @@ class CameraWidget(QtWidgets.QWidget):
             self._apply_ui_fps(ui_fps)
             self.base_ui_fps = max(1, int(ui_fps))  # Store original for FPS recovery
 
-        cap_w, cap_h = request_capture_size if request_capture_size else (None, None)
-        self.worker = CaptureWorker(
-            stream_link,
-            parent=self,
-            target_fps=target_fps,
-            capture_width=cap_w,
-            capture_height=cap_h,
-        )
-        self.worker.frame_ready.connect(self.on_frame)
-        self.worker.status_changed.connect(self.on_status_changed)
-        self.worker.start()
+        self._spawn_worker(stream_link, target_fps, request_capture_size)
 
         if self.ui_timer is None and config.UI_FPS_LOGGING:
             self.ui_timer = QTimer(self)
@@ -989,16 +986,7 @@ class CameraWidget(QtWidgets.QWidget):
         if self.camera_stream_link is None:
             return
         
-        self.worker = CaptureWorker(
-            self.camera_stream_link,
-            parent=self,
-            target_fps=target_fps,
-            capture_width=cap_w,
-            capture_height=cap_h,
-        )
-        self.worker.frame_ready.connect(self.on_frame)
-        self.worker.status_changed.connect(self.on_status_changed)
-        self.worker.start()
+        self._spawn_worker(self.camera_stream_link, target_fps, (cap_w, cap_h))
         self._render_placeholder("CONNECTING...")
 
     def _log_status(self) -> None:
