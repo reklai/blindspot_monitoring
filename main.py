@@ -87,12 +87,6 @@ def main() -> None:
     QtCore.QTimer.singleShot(50, force_fullscreen)
     QtCore.QTimer.singleShot(300, force_fullscreen)
 
-    primary_screen = app.primaryScreen()
-    screen = (
-        primary_screen.availableGeometry()
-        if primary_screen
-        else QtCore.QRect(0, 0, 1920, 1080)
-    )
     working_cameras = find_working_cameras()
     logging.info("Found %d cameras", len(working_cameras))
 
