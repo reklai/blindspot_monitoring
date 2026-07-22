@@ -174,7 +174,8 @@ class CaptureWorker(QThread):
                         self._online = True
                         self.status_changed.emit(True)
 
-                # Grab & retrieve keeps latency low vs read().
+                # Always grab() to drain the driver buffer and keep latency
+                # low; this is cheap (no decode).
                 grabbed = self._cap.grab()
                 if not grabbed:
                     logging.debug(
@@ -187,23 +188,25 @@ class CaptureWorker(QThread):
                         self.status_changed.emit(False)
                     continue
 
-                ret, frame = self._cap.retrieve()
-                if not ret or frame is None:
-                    logging.debug(
-                        "Camera %s: retrieve() failed, closing capture",
-                        self.stream_link,
-                    )
-                    self._close_capture()
-                    if self._online:
-                        self._online = False
-                        self.status_changed.emit(False)
-                    continue
-
                 now = time.time()
                 with self._fps_lock:
                     emit_interval = self._emit_interval
-                # Throttle emits to target FPS to avoid UI overload.
+                # Throttle BEFORE retrieve(): frames the throttle drops never
+                # get decoded. On the V4L2 MJPG fallback path retrieve() runs
+                # the JPEG decode, so this skips that work for dropped frames.
+                # (GStreamer decodes in-pipeline regardless -- no effect there.)
                 if now - self._last_emit >= emit_interval:
+                    ret, frame = self._cap.retrieve()
+                    if not ret or frame is None:
+                        logging.debug(
+                            "Camera %s: retrieve() failed, closing capture",
+                            self.stream_link,
+                        )
+                        self._close_capture()
+                        if self._online:
+                            self._online = False
+                            self.status_changed.emit(False)
+                        continue
                     # retrieve() hands back a fresh, private, contiguous array
                     # every call, so it is safe to emit directly (no copy).
                     self.frame_ready.emit(frame)

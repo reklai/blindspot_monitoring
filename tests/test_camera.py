@@ -566,3 +566,30 @@ class TestRunLoopEmit:
         assert len(emitted) == 1
         # Identity, not just equality: no copy was made.
         assert emitted[0] is frame
+
+    def test_throttle_before_retrieve_skips_decode_for_dropped_frames(self):
+        """grab() runs every iteration (drains driver buffer) but retrieve()
+        -- the JPEG decode on the V4L2 MJPG path -- runs ONLY for frames the
+        throttle admits. With a huge emit interval only the first frame is
+        due, so retrieve() is called once while grab() is called N times."""
+        import numpy as np
+
+        from core.camera import CaptureWorker
+
+        worker = CaptureWorker(stream_link=0, parent=None, target_fps=30.0)
+        # Effectively never due again after the first emit.
+        worker._emit_interval = 10_000.0
+        worker._last_emit = 0.0
+
+        frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        cap = MagicMock()
+        cap.retrieve.return_value = (True, frame)
+
+        emitted = []
+        worker.frame_ready.connect(lambda f: emitted.append(f))
+
+        _run_worker_for_grabs(worker, cap, n_grabs=4)
+
+        assert cap.grab.call_count == 4
+        assert cap.retrieve.call_count == 1
+        assert len(emitted) == 1
