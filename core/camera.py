@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import glob as glob_module
 import logging
+import os
 import platform
+import re
 import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import cv2
@@ -557,59 +560,287 @@ def get_video_indexes() -> list[int]:
     return indexes
 
 
-def find_working_cameras() -> list[int]:
-    """Return a list of camera indices that can capture frames."""
-    indexes = get_video_indexes()
-    if not indexes:
+# ============================================================
+# CAMERA IDENTITY
+# ============================================================
+#
+# Slots must not be assigned by sorted /dev/video* index: USB enumeration
+# order is unstable across reboots/replugs, which can silently swap which
+# physical camera lands in which tile (safety-critical for a driver-facing
+# blindspot monitor). CameraIdentity anchors slot assignment to the USB
+# port path reported under /dev/v4l/by-path instead, which is stable for
+# a given physical cable/port regardless of enumeration order.
+
+# Module-level so tests can monkeypatch core.camera.BY_PATH_DIR.
+BY_PATH_DIR = "/dev/v4l/by-path"
+
+# Emitted once per process the first time by-path discovery comes up
+# empty while numeric /dev/video* nodes exist.
+_by_path_degraded_warned = False
+
+
+@dataclass(frozen=True)
+class CameraIdentity:
+    """Stable physical identity for one camera.
+
+    `port_path` is the USB port path derived from the /dev/v4l/by-path
+    entry name (that entry's name minus its trailing "-video-indexN"
+    suffix), or the pseudo-key "index:N" in fallback mode when no by-path
+    entries exist. It is the stable key: any dict/bookkeeping code
+    elsewhere (slot assignment, cooldowns, etc.) MUST key on this string,
+    never on a CameraIdentity instance or its `index` -- `index` and
+    `device_path` are just a snapshot taken at discovery time and can go
+    stale after a replug.
+    """
+
+    port_path: str
+    device_path: Optional[str]
+    index: int
+
+    @property
+    def stream_target(self) -> Union[int, str]:
+        """Value to pass as a capture source (by-path symlink, else index)."""
+        return self.device_path if self.device_path is not None else self.index
+
+
+def _natural_key(s: str) -> list[Union[str, int]]:
+    """Natural-sort key: splits digit runs into ints.
+
+    Plain lexicographic sorting gets USB port paths wrong, e.g.
+    "usb-0:1.10" would sort before "usb-0:1.2". Splitting digit runs out
+    as ints fixes that ("1.2" < "1.10" numerically).
+    """
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", s)]
+
+
+def _identity_sort_key(identity: "CameraIdentity") -> tuple:
+    """Sort by-path identities (natural port order) before fallback ones (by index)."""
+    if identity.device_path is not None:
+        return (0, _natural_key(identity.port_path))
+    return (1, identity.index)
+
+
+def _warn_by_path_degraded_once() -> None:
+    """Log the "degraded to enumeration order" warning at most once per process."""
+    global _by_path_degraded_warned
+    if not _by_path_degraded_warned:
+        logging.warning(
+            "no /dev/v4l/by-path entries; deterministic slot binding degraded "
+            "to enumeration order"
+        )
+        _by_path_degraded_warned = True
+
+
+def list_by_path_nodes(
+    by_path_dir: Optional[str] = None,
+) -> dict[str, list[tuple[int, str]]]:
+    """Group /dev/v4l/by-path entries by physical USB port path.
+
+    Returns {port_path: [(video_index, entry_name), ...]}, each group's
+    nodes sorted ascending by index. A port_path is a by-path entry name
+    with its trailing "-video-indexN" suffix stripped. Entries that don't
+    match that naming pattern, or whose resolved target isn't a
+    /dev/videoN node, are skipped. A missing/unreadable directory (or one
+    with no matching entries) returns {}.
+
+    `by_path_dir=None` means "use BY_PATH_DIR", read from the module
+    attribute at call time so tests can monkeypatch it.
+    """
+    directory = by_path_dir if by_path_dir is not None else BY_PATH_DIR
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return {}
+
+    groups: dict[str, list[tuple[int, str]]] = {}
+    for name in names:
+        match = re.fullmatch(r"(.+)-video-index(\d+)", name)
+        if not match:
+            continue
+        port_path = match.group(1)
+        resolved = os.path.realpath(os.path.join(directory, name))
+        node_match = re.search(r"video(\d+)$", resolved)
+        if not node_match:
+            continue
+        node_index = int(node_match.group(1))
+        groups.setdefault(port_path, []).append((node_index, name))
+
+    for nodes in groups.values():
+        nodes.sort(key=lambda pair: pair[0])
+
+    return groups
+
+
+def _test_identity(
+    port_path: str,
+    node_indexes: list[tuple[int, Optional[str]]],
+    by_path_dir: Optional[str],
+    **probe_kwargs: Any,
+) -> Optional[CameraIdentity]:
+    """Probe one physical group's candidate nodes, ascending, for the capture node.
+
+    UVC devices commonly expose a metadata node alongside the real
+    capture node in the same by-path group; the metadata node fails
+    grab(). The first node (in ascending index order) that passes
+    `test_single_camera` wins and becomes the identity. If every node
+    fails, returns None. `node_indexes` entries are (video_index,
+    entry_name); entry_name is None for fallback (no-by-path) candidates,
+    which yields device_path=None.
+    """
+    directory = by_path_dir if by_path_dir is not None else BY_PATH_DIR
+    for index, entry_name in node_indexes:
+        result = test_single_camera(index, **probe_kwargs)
+        if result is not None:
+            device_path = (
+                os.path.join(directory, entry_name) if entry_name is not None else None
+            )
+            return CameraIdentity(port_path=port_path, device_path=device_path, index=index)
+    return None
+
+
+def discover_camera_identities(by_path_dir: Optional[str] = None) -> list[CameraIdentity]:
+    """Cheap, non-probing camera identity discovery (used by the rescan tick).
+
+    Combines /dev/v4l/by-path groups with orphan /dev/video* nodes not
+    covered by any by-path group. No probing is done here: a by-path
+    group's LOWEST node is used as the provisional index/device_path
+    (probing to pick the real capture node happens in
+    find_working_camera_identities). Orphan numeric nodes become fallback
+    identities (port_path "index:N", device_path None).
+
+    Sorted: by-path identities first (natural port_path order), then
+    fallback identities (by index).
+    """
+    directory = by_path_dir if by_path_dir is not None else BY_PATH_DIR
+    groups = list_by_path_nodes(directory)
+
+    covered_indexes: set[int] = set()
+    by_path_identities: list[CameraIdentity] = []
+    for port_path, nodes in groups.items():
+        lowest_index, entry_name = nodes[0]
+        by_path_identities.append(
+            CameraIdentity(
+                port_path=port_path,
+                device_path=os.path.join(directory, entry_name),
+                index=lowest_index,
+            )
+        )
+        covered_indexes.update(idx for idx, _ in nodes)
+    by_path_identities.sort(key=_identity_sort_key)
+
+    all_indexes = get_video_indexes()
+    if not groups and all_indexes:
+        _warn_by_path_degraded_once()
+
+    orphan_indexes = sorted(idx for idx in all_indexes if idx not in covered_indexes)
+    fallback_identities = [
+        CameraIdentity(port_path=f"index:{idx}", device_path=None, index=idx)
+        for idx in orphan_indexes
+    ]
+
+    return by_path_identities + fallback_identities
+
+
+def find_working_camera_identities(by_path_dir: Optional[str] = None) -> list[CameraIdentity]:
+    """Probing camera identity discovery, used at startup.
+
+    Mirrors find_working_cameras()'s two-round structure, but round 1
+    submits one probe per PHYSICAL GROUP (via _test_identity) instead of
+    per node, so a UVC metadata node never shadows the real capture node.
+    Round 2 re-confirms each surviving identity's resolved index with the
+    existing no-kill confirmation pattern; failures drop the identity.
+    """
+    directory = by_path_dir if by_path_dir is not None else BY_PATH_DIR
+    groups = list_by_path_nodes(directory)
+
+    covered_indexes = {idx for nodes in groups.values() for idx, _ in nodes}
+    all_indexes = get_video_indexes()
+    if not groups and all_indexes:
+        _warn_by_path_degraded_once()
+
+    orphan_indexes = sorted(idx for idx in all_indexes if idx not in covered_indexes)
+
+    candidates: dict[str, list[tuple[int, Optional[str]]]] = dict(groups)
+    for idx in orphan_indexes:
+        candidates[f"index:{idx}"] = [(idx, None)]
+
+    if not candidates:
         logging.info("No /dev/video* devices found!")
         return []
 
-    max_workers = min(4, len(indexes))
+    max_workers = min(4, len(candidates))
     logging.info(
-        "Testing %d cameras concurrently (workers=%d)...", len(indexes), max_workers
+        "Testing %d camera groups concurrently (workers=%d)...",
+        len(candidates),
+        max_workers,
     )
-    working = []
+    survivors: list[CameraIdentity] = []
     lock = threading.Lock()
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(test_single_camera, idx): idx for idx in indexes}
+        futures = {
+            executor.submit(_test_identity, port_path, nodes, directory): port_path
+            for port_path, nodes in candidates.items()
+        }
         for future in as_completed(futures):
-            cam_idx = futures[future]
+            port_path = futures[future]
             try:
-                result = future.result()
-                if result is not None:
+                identity = future.result()
+                if identity is not None:
                     with lock:
-                        working.append(result)
-                        logging.info("Camera %d OK", result)
+                        survivors.append(identity)
+                        logging.info(
+                            "Camera group %s OK -> /dev/video%d",
+                            identity.port_path,
+                            identity.index,
+                        )
             except Exception:
-                logging.exception("Exception testing camera %d", cam_idx)
+                logging.exception("Exception testing camera group %s", port_path)
 
-    # Second pass to confirm cameras without killing holders
-    if working:
+    # Second pass to confirm survivors without killing holders.
+    if survivors:
         logging.info("Round 2 - Double-check (no pre-kill)...")
-        final_working = []
-        with ThreadPoolExecutor(max_workers=min(4, len(working))) as executor:
+        confirmed: list[CameraIdentity] = []
+        with ThreadPoolExecutor(max_workers=min(4, len(survivors))) as executor:
             futures = {
                 executor.submit(
                     test_single_camera,
-                    idx,
+                    identity.index,
                     retries=2,
                     retry_delay=0.15,
                     allow_kill=False,
-                ): idx
-                for idx in working
+                ): identity
+                for identity in survivors
             }
             for future in as_completed(futures):
-                cam_idx = futures[future]
+                identity = futures[future]
                 try:
                     result = future.result()
                     if result is not None:
-                        final_working.append(result)
-                        logging.info("Confirmed camera %d", result)
+                        confirmed.append(identity)
+                        logging.info(
+                            "Confirmed camera %s -> /dev/video%d",
+                            identity.port_path,
+                            identity.index,
+                        )
                 except Exception:
-                    logging.exception("Exception confirming camera %d", cam_idx)
-        working = final_working
+                    logging.exception("Exception confirming camera %s", identity.port_path)
+        survivors = confirmed
 
-    working = sorted(working)
-    logging.info("FINAL Working cameras: %s", working)
-    return working
+    survivors.sort(key=_identity_sort_key)
+    logging.info(
+        "FINAL Working camera identities: %s",
+        {identity.port_path: f"/dev/video{identity.index}" for identity in survivors},
+    )
+    return survivors
+
+
+def find_working_cameras() -> list[int]:
+    """Return a list of camera indices that can capture frames.
+
+    Delegates to find_working_camera_identities() (by-path aware, dedupes
+    UVC metadata nodes from the real capture node per physical port) and
+    returns just the resolved /dev/videoN indices, for callers that don't
+    need full CameraIdentity objects.
+    """
+    return [identity.index for identity in find_working_camera_identities()]
