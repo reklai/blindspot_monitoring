@@ -101,7 +101,11 @@ class CameraWidget(QtWidgets.QWidget):
         )
 
         self.camera_stream_link = stream_link
-        self.widget_id = f"cam{stream_link}_{id(self)}"
+        # For str stream links (by-path symlinks) keep only the readable
+        # tail (e.g. "...usb-0:1.3:1.0-video-index0") so log lines stay
+        # short; int links are unchanged.
+        id_label = stream_link[-24:] if isinstance(stream_link, str) else stream_link
+        self.widget_id = f"cam{id_label}_{id(self)}"
 
         # State used for fullscreen toggle + drag/hold swap mode.
         self.is_fullscreen = False
