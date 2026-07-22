@@ -142,6 +142,25 @@ class TestChooseProfile:
         assert isinstance(result, tuple)
         assert len(result) == 4
 
+    def test_choose_profile_values(self, save_restore_config):
+        """Test choose_profile returns configured values unchanged, consistently."""
+        # Set known values
+        config.PROFILE_CAPTURE_WIDTH = 640
+        config.PROFILE_CAPTURE_HEIGHT = 480
+        config.PROFILE_CAPTURE_FPS = 20
+        config.PROFILE_UI_FPS = 15
+        config.MIN_DYNAMIC_FPS = 5
+        config.MIN_DYNAMIC_UI_FPS = 10
+
+        # Values pass through from config unchanged, regardless of how many
+        # times it's called (no camera-count scaling).
+        for _ in range(3):
+            w, h, fps, ui_fps = config.choose_profile()
+            assert w == 640
+            assert h == 480
+            assert fps == 20
+            assert ui_fps == 15
+
 
 class TestFirstFrameTimeoutConfig:
     """Test parsing of [performance] first_frame_timeout_sec."""
@@ -171,25 +190,6 @@ class TestFirstFrameTimeoutConfig:
         config.apply_config(parser)
 
         assert config.FIRST_FRAME_TIMEOUT_SEC >= 2.0
-
-    def test_choose_profile_values(self, save_restore_config):
-        """Test choose_profile returns configured values unchanged, consistently."""
-        # Set known values
-        config.PROFILE_CAPTURE_WIDTH = 640
-        config.PROFILE_CAPTURE_HEIGHT = 480
-        config.PROFILE_CAPTURE_FPS = 20
-        config.PROFILE_UI_FPS = 15
-        config.MIN_DYNAMIC_FPS = 5
-        config.MIN_DYNAMIC_UI_FPS = 10
-
-        # Values pass through from config unchanged, regardless of how many
-        # times it's called (no camera-count scaling).
-        for _ in range(3):
-            w, h, fps, ui_fps = config.choose_profile()
-            assert w == 640
-            assert h == 480
-            assert fps == 20
-            assert ui_fps == 15
 
 
 class TestSlotPins:
