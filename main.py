@@ -30,6 +30,40 @@ from ui import CameraWidget, get_smart_grid
 from utils import log_health_summary
 
 
+def _step_widget_fps(w: CameraWidget, stress: bool, profile_ui_fps: int) -> bool:
+    """Adjust one widget's capture and UI FPS a single step toward the
+    stress-relief direction (lower) or the recovery direction (restore
+    toward base). Returns True if either FPS value actually changed.
+    """
+    changed = False
+    base = w.base_target_fps or 30
+    cur = w.current_target_fps or base
+    if stress:
+        new_fps = max(config.MIN_DYNAMIC_FPS, cur - 2)
+        if new_fps < cur:
+            w.set_dynamic_fps(new_fps)
+            changed = True
+        # Use widget's base_ui_fps for consistent recovery target
+        cur_ui = w.ui_render_fps or profile_ui_fps
+        new_ui = max(config.MIN_DYNAMIC_UI_FPS, cur_ui - config.UI_FPS_STEP)
+        if new_ui < cur_ui:
+            w.set_dynamic_ui_fps(new_ui)
+            changed = True
+    else:
+        new_fps = min(base, cur + 2)
+        if new_fps > cur:
+            w.set_dynamic_fps(new_fps)
+            changed = True
+        # Restore toward widget's original base_ui_fps, not profile ui_fps
+        base_ui = w.base_ui_fps or profile_ui_fps
+        cur_ui = w.ui_render_fps or base_ui
+        new_ui = min(base_ui, cur_ui + config.UI_FPS_STEP)
+        if new_ui > cur_ui:
+            w.set_dynamic_ui_fps(new_ui)
+            changed = True
+    return changed
+
+
 def safe_cleanup(widgets: list[CameraWidget], cleaned_flag: list[bool]) -> None:
     """Gracefully stop all camera worker threads."""
     if cleaned_flag[0]:
@@ -221,18 +255,7 @@ def main() -> None:
 
             if stress_counter["stress"] >= config.STRESS_HOLD_COUNT:
                 for w in camera_widgets:
-                    base = w.base_target_fps or 30
-                    cur = w.current_target_fps or base
-                    new_fps = max(config.MIN_DYNAMIC_FPS, cur - 2)
-                    if new_fps < cur:
-                        w.set_dynamic_fps(new_fps)
-                    # Use widget's base_ui_fps for consistent recovery target
-                    cur_ui = w.ui_render_fps or ui_fps
-                    new_ui = max(
-                        config.MIN_DYNAMIC_UI_FPS, cur_ui - config.UI_FPS_STEP
-                    )
-                    if new_ui < cur_ui:
-                        w.set_dynamic_ui_fps(new_ui)
+                    _step_widget_fps(w, stress=True, profile_ui_fps=ui_fps)
                 stress_counter["stress"] = 0
                 logging.info(
                     "Stress detected (load=%s, temp=%s). Lowering FPS.",
@@ -243,18 +266,7 @@ def main() -> None:
             if stress_counter["recover"] >= config.RECOVER_HOLD_COUNT:
                 fps_restored = False
                 for w in camera_widgets:
-                    base = w.base_target_fps or 30
-                    cur = w.current_target_fps or base
-                    new_fps = min(base, cur + 2)
-                    if new_fps > cur:
-                        w.set_dynamic_fps(new_fps)
-                        fps_restored = True
-                    # Restore toward widget's original base_ui_fps, not profile ui_fps
-                    base_ui = w.base_ui_fps or ui_fps
-                    cur_ui = w.ui_render_fps or base_ui
-                    new_ui = min(base_ui, cur_ui + config.UI_FPS_STEP)
-                    if new_ui > cur_ui:
-                        w.set_dynamic_ui_fps(new_ui)
+                    if _step_widget_fps(w, stress=False, profile_ui_fps=ui_fps):
                         fps_restored = True
                 stress_counter["recover"] = 0
                 if fps_restored:
