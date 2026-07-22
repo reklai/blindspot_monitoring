@@ -633,38 +633,22 @@ class CameraWidget(QtWidgets.QWidget):
 
     @pyqtSlot(object)
     def on_frame(self, frame_bgr: NDArray[np.uint8]) -> None:
-        """Receive latest camera frame from worker."""
+        """Receive latest camera frame from worker.
+
+        The worker emits a fresh, private array per frame (queued-connection
+        safe), so we simply retain the reference -- no buffer recycling.
+        """
         try:
             if frame_bgr is None:
                 return
-            # Return previous frame to pool before updating _latest_frame.
-            # Note: Both on_frame (signal/slot) and _render_latest_frame (timer)
-            # run on the main thread via Qt's event loop, so no actual race exists.
-            # We return before updating as a defensive pattern for clarity.
-            previous_frame = self._latest_frame
-            if previous_frame is not None and self.worker is not None:
-                try:
-                    self.worker.return_frame(previous_frame)
-                except Exception:
-                    logging.debug("Failed to return frame to pool", exc_info=True)
-            # Now safe to update the latest frame
             self._latest_frame = frame_bgr
             self._frame_id += 1
             self._last_frame_ts = time.time()
         except Exception:
             logging.exception("on_frame")
 
-    def _release_current_frame(self, worker: Optional[CaptureWorker] = None) -> None:
-        """Return current frame buffer to pool and clear reference."""
-        if self._latest_frame is None:
-            return
-        if worker is None:
-            worker = self.worker
-        if worker is not None:
-            try:
-                worker.return_frame(self._latest_frame)
-            except Exception:
-                logging.debug("Failed to return frame to pool", exc_info=True)
+    def _release_current_frame(self) -> None:
+        """Drop the reference to the current frame buffer."""
         self._latest_frame = None
 
     def _dispose_worker(self, worker: CaptureWorker) -> None:
@@ -1149,7 +1133,7 @@ class CameraWidget(QtWidgets.QWidget):
                     worker.stop()
                 except Exception:
                     logging.debug("Error stopping worker during cleanup", exc_info=True)
-                self._release_current_frame(worker)
+                self._release_current_frame()
                 self._dispose_worker(worker)
                 self.worker = None
 
@@ -1183,7 +1167,7 @@ class CameraWidget(QtWidgets.QWidget):
                 worker.stop()
             except Exception:
                 logging.debug("Error stopping worker during detach", exc_info=True)
-            self._release_current_frame(worker)
+            self._release_current_frame()
             self._dispose_worker(worker)
             self.worker = None
         

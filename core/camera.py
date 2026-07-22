@@ -14,14 +14,11 @@ import platform
 import re
 import threading
 import time
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import cv2
-import numpy as np
-from numpy.typing import NDArray
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 from core import config
@@ -112,9 +109,6 @@ class CaptureWorker(QThread):
     # Signal emitted when camera connection status changes.
     status_changed = pyqtSignal(bool)
 
-    # Pre-allocated frame pool size (reduces GC pressure)
-    FRAME_POOL_SIZE = 3
-
     def __init__(
         self,
         stream_link: Union[int, str],
@@ -147,44 +141,6 @@ class CaptureWorker(QThread):
         # Set True by stop() when the thread could not be terminated and the
         # capture handle was intentionally leaked (see stop() for rationale).
         self._leaked = False
-        
-        # Pre-allocated frame pool to reduce memory allocations/GC pressure
-        self._frame_pool: deque[NDArray[np.uint8]] = deque(maxlen=self.FRAME_POOL_SIZE)
-        self._frame_pool_lock = threading.Lock()
-        self._pool_frame_shape: Optional[tuple[int, ...]] = None
-
-    def _get_pooled_frame(self, shape: tuple[int, ...], dtype: np.dtype) -> NDArray[np.uint8]:
-        """Get a pre-allocated frame from pool or create new one.
-        
-        This reduces memory allocation overhead and GC pressure by reusing
-        frame buffers instead of allocating new ones for each capture.
-        """
-        with self._frame_pool_lock:
-            # If shape changed, invalidate pool
-            if self._pool_frame_shape != shape:
-                self._frame_pool.clear()
-                self._pool_frame_shape = shape
-            
-            # Try to get existing frame from pool
-            if self._frame_pool:
-                return self._frame_pool.popleft()
-        
-        # Allocate new frame (contiguous for efficient Qt conversion)
-        return np.empty(shape, dtype=dtype, order='C')
-    
-    def _return_to_pool(self, frame: NDArray[np.uint8]) -> None:
-        """Return a frame buffer to the pool for reuse."""
-        with self._frame_pool_lock:
-            if (
-                self._pool_frame_shape is not None
-                and frame.shape == self._pool_frame_shape
-                and len(self._frame_pool) < self.FRAME_POOL_SIZE
-            ):
-                self._frame_pool.append(frame)
-
-    def return_frame(self, frame: NDArray[np.uint8]) -> None:
-        """Public helper to return a frame buffer to the pool."""
-        self._return_to_pool(frame)
 
     def run(self) -> None:
         """Capture loop: open camera, grab frames, emit, reconnect on failure."""
@@ -248,10 +204,9 @@ class CaptureWorker(QThread):
                     emit_interval = self._emit_interval
                 # Throttle emits to target FPS to avoid UI overload.
                 if now - self._last_emit >= emit_interval:
-                    # Use pooled frame to reduce allocations
-                    pooled = self._get_pooled_frame(frame.shape, frame.dtype)
-                    np.copyto(pooled, frame)
-                    self.frame_ready.emit(pooled)
+                    # retrieve() hands back a fresh, private, contiguous array
+                    # every call, so it is safe to emit directly (no copy).
+                    self.frame_ready.emit(frame)
                     self._last_emit = now
 
                 self.msleep(1)

@@ -504,12 +504,65 @@ class TestFrameRateLimiting:
     def test_emit_interval_updates_with_fps(self):
         """Test emit interval updates when FPS changes."""
         from core.camera import CaptureWorker
-        
+
         worker = CaptureWorker(stream_link=0, parent=None, target_fps=30.0)
         initial_interval = worker._emit_interval
-        
+
         worker.set_target_fps(15.0)
         new_interval = worker._emit_interval
-        
+
         # New interval should be longer (lower FPS = longer interval)
         assert new_interval > initial_interval
+
+
+def _run_worker_for_grabs(worker, cap, n_grabs):
+    """Drive worker.run() synchronously for exactly `n_grabs` grab() calls.
+
+    Sets worker._cap to the mock capture, makes msleep a no-op, and stops
+    the loop after `n_grabs` grab() calls. Returns nothing; inspect the
+    mock and any connected collectors afterward.
+    """
+    cap.isOpened.return_value = True
+    worker._cap = cap
+    worker.msleep = lambda ms: None
+
+    state = {"grabs": 0}
+
+    def grab_side_effect():
+        state["grabs"] += 1
+        if state["grabs"] >= n_grabs:
+            worker._running = False
+        return True
+
+    cap.grab.side_effect = grab_side_effect
+    worker.run()
+
+
+class TestRunLoopEmit:
+    """Behavioral tests for the run() capture loop: throttle-before-retrieve
+    and direct (no-copy) emission of the retrieve() array."""
+
+    def test_emit_sends_retrieve_array_identity_no_copy(self):
+        """With the throttle open every iteration, the emitted object IS the
+        exact numpy array retrieve() returned -- no pool copy in between."""
+        import numpy as np
+
+        from core.camera import CaptureWorker
+
+        worker = CaptureWorker(stream_link=0, parent=None, target_fps=30.0)
+        # Open the throttle fully so every grabbed frame emits.
+        worker._emit_interval = 0.0
+        worker._last_emit = 0.0
+
+        frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        cap = MagicMock()
+        cap.retrieve.return_value = (True, frame)
+
+        emitted = []
+        worker.frame_ready.connect(lambda f: emitted.append(f))
+
+        _run_worker_for_grabs(worker, cap, n_grabs=1)
+
+        assert len(emitted) == 1
+        # Identity, not just equality: no copy was made.
+        assert emitted[0] is frame
