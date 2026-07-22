@@ -17,8 +17,6 @@ class TestCameraWidgetInit:
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
-            width=640,
-            height=480,
             stream_link=None,
             enable_capture=False,
             placeholder_text="TEST",
@@ -37,8 +35,6 @@ class TestCameraWidgetInit:
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
-            width=1,
-            height=1,
             stream_link=None,
             enable_capture=False,
             settings_mode=True,
@@ -60,8 +56,6 @@ class TestFullscreenBehavior:
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
-            width=640,
-            height=480,
             stream_link=None,
             enable_capture=False,
         )
@@ -79,8 +73,6 @@ class TestFullscreenBehavior:
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
-            width=640,
-            height=480,
             stream_link=None,
             enable_capture=False,
         )
@@ -99,8 +91,6 @@ class TestFullscreenBehavior:
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
-            width=640,
-            height=480,
             stream_link=None,
             enable_capture=False,
         )
@@ -121,8 +111,6 @@ class TestFullscreenBehavior:
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
-            width=640,
-            height=480,
             stream_link=None,
             enable_capture=False,
         )
@@ -141,8 +129,6 @@ class TestFullscreenBehavior:
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
-            width=640,
-            height=480,
             stream_link=None,
             enable_capture=False,
         )
@@ -168,8 +154,6 @@ class TestNightMode:
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
-            width=640,
-            height=480,
             stream_link=None,
             enable_capture=False,
         )
@@ -184,8 +168,6 @@ class TestNightMode:
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
-            width=640,
-            height=480,
             stream_link=None,
             enable_capture=False,
         )
@@ -208,8 +190,6 @@ class TestWidgetCleanup:
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
-            width=640,
-            height=480,
             stream_link=None,
             enable_capture=False,
         )
@@ -223,8 +203,6 @@ class TestWidgetCleanup:
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
-            width=640,
-            height=480,
             stream_link=None,
             enable_capture=False,
         )
@@ -242,8 +220,6 @@ class TestSwapMode:
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
-            width=640,
-            height=480,
             stream_link=None,
             enable_capture=False,
         )
@@ -258,8 +234,6 @@ class TestSwapMode:
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
-            width=640,
-            height=480,
             stream_link=None,
             enable_capture=False,
         )
@@ -279,8 +253,6 @@ class TestDynamicFPS:
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
-            width=640,
-            height=480,
             stream_link=None,
             enable_capture=False,
             target_fps=30.0,
@@ -301,8 +273,6 @@ class TestDynamicFPS:
         from core import config
         
         widget = CameraWidget(
-            width=640,
-            height=480,
             stream_link=None,
             enable_capture=False,
             target_fps=30.0,
@@ -324,8 +294,6 @@ class TestDynamicFPS:
         from core import config
         
         widget = CameraWidget(
-            width=640,
-            height=480,
             stream_link=None,
             enable_capture=False,
             ui_fps=15,

@@ -75,8 +75,6 @@ class CameraWidget(QtWidgets.QWidget):
 
     def __init__(
         self,
-        width: int,
-        height: int,
         stream_link: Optional[int] = 0,
         parent: Optional[QtWidgets.QWidget] = None,
         target_fps: Optional[float] = None,
@@ -102,8 +100,6 @@ class CameraWidget(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Policy.Expanding,
         )
 
-        self.screen_width = max(1, width)
-        self.screen_height = max(1, height)
         self.camera_stream_link = stream_link
         self.widget_id = f"cam{stream_link}_{id(self)}"
 
@@ -192,7 +188,6 @@ class CameraWidget(QtWidgets.QWidget):
                     self._on_brightness_change(v)
 
             for val, label in zip(brightness_values, brightness_labels):
-                btn = QtWidgets.QLabel(label)
                 btn = QtWidgets.QLabel(label)
                 btn.setStyleSheet(btn_style)
                 btn.setAttribute(QtCore.Qt.WidgetAttribute.WA_AcceptTouchEvents, True)

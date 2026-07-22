@@ -139,8 +139,6 @@ def main() -> None:
 
     # Settings tile (always present, top-left)
     settings_tile = CameraWidget(
-        width=1,
-        height=1,
         stream_link=None,
         parent=central_widget,
         target_fps=None,
@@ -164,8 +162,6 @@ def main() -> None:
         if slot_idx < len(working_cameras):
             cam_index = working_cameras[slot_idx]
             cw = CameraWidget(
-                1,
-                1,
                 cam_index,
                 parent=central_widget,
                 target_fps=cap_fps,
@@ -177,8 +173,6 @@ def main() -> None:
             camera_widgets.append(cw)
         else:
             cw = CameraWidget(
-                1,
-                1,
                 stream_link=None,
                 parent=central_widget,
                 target_fps=None,
@@ -192,12 +186,6 @@ def main() -> None:
         all_widgets.append(cw)
 
     rows, cols = get_smart_grid(len(all_widgets))
-    widget_width = max(1, screen.width() // cols)
-    widget_height = max(1, screen.height() // rows)
-
-    for cw in all_widgets:
-        cw.screen_width = widget_width
-        cw.screen_height = widget_height
 
     for i, cw in enumerate(all_widgets):
         row = i // cols
