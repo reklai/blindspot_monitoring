@@ -14,7 +14,7 @@ import signal
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Any, Optional
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import QTimer
@@ -130,6 +130,27 @@ def safe_cleanup(widgets: list[CameraWidget], cleaned_flag: list[bool]) -> None:
             pass
 
 
+def _handle_shutdown_signal(sig: int, frame: Optional[Any]) -> None:
+    """Signal handler shared by SIGINT and SIGTERM: request a clean Qt
+    shutdown so the normal QApplication.quit() -> aboutToQuit ->
+    safe_cleanup path runs instead of the process dying mid-capture.
+    """
+    QtWidgets.QApplication.quit()
+
+
+def _install_signal_handlers(app: QtWidgets.QApplication) -> None:
+    """Register the shared shutdown handler for both SIGINT and SIGTERM.
+
+    SIGINT covers Ctrl+C during interactive use; SIGTERM covers `systemctl
+    stop` / service shutdown (KillSignal=SIGTERM in install.sh's unit file)
+    so both trigger the same graceful cleanup path rather than SIGTERM
+    falling through to the default terminate-without-cleanup behavior.
+    """
+    del app  # not needed by the handler; kept for a clear, testable call site
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+
+
 def main() -> None:
     """Create the UI, discover cameras, and start event loop."""
     # Load and apply configuration
@@ -148,11 +169,8 @@ def main() -> None:
 
     cleaned_flag = [False]
 
-    # Clean shutdown on Ctrl+C
-    def on_sigint(sig, frame):
-        QtWidgets.QApplication.quit()
-
-    signal.signal(signal.SIGINT, on_sigint)
+    # Clean shutdown on Ctrl+C (SIGINT) and `systemctl stop` (SIGTERM).
+    _install_signal_handlers(app)
 
     app.setStyle(QtWidgets.QStyleFactory.create("Fusion"))
     app.setStyleSheet("QWidget { background: #2b2b2b; color: #ffffff; }")
@@ -391,6 +409,15 @@ def main() -> None:
         for identity, slot_index in attachments:
             widget = slot_to_widget.get(slot_index)
             if widget is None:
+                # Invariant: unreachable while slot_index values are unique
+                # and free_slot_indexes/slot_to_widget are both derived from
+                # this same placeholder_slots snapshot -- every slot_index
+                # the planner returns was present in slot_to_widget's keys.
+                # If this ever became reachable, the planner's bookkeeping
+                # (active_ports/last_slot_by_port/failed_ports) has ALREADY
+                # been mutated for this identity, so any future change must
+                # preserve this invariant rather than relying on this
+                # continue as a safety net.
                 continue
             placeholder_slots.remove(widget)
             cap_w, cap_h, cap_fps, ui_fps = config.choose_profile()
