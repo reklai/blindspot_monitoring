@@ -69,13 +69,13 @@ class CameraWidget(QtWidgets.QWidget):
     hold_threshold_ms: int = 400
 
     # Instance type hints
-    camera_stream_link: Optional[int]
+    camera_stream_link: Optional[Union[int, str]]
     worker: Optional[CaptureWorker]
     _fs_overlay: Optional[FullscreenOverlay]
 
     def __init__(
         self,
-        stream_link: Optional[int] = 0,
+        stream_link: Optional[Union[int, str]] = 0,
         parent: Optional[QtWidgets.QWidget] = None,
         target_fps: Optional[float] = None,
         request_capture_size: Optional[tuple[int, int]] = (640, 480),
@@ -351,7 +351,7 @@ class CameraWidget(QtWidgets.QWidget):
 
     def attach_camera(
         self,
-        stream_link: int,
+        stream_link: Union[int, str],
         target_fps: float,
         request_capture_size: tuple[int, int],
         ui_fps: Optional[int] = None,

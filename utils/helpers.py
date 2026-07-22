@@ -112,17 +112,17 @@ def kill_device_holders(device_path: str, grace: float = 0.4) -> bool:
 def log_health_summary(
     camera_widgets: list["CameraWidget"],
     placeholder_slots: list["CameraWidget"],
-    active_indexes: set[int],
-    failed_indexes: dict[int, float],
+    active_ports: set[str],
+    failed_ports: dict[str, float],
     stale_threshold_sec: float = 10.0,
 ) -> None:
     """Log a health summary of all cameras.
-    
+
     Args:
         camera_widgets: List of active camera widgets
         placeholder_slots: List of placeholder widgets
-        active_indexes: Set of active camera indexes
-        failed_indexes: Dict mapping failed camera indexes to failure timestamps
+        active_ports: Set of active camera port_paths
+        failed_ports: Dict mapping failed camera port_paths to failure timestamps
         stale_threshold_sec: Seconds after which a frame is considered stale
     """
     now = time.time()
@@ -162,6 +162,6 @@ def log_health_summary(
         unhealthy_workers,
         len(camera_widgets),
         len(placeholder_slots),
-        len(active_indexes),
-        len(failed_indexes),
+        len(active_ports),
+        len(failed_ports),
     )
