@@ -366,12 +366,12 @@ def configure_logging() -> None:
     logging.captureWarnings(True)
 
 
-def choose_profile(camera_count: int) -> tuple[int, int, int, int]:
-    """Pick capture resolution and FPS based on camera count.
-    
+def choose_profile() -> tuple[int, int, int, int]:
+    """Pick capture resolution and FPS from configuration.
+
     Resolution and FPS are exactly as configured in config.ini.
     Dynamic FPS feature will adjust up/down at runtime based on CPU load.
-    
+
     Returns: (width, height, capture_fps, ui_fps)
     """
     # Exact values from config - no scaling

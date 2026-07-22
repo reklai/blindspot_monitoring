@@ -133,16 +133,16 @@ cpu_load_threshold = 5.0
 
 
 class TestChooseProfile:
-    """Test profile selection based on camera count."""
+    """Test profile selection."""
 
     def test_choose_profile_returns_tuple(self):
         """Test choose_profile returns (width, height, fps, ui_fps)."""
-        result = config.choose_profile(1)
+        result = config.choose_profile()
         assert isinstance(result, tuple)
         assert len(result) == 4
 
     def test_choose_profile_values(self, save_restore_config):
-        """Test choose_profile returns configured values without camera-count scaling."""
+        """Test choose_profile returns configured values unchanged, consistently."""
         # Set known values
         config.PROFILE_CAPTURE_WIDTH = 640
         config.PROFILE_CAPTURE_HEIGHT = 480
@@ -151,26 +151,14 @@ class TestChooseProfile:
         config.MIN_DYNAMIC_FPS = 5
         config.MIN_DYNAMIC_UI_FPS = 10
 
-        # Test with 1 camera (no scaling)
-        w, h, fps, ui_fps = config.choose_profile(1)
-        assert w == 640
-        assert h == 480
-        assert fps == 20
-        assert ui_fps == 15
-        
-        # Test with 3 cameras (same configured values; runtime dynamic FPS handles load)
-        w, h, fps, ui_fps = config.choose_profile(3)
-        assert w == 640
-        assert h == 480
-        assert fps == 20
-        assert ui_fps == 15
-        
-        # Test with 6 cameras (same configured values; runtime dynamic FPS handles load)
-        w, h, fps, ui_fps = config.choose_profile(6)
-        assert w == 640
-        assert h == 480
-        assert fps == 20
-        assert ui_fps == 15
+        # Values pass through from config unchanged, regardless of how many
+        # times it's called (no camera-count scaling).
+        for _ in range(3):
+            w, h, fps, ui_fps = config.choose_profile()
+            assert w == 640
+            assert h == 480
+            assert fps == 20
+            assert ui_fps == 15
 
 
 class TestConfigDefaults:

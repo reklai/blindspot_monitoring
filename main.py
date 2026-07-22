@@ -153,8 +153,7 @@ def main() -> None:
     )
     all_widgets.append(settings_tile)
 
-    active_camera_count = max(1, min(len(working_cameras), config.CAMERA_SLOT_COUNT))
-    cap_w, cap_h, cap_fps, ui_fps = config.choose_profile(active_camera_count)
+    cap_w, cap_h, cap_fps, ui_fps = config.choose_profile()
     logging.info("Profile: %dx%d @ %d FPS (UI %d FPS)", cap_w, cap_h, cap_fps, ui_fps)
 
     # Exactly N camera slots at all times (based on config)
@@ -299,10 +298,7 @@ def main() -> None:
                 break
             if ok is not None:
                 slot = placeholder_slots.pop(0)
-                active_count = min(
-                    config.CAMERA_SLOT_COUNT, len(camera_widgets) + 1
-                )
-                cap_w, cap_h, cap_fps, ui_fps = config.choose_profile(active_count)
+                cap_w, cap_h, cap_fps, ui_fps = config.choose_profile()
                 slot.attach_camera(ok, cap_fps, (cap_w, cap_h), ui_fps=ui_fps)
                 slot.set_night_mode(night_mode_state["enabled"])
                 camera_widgets.append(slot)
