@@ -67,6 +67,43 @@ def _check_gstreamer_available() -> bool:
     return _gstreamer_available
 
 
+def _build_gstreamer_pipeline(
+    device: Union[int, str], width: int, height: int
+) -> Optional[str]:
+    """Build the GStreamer v4l2src pipeline string for `device`.
+
+    `device` is either:
+      - int: a /dev/videoN index -- produces exactly today's pipeline
+        string (`device=/dev/video{N}`).
+      - str starting with `/dev/`: an already-resolved device path --
+        produces `device={device}`.
+      - any other str (e.g. an `rtsp://...` URL or a relative path):
+        returns None. This GStreamer pipeline is V4L2-only; the caller
+        must skip it and fall through to the V4L2/software cascade
+        rather than feed an arbitrary string into v4l2src.
+    """
+    if isinstance(device, int):
+        device_arg = f"/dev/video{device}"
+    elif isinstance(device, str) and device.startswith("/dev/"):
+        device_arg = device
+    else:
+        return None
+
+    # Use jpegdec (libjpeg) for MJPEG decoding - stable and efficient
+    # GStreamer pipeline optimized for low-latency:
+    # - v4l2src: capture from V4L2 device
+    # - queue: decouple source from decode (max 2 buffers, leaky=downstream)
+    # - appsink: sync=false for no A/V sync overhead, drop=1 for frame dropping
+    # - max-buffers=1: only keep latest frame to minimize latency
+    return (
+        f"v4l2src device={device_arg} ! "
+        f"image/jpeg,width={width},height={height} ! "
+        f"queue max-size-buffers=2 leaky=downstream ! "
+        f"jpegdec ! videoconvert ! "
+        f"appsink drop=1 max-buffers=1 sync=false"
+    )
+
+
 class CaptureWorker(QThread):
     """Background thread for capturing frames from a camera."""
     
@@ -226,17 +263,40 @@ class CaptureWorker(QThread):
         self._close_capture()
         logging.info("Camera %s thread stopped", self.stream_link)
 
+    def _resolve_stream_target(self) -> Union[int, str]:
+        """Resolve `stream_link` to the value actually passed to
+        cv2.VideoCapture for this open attempt.
+
+        int targets pass through unchanged (no behavior change). str
+        targets are realpath'd on EVERY call -- deliberately not cached.
+        This is the fast-recovery mechanism: a worker holding a
+        /dev/v4l/by-path/... symlink re-resolves it on each reconnect
+        attempt, so once udev re-points the symlink at a re-enumerated
+        camera after a replug, the existing reconnect loop picks up the
+        new /dev/videoN node within one backoff interval. If realpath
+        fails for any reason, the original string is returned unchanged
+        so the subsequent open attempt fails and the reconnect loop
+        retries.
+        """
+        if isinstance(self.stream_link, int):
+            return self.stream_link
+        try:
+            return os.path.realpath(self.stream_link)
+        except Exception:
+            return self.stream_link
+
     def _open_capture(self) -> None:
         """Open the camera and apply preferred capture settings."""
         try:
             cap = None
             backend_name = "V4L2"
+            resolved_target = self._resolve_stream_target()
 
             def _try_v4l2_open(forced_fourcc: Optional[str]) -> Optional[cv2.VideoCapture]:
                 backend = cv2.CAP_ANY
                 if platform.system() == "Linux":
                     backend = cv2.CAP_V4L2
-                local_cap = cv2.VideoCapture(self.stream_link, backend)
+                local_cap = cv2.VideoCapture(resolved_target, backend)
                 if not local_cap or not local_cap.isOpened():
                     try:
                         local_cap.release()
@@ -284,29 +344,23 @@ class CaptureWorker(QThread):
                     return None
                 return local_cap
 
-            # Try GStreamer first if enabled and available (more efficient MJPEG pipeline)
-            if (
-                config.USE_GSTREAMER
-                and _check_gstreamer_available()
-                and platform.system() == "Linux"
-                and isinstance(self.stream_link, int)
-            ):
+            # Try GStreamer first if enabled and available (more efficient MJPEG pipeline).
+            # _build_gstreamer_pipeline returns None for stream targets it can't
+            # build a V4L2 pipeline for (e.g. non-/dev/ strings), in which case
+            # we skip straight to the V4L2/fallback cascade below.
+            w = int(self.capture_width) if self.capture_width else 640
+            h = int(self.capture_height) if self.capture_height else 480
+            pipeline = (
+                _build_gstreamer_pipeline(resolved_target, w, h)
+                if (
+                    config.USE_GSTREAMER
+                    and _check_gstreamer_available()
+                    and platform.system() == "Linux"
+                )
+                else None
+            )
+            if pipeline is not None:
                 try:
-                    w = int(self.capture_width) if self.capture_width else 640
-                    h = int(self.capture_height) if self.capture_height else 480
-                    # Use jpegdec (libjpeg) for MJPEG decoding - stable and efficient
-                    # GStreamer pipeline optimized for low-latency:
-                    # - v4l2src: capture from V4L2 device
-                    # - queue: decouple source from decode (max 2 buffers, leaky=downstream)
-                    # - appsink: sync=false for no A/V sync overhead, drop=1 for frame dropping
-                    # - max-buffers=1: only keep latest frame to minimize latency
-                    pipeline = (
-                        f"v4l2src device=/dev/video{self.stream_link} ! "
-                        f"image/jpeg,width={w},height={h} ! "
-                        f"queue max-size-buffers=2 leaky=downstream ! "
-                        f"jpegdec ! videoconvert ! "
-                        f"appsink drop=1 max-buffers=1 sync=false"
-                    )
                     cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
                     if cap and cap.isOpened():
                         # Test if we can actually grab a frame
@@ -506,18 +560,54 @@ class CaptureWorker(QThread):
 
 
 def test_single_camera(
-    cam_index: int,
+    cam_index: Union[int, str],
     retries: int = 3,
     retry_delay: float = 0.2,
     allow_kill: bool = True,
     post_kill_retries: int = 2,
     post_kill_delay: float = 0.25,
 ) -> Optional[int]:
-    """Try to open and grab a frame from one camera index."""
-    device_path = f"/dev/video{cam_index}"
+    """Try to open and grab a frame from one camera.
+
+    `cam_index` accepts two forms:
+      - int: a /dev/videoN index. Behavior is byte-identical to before
+        device-path support -- opens `cv2.VideoCapture(cam_index,
+        cv2.CAP_V4L2)` directly and returns `cam_index` on success.
+      - str: a device path (e.g. a `/dev/v4l/by-path/...` symlink or a
+        `/dev/videoN` path). Resolved via `os.path.realpath` FIRST; if
+        the resolved node doesn't exist we fail fast (return None)
+        without probing at all. `kill_device_holders` (if triggered) is
+        given the RESOLVED path, since lsof/fuser can't match a symlink.
+        On success we return the NUMERIC index parsed from the resolved
+        `/dev/videoN` node (matching `video(\\d+)$`) so existing
+        int-typed callers keep working unchanged; a resolved path that
+        isn't a `/dev/videoN` node returns None (V4L2-only).
+    """
+    if isinstance(cam_index, str):
+        resolved = os.path.realpath(cam_index)
+        if not os.path.exists(resolved):
+            logging.info(
+                "Camera %s: resolved path %s does not exist, skipping probe",
+                cam_index, resolved,
+            )
+            return None
+        match = re.search(r"video(\d+)$", resolved)
+        if not match:
+            logging.warning(
+                "Camera %s: resolved path %s is not a /dev/videoN node, skipping",
+                cam_index, resolved,
+            )
+            return None
+        result_index = int(match.group(1))
+        open_target: Union[int, str] = resolved
+        device_path = resolved
+    else:
+        result_index = cam_index
+        open_target = cam_index
+        device_path = f"/dev/video{cam_index}"
 
     def try_open():
-        cap = cv2.VideoCapture(cam_index, cv2.CAP_V4L2)
+        cap = cv2.VideoCapture(open_target, cv2.CAP_V4L2)
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if not cap.isOpened():
@@ -533,7 +623,7 @@ def test_single_camera(
 
     for _ in range(retries):
         if try_open():
-            return cam_index
+            return result_index
         time.sleep(retry_delay)
 
     if allow_kill and config.KILL_DEVICE_HOLDERS:

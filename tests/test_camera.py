@@ -5,6 +5,7 @@ Tests for core/camera.py - Camera discovery and capture logic.
 import time
 from unittest.mock import MagicMock, patch, PropertyMock
 
+import cv2
 import pytest
 
 
@@ -66,23 +67,159 @@ class TestTestSingleCamera:
     def test_single_camera_retries(self):
         """Test camera open retries on failure."""
         call_count = 0
-        
+
         def mock_is_opened():
             nonlocal call_count
             call_count += 1
             # Succeed on third attempt
             return call_count >= 3
-        
+
         with patch("cv2.VideoCapture") as mock_cap:
             instance = MagicMock()
             instance.isOpened.side_effect = mock_is_opened
             instance.read.return_value = (True, MagicMock())
             mock_cap.return_value = instance
-            
+
             from core.camera import test_single_camera
             result = test_single_camera(0, retries=3, retry_delay=0.01)
             assert result == 0
             assert call_count >= 2
+
+    def test_single_camera_int_target_call_form_unchanged(self, mock_video_capture):
+        """Regression guard: an int target must call cv2.VideoCapture with
+        the exact same args as before device-path support (no CAP_V4L2
+        change, no re-wrapping of the index)."""
+        from core.camera import test_single_camera
+
+        result = test_single_camera(5, retries=1, retry_delay=0.01)
+
+        assert result == 5
+        mock_video_capture.assert_called_once_with(5, cv2.CAP_V4L2)
+
+    def test_single_camera_str_target_resolves_and_opens(self, tmp_path):
+        """str target: realpath'd first; cv2.VideoCapture is called with
+        the RESOLVED path (not the symlink); success returns the numeric
+        index parsed from the resolved /dev/videoN node."""
+        video_node = tmp_path / "video7"
+        video_node.write_text("")
+        symlink = tmp_path / "by-path-camera"
+        symlink.symlink_to(video_node)
+        resolved = str(video_node.resolve())
+
+        with patch("cv2.VideoCapture") as mock_cap:
+            instance = MagicMock()
+            instance.isOpened.return_value = True
+            instance.grab.return_value = True
+            mock_cap.return_value = instance
+
+            from core.camera import test_single_camera
+            result = test_single_camera(str(symlink), retries=1, retry_delay=0.01)
+
+        assert result == 7
+        mock_cap.assert_called_once_with(resolved, cv2.CAP_V4L2)
+
+    def test_single_camera_str_target_missing_realpath_returns_none(self, tmp_path):
+        """str target whose realpath doesn't exist fails fast: returns
+        None without ever calling cv2.VideoCapture."""
+        missing = tmp_path / "gone"
+
+        with patch("cv2.VideoCapture") as mock_cap:
+            from core.camera import test_single_camera
+            result = test_single_camera(str(missing), retries=3, retry_delay=0.01)
+
+        assert result is None
+        mock_cap.assert_not_called()
+
+    def test_single_camera_str_target_non_videon_returns_none(self, tmp_path):
+        """str target resolving to a node that isn't a /dev/videoN path
+        returns None (V4L2-only support)."""
+        node = tmp_path / "not-a-video-node"
+        node.write_text("")
+
+        with patch("cv2.VideoCapture") as mock_cap:
+            from core.camera import test_single_camera
+            result = test_single_camera(str(node), retries=1, retry_delay=0.01)
+
+        assert result is None
+        mock_cap.assert_not_called()
+
+    def test_single_camera_str_target_kill_uses_resolved_path(
+        self, tmp_path, save_restore_config
+    ):
+        """When allow_kill triggers, kill_device_holders receives the
+        RESOLVED real path, never the symlink (lsof/fuser can't match a
+        symlink)."""
+        from core import config
+
+        video_node = tmp_path / "video2"
+        video_node.write_text("")
+        symlink = tmp_path / "by-path-camera"
+        symlink.symlink_to(video_node)
+        resolved = str(video_node.resolve())
+
+        config.KILL_DEVICE_HOLDERS = True
+
+        with patch("cv2.VideoCapture") as mock_cap:
+            instance = MagicMock()
+            instance.isOpened.return_value = False
+            mock_cap.return_value = instance
+
+            with patch("core.camera.kill_device_holders") as mock_kill:
+                mock_kill.return_value = False
+
+                from core.camera import test_single_camera
+                result = test_single_camera(
+                    str(symlink),
+                    retries=1,
+                    retry_delay=0.01,
+                    allow_kill=True,
+                    post_kill_retries=1,
+                    post_kill_delay=0.01,
+                )
+
+                mock_kill.assert_called_once_with(resolved)
+
+        assert result is None
+
+
+class TestBuildGstreamerPipeline:
+    """Test the extracted GStreamer pipeline string builder."""
+
+    def test_int_device_matches_existing_pipeline_string(self):
+        from core.camera import _build_gstreamer_pipeline
+
+        pipeline = _build_gstreamer_pipeline(3, 640, 480)
+
+        assert pipeline == (
+            "v4l2src device=/dev/video3 ! "
+            "image/jpeg,width=640,height=480 ! "
+            "queue max-size-buffers=2 leaky=downstream ! "
+            "jpegdec ! videoconvert ! "
+            "appsink drop=1 max-buffers=1 sync=false"
+        )
+
+    def test_dev_path_string_uses_device_form(self):
+        from core.camera import _build_gstreamer_pipeline
+
+        pipeline = _build_gstreamer_pipeline("/dev/video5", 640, 480)
+
+        assert pipeline == (
+            "v4l2src device=/dev/video5 ! "
+            "image/jpeg,width=640,height=480 ! "
+            "queue max-size-buffers=2 leaky=downstream ! "
+            "jpegdec ! videoconvert ! "
+            "appsink drop=1 max-buffers=1 sync=false"
+        )
+
+    def test_rtsp_url_returns_none(self):
+        from core.camera import _build_gstreamer_pipeline
+
+        assert _build_gstreamer_pipeline("rtsp://example.com/stream", 640, 480) is None
+
+    def test_non_dev_relative_string_returns_none(self):
+        from core.camera import _build_gstreamer_pipeline
+
+        assert _build_gstreamer_pipeline("some/relative/path", 640, 480) is None
 
 
 class TestFindWorkingCameras:
@@ -144,11 +281,73 @@ class TestCaptureWorker:
     def test_worker_stop_when_not_running(self):
         """Test stopping worker sets running flag to False."""
         from core.camera import CaptureWorker
-        
+
         worker = CaptureWorker(stream_link=0, parent=None)
         worker._running = True
         worker.stop()
         assert worker._running is False
+
+    def test_resolve_stream_target_int_passthrough(self):
+        """int stream_link resolves to itself, unchanged."""
+        from core.camera import CaptureWorker
+
+        worker = CaptureWorker(stream_link=4, parent=None)
+        assert worker._resolve_stream_target() == 4
+
+    def test_resolve_stream_target_no_caching_across_replug(self, tmp_path):
+        """str stream_link is realpath'd on EVERY call -- no caching. A
+        by-path symlink re-pointed between two calls (simulating udev
+        re-pointing it after a replug) must resolve to the NEW target on
+        the second call."""
+        from core.camera import CaptureWorker
+
+        node_a = tmp_path / "video0"
+        node_a.write_text("")
+        node_b = tmp_path / "video1"
+        node_b.write_text("")
+        symlink = tmp_path / "by-path-camera"
+        symlink.symlink_to(node_a)
+
+        worker = CaptureWorker(stream_link=str(symlink), parent=None)
+        first = worker._resolve_stream_target()
+        assert first == str(node_a.resolve())
+
+        symlink.unlink()
+        symlink.symlink_to(node_b)
+
+        second = worker._resolve_stream_target()
+        assert second == str(node_b.resolve())
+        assert second != first
+
+    def test_worker_str_stream_link_open_uses_resolved_path(self, tmp_path, monkeypatch):
+        """Constructing a worker with a str device path and running
+        _open_capture through its (mocked, failing) fallback cascade must
+        not crash, and every cv2.VideoCapture call must use the RESOLVED
+        path, never the symlink."""
+        import core.camera as camera_module
+        from core.camera import CaptureWorker
+
+        # Keep this test to the V4L2 cascade regardless of the local
+        # OpenCV build's GStreamer support.
+        monkeypatch.setattr(camera_module.config, "USE_GSTREAMER", False)
+
+        video_node = tmp_path / "video4"
+        video_node.write_text("")
+        symlink = tmp_path / "by-path-camera"
+        symlink.symlink_to(video_node)
+        resolved = str(video_node.resolve())
+
+        with patch("cv2.VideoCapture") as mock_cap:
+            instance = MagicMock()
+            instance.isOpened.return_value = False
+            mock_cap.return_value = instance
+
+            worker = CaptureWorker(stream_link=str(symlink), parent=None)
+            worker._open_capture()  # must not raise
+
+        assert mock_cap.call_args_list, "expected at least one open attempt"
+        for call in mock_cap.call_args_list:
+            assert call.args[0] == resolved
 
 
 class TestGStreamerPipeline:
