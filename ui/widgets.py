@@ -277,6 +277,16 @@ class CameraWidget(QtWidgets.QWidget):
         self.base_target_fps = target_fps
         self.current_target_fps = target_fps
 
+        # Render rate. Established before the worker is spawned so _spawn_worker
+        # can pass it as the emit-rate bound (min(capture_fps, ui_fps)).
+        # Settings tiles never render, so their render rate is 0.
+        if not self.settings_mode:
+            self.ui_render_fps = max(1, int(ui_fps))
+            self.base_ui_fps = self.ui_render_fps  # Store original for FPS recovery
+        else:
+            self.ui_render_fps = 0
+            self.base_ui_fps = 0
+
         # Start capture worker in background thread (if enabled)
         self.worker = None
         if self.capture_enabled and stream_link is not None:
@@ -290,16 +300,12 @@ class CameraWidget(QtWidgets.QWidget):
         # Timer to render latest frame at a stable UI FPS.
         # Compensate for render overhead to hit actual target FPS.
         if not self.settings_mode:
-            self.ui_render_fps = max(1, int(ui_fps))
-            self.base_ui_fps = self.ui_render_fps  # Store original for FPS recovery
             interval = max(1, int(1000 / self.ui_render_fps) - config.RENDER_OVERHEAD_MS)
             self.render_timer = QTimer(self)
             self.render_timer.setInterval(interval)
             self.render_timer.timeout.connect(self._render_latest_frame)
             self.render_timer.start()
         else:
-            self.ui_render_fps = 0
-            self.base_ui_fps = 0
             self.render_timer = None
 
         # Optional UI FPS diagnostics (only for real cameras)
@@ -336,12 +342,16 @@ class CameraWidget(QtWidgets.QWidget):
     def _apply_ui_fps(self, ui_fps: int) -> None:
         """Update UI render timer to match camera UI FPS.
 
-        Compensates for render overhead to achieve actual target FPS.
+        Compensates for render overhead to achieve actual target FPS. Also
+        propagates the new render rate to the worker as the emit-rate bound
+        so emit rate <= render rate holds after dynamic UI-FPS changes.
         """
         self.ui_render_fps = max(1, int(ui_fps))
         if self.render_timer:
             interval = max(1, int(1000 / self.ui_render_fps) - config.RENDER_OVERHEAD_MS)
             self.render_timer.setInterval(interval)
+        if self.worker is not None:
+            self.worker.set_ui_fps(self.ui_render_fps)
 
     def _spawn_worker(
         self,
@@ -349,7 +359,12 @@ class CameraWidget(QtWidgets.QWidget):
         target_fps: Optional[float],
         capture_size: Optional[tuple[int, int]],
     ) -> None:
-        """Construct, wire, and start a CaptureWorker; assigns self.worker."""
+        """Construct, wire, and start a CaptureWorker; assigns self.worker.
+
+        Passes the widget's render rate as `ui_fps` so the worker throttles
+        emits to min(capture_fps, ui_fps) -- it never emits frames the render
+        dedup would just discard. Device configuration still uses target_fps.
+        """
         cap_w, cap_h = capture_size if capture_size else (None, None)
         self.worker = CaptureWorker(
             stream_link,
@@ -357,6 +372,7 @@ class CameraWidget(QtWidgets.QWidget):
             target_fps=target_fps,
             capture_width=cap_w,
             capture_height=cap_h,
+            ui_fps=self.ui_render_fps,
         )
         self.worker.frame_ready.connect(self.on_frame)
         self.worker.status_changed.connect(self.on_status_changed)

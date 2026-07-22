@@ -116,8 +116,16 @@ class CaptureWorker(QThread):
         target_fps: Optional[float] = None,
         capture_width: Optional[int] = None,
         capture_height: Optional[int] = None,
+        ui_fps: Optional[float] = None,
     ) -> None:
-        """Initialize camera capture settings and state."""
+        """Initialize camera capture settings and state.
+
+        `target_fps` configures the capture DEVICE (cv2 CAP_PROP_FPS on the
+        V4L2 path). `ui_fps`, when given, is an upper bound on the EMIT rate:
+        the throttle interval targets min(device fps, ui_fps) so the worker
+        never emits faster than the UI renders (no frames copied then
+        discarded by the render dedup). Device configuration is unaffected.
+        """
         super().__init__(parent)
         self.stream_link = stream_link
         self._running = True
@@ -125,7 +133,15 @@ class CaptureWorker(QThread):
         self._cap: Optional[cv2.VideoCapture] = None
         self._last_emit = 0.0
         self._target_fps = target_fps
+        # Upper bound on the emit rate (render rate); None means unbounded.
+        self._ui_fps = float(ui_fps) if (ui_fps and ui_fps > 0) else None
+        # Effective device fps used to derive the emit interval; refined by
+        # _configure_fps_from_camera once a capture is open.
+        self._device_fps = (
+            float(target_fps) if (target_fps and target_fps > 0) else 30.0
+        )
         self._emit_interval = 1.0 / 30.0
+        self._recompute_emit_interval_locked()
         self.capture_width = capture_width
         self.capture_height = capture_height
         self._online = False
@@ -418,8 +434,23 @@ class CaptureWorker(QThread):
         except Exception:
             logging.exception("Failed to open capture %s", self.stream_link)
 
+    def _recompute_emit_interval_locked(self) -> None:
+        """Recompute `_emit_interval` from `_device_fps` bounded by `_ui_fps`.
+
+        Single point where the emit throttle is derived: the emit rate is
+        min(device fps, ui fps). Because the widget keeps `_ui_fps` in sync
+        with its live render rate (set_ui_fps), this guarantees the
+        emit-rate <= render-rate invariant holds after any dynamic
+        adjustment. Caller must hold `_fps_lock` (or be single-threaded, as
+        during __init__).
+        """
+        fps = self._device_fps
+        if self._ui_fps is not None:
+            fps = min(fps, self._ui_fps)
+        self._emit_interval = 1.0 / max(1.0, fps)
+
     def _configure_fps_from_camera(self) -> None:
-        """Pick a usable FPS value and update emit interval."""
+        """Pick a usable device FPS value and update the emit interval."""
         if self._target_fps and self._target_fps > 0:
             fps = float(self._target_fps)
         else:
@@ -429,10 +460,15 @@ class CaptureWorker(QThread):
             fps = 30.0
 
         with self._fps_lock:
-            self._emit_interval = 1.0 / max(1.0, fps)
+            self._device_fps = fps
+            self._recompute_emit_interval_locked()
 
     def set_target_fps(self, fps: Optional[float]) -> None:
-        """Update target FPS at runtime (software throttling only)."""
+        """Update target/device FPS at runtime (software throttling only).
+
+        The emit interval stays bounded by `_ui_fps` (min of the two), so a
+        capture-fps change never pushes the emit rate above the render rate.
+        """
         if fps is None:
             return
         try:
@@ -441,12 +477,31 @@ class CaptureWorker(QThread):
                 return
             with self._fps_lock:
                 self._target_fps = fps
-                self._emit_interval = 1.0 / max(1.0, fps)
+                self._device_fps = fps
+                self._recompute_emit_interval_locked()
             # Note: We don't call cap.set(CAP_PROP_FPS) here because:
             # 1. GStreamer pipelines restart when FPS is changed, causing disconnects
             # 2. Software throttling via _emit_interval is sufficient for stress management
         except Exception:
             logging.exception("set_target_fps")
+
+    def set_ui_fps(self, ui_fps: Optional[float]) -> None:
+        """Update the UI render-rate bound used to cap the emit rate.
+
+        Called by the widget whenever its render rate changes (dynamic UI
+        FPS) so the emit throttle keeps targeting min(device fps, ui fps).
+        """
+        if ui_fps is None:
+            return
+        try:
+            ui_fps = float(ui_fps)
+            if ui_fps <= 0:
+                return
+            with self._fps_lock:
+                self._ui_fps = ui_fps
+                self._recompute_emit_interval_locked()
+        except Exception:
+            logging.exception("set_ui_fps")
 
     def _close_capture(self) -> None:
         """Release camera handle if open.

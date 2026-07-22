@@ -385,6 +385,7 @@ class TestSpawnWorker:
                 target_fps=20.0,
                 capture_width=640,
                 capture_height=480,
+                ui_fps=widget.ui_render_fps,
             )
             assert widget.worker is mock_worker
             mock_worker.frame_ready.connect.assert_called_once_with(widget.on_frame)
@@ -421,6 +422,7 @@ class TestSpawnWorker:
                 target_fps=15.0,
                 capture_width=320,
                 capture_height=240,
+                ui_fps=widget.ui_render_fps,
             )
             assert widget.worker is mock_worker
             mock_worker.frame_ready.connect.assert_called_once_with(widget.on_frame)
@@ -464,6 +466,7 @@ class TestSpawnWorker:
                 target_fps=10.0,
                 capture_width=320,
                 capture_height=240,
+                ui_fps=widget.ui_render_fps,
             )
             assert widget.worker is new_worker
             new_worker.frame_ready.connect.assert_called_once_with(widget.on_frame)
@@ -552,6 +555,55 @@ class TestSpawnWorker:
             assert widget.worker is new_worker
             new_worker.start.assert_called_once()
 
+            widget.cleanup()
+
+
+class TestEmitRateAlignment:
+    """Widget wires the render rate into the worker as the emit-rate bound,
+    keeping emit rate <= render rate through dynamic UI-FPS changes."""
+
+    @pytest.mark.requires_display
+    def test_spawn_worker_passes_render_rate_as_ui_fps(self, qapp):
+        """_spawn_worker passes the widget's ui_render_fps as the worker's
+        emit-rate bound so it targets min(capture_fps, ui_fps)."""
+        from ui.widgets import CameraWidget
+
+        with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
+            mock_worker_cls.return_value = MagicMock()
+            widget = CameraWidget(
+                stream_link=0,
+                enable_capture=True,
+                target_fps=25.0,
+                request_capture_size=(640, 480),
+                ui_fps=20,
+            )
+            _, kwargs = mock_worker_cls.call_args
+            assert kwargs["ui_fps"] == 20
+            assert kwargs["target_fps"] == 25.0
+            widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_dynamic_ui_fps_pushes_new_bound_to_worker(self, qapp):
+        """set_dynamic_ui_fps propagates the new render rate to the worker so
+        the emit-rate bound tracks the live render rate (invariant upkeep)."""
+        from ui.widgets import CameraWidget
+
+        with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
+            worker = MagicMock()
+            mock_worker_cls.return_value = worker
+            widget = CameraWidget(
+                stream_link=0,
+                enable_capture=True,
+                target_fps=25.0,
+                request_capture_size=(640, 480),
+                ui_fps=20,
+            )
+            worker.set_ui_fps.reset_mock()
+
+            widget.set_dynamic_ui_fps(12)
+
+            worker.set_ui_fps.assert_called_once_with(widget.ui_render_fps)
+            assert widget.ui_render_fps == 12
             widget.cleanup()
 
 

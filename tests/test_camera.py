@@ -515,6 +515,64 @@ class TestFrameRateLimiting:
         assert new_interval > initial_interval
 
 
+class TestEmitRateAlignment:
+    """Emit rate is bounded by the UI render rate: min(device fps, ui fps)."""
+
+    def test_emit_interval_bounded_by_ui_fps(self):
+        """capture 25 > ui 20 -> emit at 20 (the render rate), not 25."""
+        from core.camera import CaptureWorker
+
+        worker = CaptureWorker(stream_link=0, target_fps=25.0, ui_fps=20.0)
+        worker._configure_fps_from_camera()
+        assert worker._emit_interval == pytest.approx(1.0 / 20.0)
+
+    def test_emit_interval_uses_capture_when_below_ui(self):
+        """capture 10 < ui 20 -> emit at 10 (min wins the lower value)."""
+        from core.camera import CaptureWorker
+
+        worker = CaptureWorker(stream_link=0, target_fps=10.0, ui_fps=20.0)
+        worker._configure_fps_from_camera()
+        assert worker._emit_interval == pytest.approx(1.0 / 10.0)
+
+    def test_emit_interval_unbounded_without_ui_fps(self):
+        """No ui_fps bound -> emit at device fps (back-compat)."""
+        from core.camera import CaptureWorker
+
+        worker = CaptureWorker(stream_link=0, target_fps=25.0)
+        worker._configure_fps_from_camera()
+        assert worker._emit_interval == pytest.approx(1.0 / 25.0)
+
+    def test_set_ui_fps_lowers_emit_rate_to_new_bound(self):
+        """Dropping the render rate below capture lowers the emit rate to it."""
+        from core.camera import CaptureWorker
+
+        worker = CaptureWorker(stream_link=0, target_fps=25.0, ui_fps=20.0)
+        worker._configure_fps_from_camera()
+        assert worker._emit_interval == pytest.approx(1.0 / 20.0)
+
+        worker.set_ui_fps(12.0)
+        assert worker._emit_interval == pytest.approx(1.0 / 12.0)
+
+    def test_set_target_fps_stays_bounded_by_ui(self):
+        """Dynamic capture-fps changes never push emit above the render rate.
+
+        Invariant trace: emit rate = min(device, ui) <= ui = render rate,
+        for every device value reachable via set_target_fps.
+        """
+        from core.camera import CaptureWorker
+
+        worker = CaptureWorker(stream_link=0, target_fps=25.0, ui_fps=20.0)
+        worker._configure_fps_from_camera()
+
+        # Lower capture below ui -> emit follows capture (min).
+        worker.set_target_fps(10.0)
+        assert worker._emit_interval == pytest.approx(1.0 / 10.0)
+
+        # Raise capture back above ui -> emit clamped to ui.
+        worker.set_target_fps(25.0)
+        assert worker._emit_interval == pytest.approx(1.0 / 20.0)
+
+
 def _run_worker_for_grabs(worker, cap, n_grabs):
     """Drive worker.run() synchronously for exactly `n_grabs` grab() calls.
 
