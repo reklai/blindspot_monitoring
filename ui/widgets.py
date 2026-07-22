@@ -249,6 +249,10 @@ class CameraWidget(QtWidgets.QWidget):
         self._restart_events = deque(maxlen=config.MAX_RESTARTS_PER_WINDOW * 2)
         self._last_restart_ts = 0.0
         self._restart_limit_logged = False
+        # Set True when a stale restart bails out because the old worker could
+        # not be stopped (leaked/zombie thread). Marks the widget detachable so
+        # the app-level rescan can reclaim its slot (see is_permanently_failed).
+        self._leaked_worker = False
         self._last_status_log_ts = 0.0
         self._last_status_log_interval_sec = 10.0
         self._pixmap_cache = QtGui.QPixmap()
@@ -362,6 +366,7 @@ class CameraWidget(QtWidgets.QWidget):
 
         self._restart_events.clear()
         self._restart_limit_logged = False
+        self._leaked_worker = False
         self._last_restart_ts = 0.0
 
         self.capture_enabled = True
@@ -927,10 +932,18 @@ class CameraWidget(QtWidgets.QWidget):
         return self._restart_window_sec * 2
 
     def is_permanently_failed(self, now: float) -> bool:
-        """Return True once the restart limit has been logged and the
+        """Return True once the widget can no longer recover on its own and the
         extended cooldown has elapsed since the last restart attempt.
+
+        Two independent triggers, both gated by the extended cooldown so the
+        rescan does not reclaim the slot instantly:
+          * `_restart_limit_logged` -- the restart budget was exhausted.
+          * `_leaked_worker` -- a stale restart bailed out on an unkillable
+            worker and cleared `self.worker`, so no further restart attempts
+            can accumulate to hit the budget; without this flag the widget
+            would never become detachable (dead end).
         """
-        if not self._restart_limit_logged:
+        if not (self._restart_limit_logged or self._leaked_worker):
             return False
         return (now - self._last_restart_ts) >= self._extended_cooldown_sec
 
@@ -963,42 +976,66 @@ class CameraWidget(QtWidgets.QWidget):
             )
             self._restart_events.clear()
             self._restart_limit_logged = False
-        
-        self._restart_events.append(now)
+
+        # Cooldown always applies from this attempt onward (requirement (b): no
+        # hot-loop -- even the bail-out path leaves _last_restart_ts set so the
+        # stale detector backs off instead of retrying every render tick).
         self._last_restart_ts = now
-        
+
         # Store old worker reference to verify cleanup
         old_worker = self.worker
         cap_w = getattr(old_worker, "capture_width", None)
         cap_h = getattr(old_worker, "capture_height", None)
         target_fps = self.current_target_fps or self.base_target_fps
-        
+
         logging.info(
             "Restarting capture for %s after stale frames", self.camera_stream_link
         )
-        
-        # Stop old worker and verify it stopped
+
+        # Stop the old worker. stop() returns False if the thread could not be
+        # terminated (leaked/zombie); we then must NOT spawn a replacement that
+        # would fight the zombie for the device.
+        stopped = False
         try:
-            old_worker.stop()
+            stopped = old_worker.stop()
         except Exception:
             logging.exception("Error stopping old worker for %s", self.camera_stream_link)
-        
-        # Verify old worker is actually stopped before creating new one
-        if old_worker.isRunning():
+
+        if not stopped:
+            # Bail-out path. Budget/backoff trade-off (requirements a & b):
+            #   (a) do NOT record this into _restart_events -- a wedged thread
+            #       must not eat the N-per-window budget a later successful
+            #       restart could use (record-after-success: we only append on
+            #       the success path below).
+            #   (b) _last_restart_ts stays set to `now` (above) so the normal
+            #       cooldown still gates the next attempt (no hot-loop).
             logging.error(
-                "Old worker for %s still running after stop() - potential resource leak",
-                self.camera_stream_link
+                "Old worker for %s could not be stopped; disposing zombie and "
+                "leaving slot for rescan/detach",
+                self.camera_stream_link,
             )
-            # Don't create a new worker if old one is still running
-            # This prevents resource conflicts
+            # Disconnect signals so the zombie can't emit into the UI, and drop
+            # our reference. _dispose_worker only disconnects + deleteLater, so
+            # it is safe on a still-running worker.
+            self._dispose_worker(old_worker)
+            self.worker = None
+            # Mark detachable: with self.worker == None no further stale
+            # restarts can accumulate to hit the budget limit, so flag the
+            # leak explicitly (is_permanently_failed reads _leaked_worker).
+            self._leaked_worker = True
+            # Show DISCONNECTED so the tile reflects the dead capture.
+            self.on_status_changed(False)
             return
 
+        # Success path: this restart counts against the budget.
+        self._restart_events.append(now)
+
         self._dispose_worker(old_worker)
-        
+
         # camera_stream_link is guaranteed to be set if capture_enabled is True
         if self.camera_stream_link is None:
             return
-        
+
         self._spawn_worker(self.camera_stream_link, target_fps, (cap_w, cap_h))
         self._render_placeholder("CONNECTING...")
 
@@ -1105,10 +1142,11 @@ class CameraWidget(QtWidgets.QWidget):
         except Exception:
             pass
 
-    def detach_camera(self) -> Optional[int]:
+    def detach_camera(self) -> Optional[Union[int, str]]:
         """Detach camera from this widget and return to placeholder state.
-        
-        Returns the camera index that was detached, or None if not applicable.
+
+        Returns the camera stream link that was detached (an int device index
+        or a str device path/stream URL), or None if not applicable.
         """
         if not self.capture_enabled or self.settings_mode:
             return None
@@ -1136,7 +1174,8 @@ class CameraWidget(QtWidgets.QWidget):
         self._last_rendered_id = -1
         self._restart_events.clear()
         self._restart_limit_logged = False
-        
+        self._leaked_worker = False
+
         # Update display
         self._render_placeholder(self.placeholder_text or "DISCONNECTED")
         

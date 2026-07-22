@@ -474,6 +474,86 @@ class TestSpawnWorker:
 
             widget.cleanup()
 
+    @pytest.mark.requires_display
+    def test_restart_bail_out_preserves_budget_and_is_detachable(self, qapp):
+        """When the old worker cannot be stopped (stop() -> False), the stale
+        restart must NOT consume restart budget, must dispose the zombie and
+        clear self.worker, must NOT spawn a replacement, must keep the cooldown
+        (no hot-loop), and must leave the widget detachable via
+        is_permanently_failed()."""
+        from ui.widgets import CameraWidget
+
+        with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
+            old_worker = MagicMock()
+            old_worker.stop.return_value = False  # leaked / unkillable
+            old_worker.isRunning.return_value = True
+            old_worker.capture_width = 320
+            old_worker.capture_height = 240
+            mock_worker_cls.return_value = old_worker
+
+            widget = CameraWidget(
+                stream_link=2,
+                enable_capture=True,
+                target_fps=10.0,
+                request_capture_size=(320, 240),
+            )
+            widget._last_restart_ts = 0.0  # allow the cooldown gate to pass
+            events_before = len(widget._restart_events)
+
+            mock_worker_cls.reset_mock()
+
+            now = time.time()
+            widget._restart_capture_if_stale()
+
+            # (a) budget deque untouched -- a wedged thread must not eat the window
+            assert len(widget._restart_events) == events_before
+            # (b) cooldown still applies -- _last_restart_ts advanced to ~now
+            assert widget._last_restart_ts >= now
+            # zombie disposed, worker cleared, no replacement spawned
+            old_worker.stop.assert_called_once()
+            assert widget.worker is None
+            mock_worker_cls.assert_not_called()
+            # detachable: once the extended cooldown elapses, permanently failed
+            widget._last_restart_ts = now - widget._extended_cooldown_sec
+            assert widget.is_permanently_failed(now) is True
+
+            widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_restart_success_consumes_budget(self, qapp):
+        """Regression: on the normal (stop() -> True) path the restart budget
+        is consumed (one event recorded) and a replacement is spawned."""
+        from ui.widgets import CameraWidget
+
+        with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
+            old_worker = MagicMock()
+            old_worker.stop.return_value = True
+            old_worker.isRunning.return_value = False
+            old_worker.capture_width = 320
+            old_worker.capture_height = 240
+            mock_worker_cls.return_value = old_worker
+
+            widget = CameraWidget(
+                stream_link=2,
+                enable_capture=True,
+                target_fps=10.0,
+                request_capture_size=(320, 240),
+            )
+            widget._last_restart_ts = 0.0
+            events_before = len(widget._restart_events)
+
+            new_worker = MagicMock()
+            mock_worker_cls.reset_mock()
+            mock_worker_cls.return_value = new_worker
+
+            widget._restart_capture_if_stale()
+
+            assert len(widget._restart_events) == events_before + 1
+            assert widget.worker is new_worker
+            new_worker.start.assert_called_once()
+
+            widget.cleanup()
+
 
 class TestBlitScaled:
     """Characterization tests pinning the scaled-pixmap blit path in
