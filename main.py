@@ -83,6 +83,27 @@ def _plan_rescan_attachments(
     return attachments
 
 
+def _plan_detach_sweep(
+    camera_widgets: list[CameraWidget], now: float
+) -> list[CameraWidget]:
+    """Return the capture widgets that have permanently failed and must be
+    detached back to placeholder slots on this sweep (pure decision, no Qt).
+
+    A widget qualifies when it still has capture enabled AND
+    `is_permanently_failed(now)` is True (restart budget exhausted, or a
+    stale restart bailed out on an unkillable/leaked worker). Placeholder
+    or already-detached slots (`capture_enabled` False) are never swept.
+
+    Split out from `rescan_and_attach` so the sweep runs UNCONDITIONALLY
+    every tick -- the deployed steady state has no free placeholder slots,
+    and a widget that leaks its worker after all slots fill has no other
+    recovery path, so this decision must not be gated on placeholder state.
+    """
+    return [
+        w for w in camera_widgets if w.capture_enabled and w.is_permanently_failed(now)
+    ]
+
+
 def _step_widget_fps(w: CameraWidget, stress: bool, profile_ui_fps: int) -> bool:
     """Adjust one widget's capture and UI FPS a single step toward the
     stress-relief direction (lower) or the recovery direction (restore
@@ -451,44 +472,41 @@ def main() -> None:
         return results
 
     def rescan_and_attach():
-        """Scan for new cameras and attach them to placeholders."""
-        nonlocal rescan_timer
-        
-        # First, check for cameras that have permanently failed and detach them
-        # This converts them back to placeholder slots
-        for w in list(camera_widgets):
-            if not w.capture_enabled:
-                continue
-            now = time.time()
-            if w.is_permanently_failed(now):
-                # Camera has been disconnected long enough, detach it
-                detached_idx = w.detach_camera()
-                if detached_idx is not None:
-                    camera_widgets.remove(w)
-                    placeholder_slots.append(w)
-                    # Reclaim the port; keep last_slot_by_port as reattach
-                    # memory so a replug returns to this same slot.
-                    port = port_of_widget.pop(w, None)
-                    if port is not None:
-                        active_ports.discard(port)
-                        failed_ports[port] = now
-                    logging.info(
-                        "Camera port %s (was %s) detached from slot %d after "
-                        "prolonged failure, slot available for reuse",
-                        port,
-                        detached_idx,
-                        w.slot_index,
-                    )
-                    # Restart rescan timer if it was stopped
-                    if rescan_timer is not None and not rescan_timer.isActive():
-                        rescan_timer.start()
-                        logging.info("Restarted rescan timer for detached camera slot")
-        
+        """Scan for new cameras and attach them to placeholders.
+
+        The rescan timer runs ALWAYS (never self-stops): the detach sweep
+        below is the only recovery path for a permanently-failed/leaked
+        widget, and in the deployed steady state all slots are filled, so
+        gating either the timer or the sweep on placeholder availability
+        would strand such a widget as a dead DISCONNECTED tile until process
+        restart. The sweep is a cheap <= slot_count loop every 15s.
+        """
+        # First, detach any capture widgets that have permanently failed so
+        # their slots become placeholders again. Runs regardless of whether
+        # any placeholder is currently free (see _plan_detach_sweep).
+        now = time.time()
+        for w in _plan_detach_sweep(list(camera_widgets), now):
+            detached_idx = w.detach_camera()
+            if detached_idx is not None:
+                camera_widgets.remove(w)
+                placeholder_slots.append(w)
+                # Reclaim the port; keep last_slot_by_port as reattach
+                # memory so a replug returns to this same slot.
+                port = port_of_widget.pop(w, None)
+                if port is not None:
+                    active_ports.discard(port)
+                    failed_ports[port] = now
+                logging.info(
+                    "Camera port %s (was %s) detached from slot %d after "
+                    "prolonged failure, slot available for reuse",
+                    port,
+                    detached_idx,
+                    w.slot_index,
+                )
+
         if not placeholder_slots:
-            # All slots filled, stop the timer
-            if rescan_timer is not None and rescan_timer.isActive():
-                rescan_timer.stop()
-                logging.info("All camera slots filled, stopping rescan timer")
+            # No free slots to attach into this tick; the sweep above still
+            # ran, so leave the timer going and just wait for the next tick.
             return
 
         now = time.time()

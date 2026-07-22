@@ -15,11 +15,54 @@ SAFETY RULES under test:
 """
 
 from core.camera import CameraIdentity
-from main import _plan_rescan_attachments
+from main import _plan_detach_sweep, _plan_rescan_attachments
 
 
 PORT_A = "platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0"
 PORT_B = "platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.4:1.0"
+
+
+class _FakeWidget:
+    """Minimal stand-in for a CameraWidget for sweep-decision tests."""
+
+    def __init__(self, capture_enabled: bool, permanently_failed: bool):
+        self.capture_enabled = capture_enabled
+        self._permanently_failed = permanently_failed
+        self.seen_now = None
+
+    def is_permanently_failed(self, now: float) -> bool:
+        self.seen_now = now
+        return self._permanently_failed
+
+
+class TestPlanDetachSweep:
+    """The detach sweep (Finding 1) must run every tick regardless of whether
+    any placeholder slots are free -- a widget that leaked its worker in the
+    deployed all-slots-full steady state must still be detached.
+    """
+
+    def test_permanently_failed_capture_widget_is_swept(self):
+        w = _FakeWidget(capture_enabled=True, permanently_failed=True)
+        assert _plan_detach_sweep([w], now=100.0) == [w]
+        assert w.seen_now == 100.0
+
+    def test_healthy_capture_widget_is_not_swept(self):
+        w = _FakeWidget(capture_enabled=True, permanently_failed=False)
+        assert _plan_detach_sweep([w], now=100.0) == []
+
+    def test_placeholder_widget_is_not_swept(self):
+        # capture_enabled False -> a placeholder/detached slot, never a
+        # detach candidate even if is_permanently_failed would say True.
+        w = _FakeWidget(capture_enabled=False, permanently_failed=True)
+        assert _plan_detach_sweep([w], now=100.0) == []
+
+    def test_only_failed_widgets_selected_from_mixed_list(self):
+        healthy = _FakeWidget(capture_enabled=True, permanently_failed=False)
+        failed = _FakeWidget(capture_enabled=True, permanently_failed=True)
+        placeholder = _FakeWidget(capture_enabled=False, permanently_failed=True)
+        assert _plan_detach_sweep(
+            [healthy, failed, placeholder], now=42.0
+        ) == [failed]
 
 
 def _identity(port: str, index: int) -> CameraIdentity:
