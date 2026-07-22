@@ -254,6 +254,36 @@ slot0 =
         assert config.SLOT_PINS == {}
         assert any("slot0" in r.getMessage() for r in caplog.records)
 
+    def test_duplicate_pin_value_both_kept_with_warning(
+        self, tmp_path, save_restore_config, caplog
+    ):
+        """Two different slots pinned to the identical value are both
+        kept in SLOT_PINS (matching is resolved at assignment time), but
+        a warning is logged since only one can actually match a
+        camera."""
+        config_file = tmp_path / "test.ini"
+        config_file.write_text(
+            """
+[camera]
+slot_count = 3
+
+[slots]
+slot0 = usb-0:1.1
+slot1 = usb-0:1.1
+"""
+        )
+        parser = config.load_config(str(config_file))
+        with caplog.at_level(logging.WARNING):
+            config.apply_config(parser)
+
+        assert config.SLOT_PINS == {0: "usb-0:1.1", 1: "usb-0:1.1"}
+        assert any(
+            "slot0" in r.getMessage()
+            and "slot1" in r.getMessage()
+            and "usb-0:1.1" in r.getMessage()
+            for r in caplog.records
+        )
+
     def test_repeated_apply_config_produces_fresh_dict(self, tmp_path, save_restore_config):
         """apply_config never mutates the previous SLOT_PINS dict in place."""
         config_file = tmp_path / "test.ini"

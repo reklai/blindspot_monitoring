@@ -951,6 +951,9 @@ def _pin_matches(pin: str, port_path: str) -> bool:
     """
     if pin.startswith("index:"):
         return pin == port_path
+    # Substring matching below is intended for by-path port-tail pins
+    # (e.g. "usb-0:1.3") only; "index:N" pins are the fallback-mode form
+    # and always take the exact-match branch above.
     return pin in port_path
 
 
