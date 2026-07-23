@@ -2,11 +2,26 @@
 Tests for ui/widgets.py - Widget lifecycle and fullscreen behavior.
 """
 
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _clear_zombie_workers():
+    """Empty the module-level zombie parking lot between tests so parked
+    MagicMock workers from one test never leak into another's reap pass."""
+    yield
+    import ui.widgets as widgets_mod
+
+    if hasattr(widgets_mod, "_zombie_workers"):
+        widgets_mod._zombie_workers.clear()
+    timer = getattr(widgets_mod, "_zombie_reap_timer", None)
+    if timer is not None:
+        timer.stop()
 
 
 class TestCameraWidgetInit:
@@ -867,6 +882,82 @@ class TestFirstFrameWatchdog:
             widget.cleanup()
 
     @pytest.mark.requires_display
+    def test_watchdog_not_triggered_after_midrun_offline(self, qapp):
+        """Camera unplugged mid-run: on_status_changed(False) clears the
+        latest frame, but the worker's own reconnect loop is the designed
+        recovery -- the watchdog must NOT keep restarting the healthy
+        reconnecting worker (each restart would block the GUI up to 2s in
+        stop() and refresh _last_restart_ts forever). The watchdog only
+        covers a worker that has delivered NOTHING since (re)attach."""
+        from ui.widgets import CameraWidget
+
+        with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
+            mock_worker_cls.return_value = MagicMock()
+            widget = CameraWidget(stream_link=0, enable_capture=True)
+            widget._attach_ts = time.time() - widget._first_frame_timeout_sec - 1.0
+
+            # A frame arrived after attach, then the camera went offline.
+            widget.on_frame(np.zeros((4, 4, 3), dtype=np.uint8))
+            widget.on_status_changed(False)
+            assert widget._latest_frame is None
+
+            with patch.object(widget, "_restart_capture_if_stale") as mock_restart:
+                widget._render_latest_frame()
+                mock_restart.assert_not_called()
+
+            widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_watchdog_fires_when_online_but_never_delivered_a_frame(self, qapp):
+        """Wedge between open-success and first frame: _open_capture()
+        succeeds so the worker emits status_changed(True) -- which refreshes
+        _last_frame_ts as grace for the stale check -- then grab()/retrieve()
+        blocks forever before the first frame_ready. Neither the V4L2 nor
+        the GStreamer path has a read timeout, so the worker's own reconnect
+        loop is stuck inside the blocked call and the watchdog is the ONLY
+        recovery. "Delivered nothing since attach" must mean no FRAME, not
+        no status transition."""
+        from ui.widgets import CameraWidget
+
+        with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
+            mock_worker_cls.return_value = MagicMock()
+            widget = CameraWidget(stream_link=0, enable_capture=True)
+            widget._attach_ts = time.time() - widget._first_frame_timeout_sec - 1.0
+
+            # The worker went online after attach but never emitted a frame.
+            widget.on_status_changed(True)
+            assert widget._latest_frame is None
+
+            with patch.object(widget, "_restart_capture_if_stale") as mock_restart:
+                widget._render_latest_frame()
+                mock_restart.assert_called_once()
+
+            widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_watchdog_rearms_on_reattach_after_earlier_frames(self, qapp):
+        """A frame delivered in a PREVIOUS attach life must not disarm the
+        watchdog for the next life: after detach + attach_camera, a worker
+        that goes online but never delivers is still caught."""
+        from ui.widgets import CameraWidget
+
+        with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
+            mock_worker_cls.return_value = MagicMock()
+            widget = CameraWidget(stream_link=0, enable_capture=True)
+            widget.on_frame(np.zeros((4, 4, 3), dtype=np.uint8))
+            widget.detach_camera()
+
+            widget.attach_camera(0, 25.0, (320, 240), ui_fps=10)
+            widget._attach_ts = time.time() - widget._first_frame_timeout_sec - 1.0
+            widget.on_status_changed(True)
+
+            with patch.object(widget, "_restart_capture_if_stale") as mock_restart:
+                widget._render_latest_frame()
+                mock_restart.assert_called_once()
+
+            widget.cleanup()
+
+    @pytest.mark.requires_display
     def test_watchdog_ignored_for_settings_tile(self, qapp):
         """Settings tiles never run the watchdog (or any frame rendering)."""
         from ui.widgets import CameraWidget
@@ -913,5 +1004,124 @@ class TestFirstFrameWatchdog:
         with patch.object(widget, "_restart_capture_if_stale") as mock_restart:
             widget._render_latest_frame()
             mock_restart.assert_not_called()
+
+        widget.cleanup()
+
+
+class TestZombieWorkerDisposal:
+    """deleteLater() on a still-running QThread is a qFatal abort (Qt kills
+    the whole process with "QThread: Destroyed while thread is still
+    running" once the event loop processes the deferred delete). The same
+    abort fires if the last Python reference to a running QThread is
+    dropped. So _dispose_worker must never deleteLater a running worker:
+    it parks the zombie with a strong reference and only deletes it once
+    isRunning() goes False.
+    """
+
+    @pytest.mark.requires_display
+    def test_dispose_running_worker_parks_instead_of_delete(self, qapp):
+        """A worker still running after a failed stop() is parked, not
+        deleteLater'd."""
+        import ui.widgets as widgets_mod
+        from ui.widgets import CameraWidget
+
+        widget = CameraWidget(stream_link=None, enable_capture=False)
+        zombie = MagicMock()
+        zombie.isRunning.return_value = True
+
+        widget._dispose_worker(zombie)
+
+        zombie.deleteLater.assert_not_called()
+        assert zombie in widgets_mod._zombie_workers
+
+        widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_dispose_stopped_worker_deletes_immediately(self, qapp):
+        """A confirmed-dead worker takes the normal deleteLater path and is
+        never parked."""
+        import ui.widgets as widgets_mod
+        from ui.widgets import CameraWidget
+
+        widget = CameraWidget(stream_link=None, enable_capture=False)
+        worker = MagicMock()
+        worker.isRunning.return_value = False
+
+        widget._dispose_worker(worker)
+
+        worker.deleteLater.assert_called_once()
+        assert worker not in widgets_mod._zombie_workers
+
+        widget.cleanup()
+
+    @pytest.mark.requires_display
+    def test_park_starts_reap_timer(self, qapp):
+        """Parking arms the periodic reap timer -- without it a zombie that
+        eventually dies would never be released."""
+        import ui.widgets as widgets_mod
+
+        zombie = MagicMock()
+        zombie.isRunning.return_value = True
+
+        widgets_mod._park_zombie_worker(zombie)
+
+        assert widgets_mod._zombie_reap_timer is not None
+        assert widgets_mod._zombie_reap_timer.isActive()
+
+    @pytest.mark.requires_display
+    def test_reap_disposes_only_dead_zombies(self, qapp):
+        """The reap pass deleteLater's zombies whose thread has exited and
+        keeps holding the ones still running."""
+        import ui.widgets as widgets_mod
+
+        still_running = MagicMock()
+        still_running.isRunning.return_value = True
+        now_dead = MagicMock()
+        now_dead.isRunning.return_value = False
+        widgets_mod._park_zombie_worker(still_running)
+        widgets_mod._park_zombie_worker(now_dead)
+
+        widgets_mod._reap_zombie_workers()
+
+        now_dead.deleteLater.assert_called_once()
+        assert now_dead not in widgets_mod._zombie_workers
+        still_running.deleteLater.assert_not_called()
+        assert still_running in widgets_mod._zombie_workers
+
+    @pytest.mark.requires_display
+    def test_real_running_qthread_survives_dispose(self, qapp):
+        """Crash repro: disposing a REAL running QThread and then processing
+        deferred deletes must not abort the process (unfixed code dies here
+        with SIGABRT), and the parked thread is released once it exits."""
+        from PyQt6 import QtCore
+
+        import ui.widgets as widgets_mod
+        from ui.widgets import CameraWidget
+
+        class _BlockingThread(QtCore.QThread):
+            def __init__(self):
+                super().__init__()
+                self.release = threading.Event()
+
+            def run(self):
+                self.release.wait(10.0)
+
+        widget = CameraWidget(stream_link=None, enable_capture=False)
+        thread = _BlockingThread()
+        thread.start()
+        assert thread.isRunning()
+
+        widget._dispose_worker(thread)
+        # Unfixed code scheduled deleteLater on the running thread; Qt's
+        # qFatal fires right here when the deferred delete is processed.
+        qapp.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+        qapp.processEvents()
+
+        assert thread in widgets_mod._zombie_workers
+
+        thread.release.set()
+        assert thread.wait(2000)
+        widgets_mod._reap_zombie_workers()
+        assert thread not in widgets_mod._zombie_workers
 
         widget.cleanup()

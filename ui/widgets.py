@@ -21,6 +21,48 @@ from core import config
 from core.camera import CaptureWorker
 
 
+# Parking lot for worker threads that could not be stopped. deleteLater()
+# on a still-running QThread is fatal: when the event loop processes the
+# deferred delete, ~QThread hits qFatal("QThread: Destroyed while thread
+# is still running") and SIGABRTs the whole process. Dropping the last
+# Python reference to a running QThread destroys the C++ object the same
+# way. So an unstoppable worker is held here by a strong reference and
+# only deleteLater'd once its thread has actually exited, checked by a
+# periodic reap pass. Its device fd stays leaked the whole time (see
+# CaptureWorker.stop()); parking only keeps the process alive.
+_zombie_workers: list[CaptureWorker] = []
+_zombie_reap_timer: Optional[QTimer] = None
+_ZOMBIE_REAP_INTERVAL_MS = 30_000
+
+
+def _park_zombie_worker(worker: CaptureWorker) -> None:
+    """Hold a still-running worker and arm the reap timer."""
+    global _zombie_reap_timer
+    _zombie_workers.append(worker)
+    if _zombie_reap_timer is None:
+        _zombie_reap_timer = QTimer()
+        _zombie_reap_timer.setInterval(_ZOMBIE_REAP_INTERVAL_MS)
+        _zombie_reap_timer.timeout.connect(_reap_zombie_workers)
+    if not _zombie_reap_timer.isActive():
+        _zombie_reap_timer.start()
+
+
+def _reap_zombie_workers() -> None:
+    """Release parked workers whose thread has exited; keep the rest."""
+    still_running: list[CaptureWorker] = []
+    for worker in _zombie_workers:
+        try:
+            if worker.isRunning():
+                still_running.append(worker)
+                continue
+            worker.deleteLater()
+        except RuntimeError:
+            # C++ object already gone; nothing left to release.
+            pass
+    _zombie_workers[:] = still_running
+    if not still_running and _zombie_reap_timer is not None:
+        _zombie_reap_timer.stop()
+
 
 class FullscreenOverlay(QtWidgets.QWidget):
     """Transparent top-level widget for fullscreen display."""
@@ -262,6 +304,14 @@ class CameraWidget(QtWidgets.QWidget):
         # below, which only runs once a frame has arrived at least once.
         self._attach_ts = 0.0
         self._first_frame_timeout_sec = config.FIRST_FRAME_TIMEOUT_SEC
+        # True once the CURRENT attach has delivered at least one frame.
+        # The watchdog keys on this, NOT on _last_frame_ts:
+        # on_status_changed(True) refreshes _last_frame_ts as grace for the
+        # stale check, so a timestamp comparison would let a worker that
+        # went online but wedged before its first frame escape the watchdog
+        # forever (no read timeout exists on the V4L2/GStreamer paths, so
+        # its own reconnect loop is stuck inside the blocked call too).
+        self._frame_since_attach = False
         # Set True when a stale restart bails out because the old worker could
         # not be stopped (leaked/zombie thread). Marks the widget detachable so
         # the app-level rescan can reclaim its slot (see is_permanently_failed).
@@ -414,6 +464,7 @@ class CameraWidget(QtWidgets.QWidget):
 
         self._spawn_worker(stream_link, target_fps, request_capture_size)
         self._attach_ts = time.time()
+        self._frame_since_attach = False
 
         if self.ui_timer is None and config.UI_FPS_LOGGING:
             self.ui_timer = QTimer(self)
@@ -669,6 +720,7 @@ class CameraWidget(QtWidgets.QWidget):
             self._latest_frame = frame_bgr
             self._frame_id += 1
             self._last_frame_ts = time.time()
+            self._frame_since_attach = True
         except Exception:
             logging.exception("on_frame")
 
@@ -677,7 +729,14 @@ class CameraWidget(QtWidgets.QWidget):
         self._latest_frame = None
 
     def _dispose_worker(self, worker: CaptureWorker) -> None:
-        """Disconnect and schedule a worker for deletion."""
+        """Disconnect a worker and schedule it for deletion, zombie-safely.
+
+        A worker whose thread is still running (stop() failed or was
+        skipped) must NOT be deleteLater'd -- that is a qFatal abort of the
+        whole process (see the parking-lot comment at module level). Such a
+        worker is parked instead and deleted by the reap pass once its
+        thread exits.
+        """
         try:
             worker.frame_ready.disconnect(self.on_frame)
         except Exception:
@@ -688,6 +747,9 @@ class CameraWidget(QtWidgets.QWidget):
             pass
         try:
             worker.setParent(None)
+            if worker.isRunning():
+                _park_zombie_worker(worker)
+                return
             worker.deleteLater()
         except Exception:
             pass
@@ -757,10 +819,20 @@ class CameraWidget(QtWidgets.QWidget):
                 # below (it only runs once _last_frame_ts has been set by a
                 # first frame). Settings tiles never reach here (early
                 # return above); capture_enabled/worker guard against
-                # placeholder/detached slots.
+                # placeholder/detached slots. The _frame_since_attach guard
+                # restricts the watchdog to "no FRAME delivered since this
+                # (re)attach": a camera that goes offline MID-RUN also lands
+                # here (on_status_changed(False) clears _latest_frame), but
+                # its worker's reconnect loop is the designed recovery --
+                # restarting that healthy worker would block the GUI up to
+                # 2s per stop() and refresh _last_restart_ts forever. A
+                # dedicated flag (not _last_frame_ts, which
+                # on_status_changed(True) also refreshes) keeps the
+                # online-but-wedged-before-first-frame worker covered.
                 if (
                     self.capture_enabled
                     and self.worker is not None
+                    and not self._frame_since_attach
                     and (time.time() - self._attach_ts) > self._first_frame_timeout_sec
                 ):
                     self._restart_capture_if_stale()
@@ -1047,8 +1119,9 @@ class CameraWidget(QtWidgets.QWidget):
                 self.camera_stream_link,
             )
             # Disconnect signals so the zombie can't emit into the UI, and drop
-            # our reference. _dispose_worker only disconnects + deleteLater, so
-            # it is safe on a still-running worker.
+            # our reference. _dispose_worker parks a still-running worker in
+            # the module zombie list (deleteLater on a live QThread would
+            # qFatal-abort the process) and frees it once the thread exits.
             self._dispose_worker(old_worker)
             self.worker = None
             # Mark detachable: with self.worker == None no further stale
@@ -1070,6 +1143,7 @@ class CameraWidget(QtWidgets.QWidget):
 
         self._spawn_worker(self.camera_stream_link, target_fps, (cap_w, cap_h))
         self._attach_ts = time.time()
+        self._frame_since_attach = False
         self._render_placeholder("CONNECTING...")
 
     def _log_status(self) -> None:
@@ -1203,6 +1277,7 @@ class CameraWidget(QtWidgets.QWidget):
         if self._latest_frame is not None:
             self._release_current_frame()
         self._last_frame_ts = 0.0
+        self._frame_since_attach = False
         self._frame_id = 0
         self._last_rendered_id = -1
         self._restart_events.clear()
