@@ -6,6 +6,7 @@ Includes system helpers and process management.
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 import re
@@ -107,6 +108,44 @@ def kill_device_holders(device_path: str, grace: float = 0.4) -> bool:
                 logging.debug("Failed to SIGKILL pid %d", pid, exc_info=True)
 
     return True
+
+
+def set_cloexec_on_device_fds(prefix: str = "/dev/video") -> int:
+    """Set FD_CLOEXEC on every open fd whose target starts with `prefix`.
+
+    Used right before the settings-tile restart's os.execv: a capture fd
+    leaked by an unkillable worker thread (see CaptureWorker.stop()) was
+    opened by OpenCV WITHOUT O_CLOEXEC, so it would survive the exec, keep
+    the device claimed in the replacement process, and -- because exec
+    keeps the PID -- be unreclaimable there (kill_device_holders skips our
+    own PID). Marking it close-on-exec makes the kernel drop it at exec so
+    the restarted app can reopen the camera. Setting the flag does not
+    close the fd, so a wedged thread still blocked in grab() on it is
+    unaffected until the exec replaces the process image.
+
+    Best-effort: returns the number of fds marked; unreadable entries and
+    fcntl failures are skipped.
+    """
+    count = 0
+    try:
+        fd_names = os.listdir("/proc/self/fd")
+    except OSError:
+        return 0
+    for name in fd_names:
+        try:
+            fd = int(name)
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except (ValueError, OSError):
+            continue
+        if not target.startswith(prefix):
+            continue
+        try:
+            flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+            fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+            count += 1
+        except OSError:
+            continue
+    return count
 
 
 def log_health_summary(

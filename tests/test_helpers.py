@@ -236,3 +236,43 @@ class TestLogHealthSummary:
         mock_warning.assert_called()
         warning_call = mock_warning.call_args[0][0]
         assert "unhealthy" in warning_call.lower()
+
+
+class TestSetCloexecOnDeviceFds:
+    """set_cloexec_on_device_fds marks open fds whose /proc/self/fd target
+    matches the prefix as close-on-exec, so the settings-tile restart's
+    os.execv does not carry a leaked capture fd into the replacement
+    process. OpenCV's V4L2 open() has no O_CLOEXEC, and exec keeps the PID,
+    so kill_device_holders (which skips our own PID) could never reclaim
+    the device in the restarted app -- the kernel must drop the fd at exec.
+    """
+
+    def test_sets_cloexec_only_on_matching_fds(self, tmp_path):
+        device = tmp_path / "video7"
+        device.write_bytes(b"")
+        other = tmp_path / "unrelated"
+        other.write_bytes(b"")
+
+        dev_fd = os.open(device, os.O_RDONLY)
+        other_fd = os.open(other, os.O_RDONLY)
+        try:
+            # Simulate OpenCV's V4L2 open(): fd inheritable (no CLOEXEC).
+            os.set_inheritable(dev_fd, True)
+            os.set_inheritable(other_fd, True)
+
+            count = helpers.set_cloexec_on_device_fds(
+                prefix=str(tmp_path / "video")
+            )
+
+            assert count == 1
+            # inheritable is the inverse of FD_CLOEXEC.
+            assert os.get_inheritable(dev_fd) is False
+            assert os.get_inheritable(other_fd) is True
+        finally:
+            os.close(dev_fd)
+            os.close(other_fd)
+
+    def test_returns_zero_when_nothing_matches(self, tmp_path):
+        assert helpers.set_cloexec_on_device_fds(
+            prefix=str(tmp_path / "no-such-device")
+        ) == 0
