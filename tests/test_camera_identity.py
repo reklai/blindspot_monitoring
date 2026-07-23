@@ -153,6 +153,56 @@ class TestTestIdentity:
         assert ident is None
 
 
+class TestProbeGroupFallback:
+    """probe_group_fallback: the public rescan-side sibling of the startup
+    group probe. When a group's provisional (lowest) node failed, it probes
+    the group's REMAINING nodes ascending, exactly as startup does, so a
+    camera whose capture node isn't its group's lowest can still hot-plug
+    reattach.
+    """
+
+    def test_probes_remaining_nodes_and_skips_excluded(self, fake_by_path):
+        by_path_dir = fake_by_path["by_path_dir"]
+        make_link = fake_by_path["make_link"]
+        make_link(f"{PORT_A}-video-index0", 0)  # already probed, failed
+        make_link(f"{PORT_A}-video-index1", 1)  # real capture node
+
+        from core.camera import probe_group_fallback
+
+        with patch("core.camera.test_single_camera") as mock_test:
+            mock_test.side_effect = lambda idx, **kw: idx if idx == 1 else None
+            ident = probe_group_fallback(PORT_A, exclude_index=0)
+
+        assert ident is not None
+        assert ident.port_path == PORT_A
+        assert ident.index == 1
+        assert ident.device_path == str(by_path_dir / f"{PORT_A}-video-index1")
+        # The excluded (already-probed) node is never re-probed.
+        assert all(call.args[0] != 0 for call in mock_test.call_args_list)
+
+    def test_port_without_group_returns_none(self, fake_by_path):
+        # A fallback "index:N" identity has no by-path group to expand.
+        from core.camera import probe_group_fallback
+
+        with patch("core.camera.test_single_camera") as mock_test:
+            ident = probe_group_fallback("index:5", exclude_index=5)
+
+        assert ident is None
+        mock_test.assert_not_called()
+
+    def test_single_node_group_has_nothing_left_to_probe(self, fake_by_path):
+        make_link = fake_by_path["make_link"]
+        make_link(f"{PORT_A}-video-index0", 0)
+
+        from core.camera import probe_group_fallback
+
+        with patch("core.camera.test_single_camera") as mock_test:
+            ident = probe_group_fallback(PORT_A, exclude_index=0)
+
+        assert ident is None
+        mock_test.assert_not_called()
+
+
 class TestNaturalKey:
     """Requirement 3: natural sort ('1.2' before '1.10')."""
 

@@ -853,6 +853,35 @@ def _test_identity(
     return None
 
 
+def probe_group_fallback(
+    port_path: str,
+    exclude_index: int,
+    **probe_kwargs: Any,
+) -> Optional[CameraIdentity]:
+    """Probe a by-path group's REMAINING nodes after its provisional node failed.
+
+    `discover_camera_identities` uses a group's LOWEST node as the
+    provisional capture node, but that node may be a UVC metadata node that
+    fails grab() while the real capture node has a higher index. This
+    re-derives the group's nodes for `port_path` (from BY_PATH_DIR at call
+    time) and probes the nodes other than `exclude_index` (the one already
+    probed) ascending via `_test_identity`, exactly as startup does.
+    Returns the rebuilt identity for whichever node passes, else None --
+    including when the port has no by-path group at all (e.g. fallback
+    "index:N" identities, which have a single node and nothing to expand).
+    `probe_kwargs` are passed through to `test_single_camera`.
+    """
+    nodes = list_by_path_nodes().get(port_path)
+    if not nodes:
+        return None
+    remaining: list[tuple[int, Optional[str]]] = [
+        (idx, name) for idx, name in nodes if idx != exclude_index
+    ]
+    if not remaining:
+        return None
+    return _test_identity(port_path, remaining, None, **probe_kwargs)
+
+
 def discover_camera_identities(by_path_dir: Optional[str] = None) -> list[CameraIdentity]:
     """Cheap, non-probing camera identity discovery (used by the rescan tick).
 
@@ -1007,15 +1036,25 @@ def _pin_matches(pin: str, port_path: str) -> bool:
     `index:N` pins are the fallback pseudo-key form (used when there is
     no /dev/v4l/by-path) and must match `port_path` EXACTLY -- otherwise
     pin "index:1" would wrongly claim "index:10" via substring matching.
-    Any other pin matches if it's a substring of `port_path` (the
-    documented use is the stable "usb-0:1.3" port tail).
+
+    Any other pin (the documented use is the stable "usb-0:1.3" port tail)
+    must match at component boundaries, not as a plain substring: the match
+    must end at ':' (the USB interface suffix, e.g. "...usb-0:1.3:1.0") or
+    at end-of-string, and must not start in the middle of a digit/letter
+    run OR right after '.' (the inside of a dotted port number). Otherwise
+    pin "usb-0:1.1" would also claim "usb-0:1.10" (10+ port hub) or
+    "usb-0:1.1.2" (chained hub), and a bare-fragment pin "1.1" would claim
+    "usb-0:2.1.1" (a different hub's port 1) -- the WRONG camera in a
+    pinned, safety-relevant tile.
     """
     if pin.startswith("index:"):
         return pin == port_path
-    # Substring matching below is intended for by-path port-tail pins
-    # (e.g. "usb-0:1.3") only; "index:N" pins are the fallback-mode form
-    # and always take the exact-match branch above.
-    return pin in port_path
+    return (
+        re.search(
+            r"(?<![0-9A-Za-z.])" + re.escape(pin) + r"(?=:|$)", port_path
+        )
+        is not None
+    )
 
 
 def assign_slots(

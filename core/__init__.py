@@ -28,6 +28,7 @@ __all__ = [
     "assign_slots",
     "choose_slot_for_identity",
     "get_video_indexes",
+    "probe_group_fallback",
     "test_single_camera",
     # performance module exports
     "is_system_stressed",
@@ -60,6 +61,7 @@ from .camera import (
     find_working_cameras,
     find_working_camera_identities,
     get_video_indexes,
+    probe_group_fallback,
     test_single_camera,
 )
 from .performance import is_system_stressed
