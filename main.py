@@ -27,11 +27,42 @@ from core import (
     discover_camera_identities,
     find_working_camera_identities,
     is_system_stressed,
+    probe_group_fallback,
     test_single_camera,
 )
-from core.camera import _test_identity, list_by_path_nodes
 from ui import CameraWidget, get_smart_grid
-from utils import log_health_summary
+from utils import log_health_summary, set_cloexec_on_device_fds
+
+
+class _RescanBridge(QtCore.QObject):
+    """Marshals rescan probe results from the executor thread to the GUI
+    thread.
+
+    QTimer.singleShot(0, ...) called from a future.add_done_callback runs in
+    the executor thread, which has no Qt event loop -- the timer NEVER fires
+    and the results are silently dropped (leaving rescan_inflight stuck
+    True). A cross-thread signal emit is delivered as a queued call on the
+    receiver's (GUI) thread instead, which is the supported marshalling
+    mechanism.
+    """
+
+    results_ready = QtCore.pyqtSignal(object)
+
+
+def _make_rescan_done_callback(bridge: _RescanBridge) -> Any:
+    """Build the future.add_done_callback for a rescan probe: resolve the
+    future (a failure logs and becomes an empty result list) and emit the
+    results through `bridge` for GUI-thread application."""
+
+    def _on_rescan_done(fut: Any) -> None:
+        try:
+            results = fut.result()
+        except Exception:
+            logging.exception("Rescan worker failed")
+            results = []
+        bridge.results_ready.emit(results)
+
+    return _on_rescan_done
 
 
 def _plan_rescan_attachments(
@@ -84,45 +115,6 @@ def _plan_rescan_attachments(
     return attachments
 
 
-def _rescan_probe_group_fallback(
-    identity: CameraIdentity,
-) -> Optional[tuple[CameraIdentity, int]]:
-    """Fallback probe when a by-path group's provisional (lowest) node fails.
-
-    `discover_camera_identities` uses a by-path group's LOWEST node as the
-    provisional capture node, but that node may be a UVC metadata node that
-    fails grab() while the real capture node has a higher index. When the
-    fast single-node probe fails, re-derive the group's nodes for this one
-    port via `list_by_path_nodes` (smaller change than threading the full
-    node list through discovery) and probe the REMAINING nodes ascending
-    with `_test_identity`, exactly as startup does. Returns
-    (rebuilt_identity, resolved_index) for whichever node passes, else None.
-
-    Fallback (`index:N`, device_path None) identities have a single node and
-    no group to expand, so they return None immediately (behavior unchanged).
-    """
-    if identity.device_path is None:
-        return None
-    nodes = list_by_path_nodes().get(identity.port_path)
-    if not nodes:
-        return None
-    # Skip the provisional node we already probed in the fast path.
-    remaining = [(idx, name) for idx, name in nodes if idx != identity.index]
-    if not remaining:
-        return None
-    rebuilt = _test_identity(
-        identity.port_path,
-        remaining,
-        None,
-        retries=2,
-        retry_delay=0.15,
-        allow_kill=False,
-    )
-    if rebuilt is None:
-        return None
-    return (rebuilt, rebuilt.index)
-
-
 def _run_rescan_tests(
     candidates: list[CameraIdentity],
 ) -> list[tuple[CameraIdentity, Optional[int]]]:
@@ -131,8 +123,10 @@ def _run_rescan_tests(
 
     Cheap single-node fast path first: probe the provisional
     `identity.stream_target`. On failure, fall back to probing the group's
-    remaining nodes (`_rescan_probe_group_fallback`) so a camera whose
-    capture node isn't its group's lowest can still hot-plug reattach.
+    remaining nodes (`probe_group_fallback` in core.camera) so a camera
+    whose capture node isn't its group's lowest can still hot-plug
+    reattach. Fallback (`index:N`, device_path None) identities have a
+    single node and no group to expand, so they skip the fallback probe.
     Result entries are (identity, resolved_index_or_None) for the planner.
     """
     results: list[tuple[CameraIdentity, Optional[int]]] = []
@@ -146,9 +140,17 @@ def _run_rescan_tests(
         if ok is not None:
             results.append((identity, ok))
             continue
-        fallback = _rescan_probe_group_fallback(identity)
-        if fallback is not None:
-            results.append(fallback)
+        rebuilt = None
+        if identity.device_path is not None:
+            rebuilt = probe_group_fallback(
+                identity.port_path,
+                identity.index,
+                retries=2,
+                retry_delay=0.15,
+                allow_kill=False,
+            )
+        if rebuilt is not None:
+            results.append((rebuilt, rebuilt.index))
         else:
             results.append((identity, None))
     return results
@@ -222,12 +224,39 @@ def safe_cleanup(widgets: list[CameraWidget], cleaned_flag: list[bool]) -> None:
             pass
 
 
+# Set by _handle_shutdown_signal; read by main()'s startup checkpoints.
+# QApplication.quit() is a documented no-op before app.exec() starts, so a
+# signal delivered during the multi-second startup camera discovery would
+# otherwise be silently swallowed and systemd would wait out TimeoutStopSec
+# before SIGKILLing the process mid-capture.
+_shutdown_requested = {"flag": False}
+
+
 def _handle_shutdown_signal(sig: int, frame: Optional[Any]) -> None:
     """Signal handler shared by SIGINT and SIGTERM: request a clean Qt
     shutdown so the normal QApplication.quit() -> aboutToQuit ->
     safe_cleanup path runs instead of the process dying mid-capture.
+
+    Also sets `_shutdown_requested` for signals that arrive before the
+    event loop is running (see the flag's comment above).
     """
+    _shutdown_requested["flag"] = True
     QtWidgets.QApplication.quit()
+
+
+def _startup_shutdown_check() -> None:
+    """Scheduled with QTimer.singleShot(0, ...) right before app.exec();
+    runs as the first event of the live loop and re-reads the shutdown flag.
+
+    A plain pre-exec `if flag` check leaves a race: a signal landing between
+    that check and the loop actually starting calls quit() while it is still
+    a documented no-op, and the flag would never be read again. Re-checking
+    from inside the running loop closes the window -- from here on quit()
+    works, and any earlier signal left the flag set.
+    """
+    if _shutdown_requested["flag"]:
+        logging.info("Shutdown requested during startup; quitting immediately")
+        QtWidgets.QApplication.quit()
 
 
 def _install_signal_handlers(app: QtWidgets.QApplication) -> None:
@@ -286,6 +315,13 @@ def main() -> None:
 
     identities = find_working_camera_identities()
     logging.info("Found %d cameras", len(identities))
+
+    # Startup checkpoint: a SIGTERM/SIGINT during the multi-second discovery
+    # above could not stop the app via quit() (no event loop yet). Exit now,
+    # before any capture workers are spawned.
+    if _shutdown_requested["flag"]:
+        logging.info("Shutdown requested during startup discovery; exiting")
+        return
     slot_assignment = assign_slots(
         identities, config.CAMERA_SLOT_COUNT, config.SLOT_PINS
     )
@@ -304,6 +340,16 @@ def main() -> None:
         """Restart the entire process (used by settings tile)."""
         logging.info("Restart requested from settings.")
         safe_cleanup(camera_widgets, cleaned_flag)
+        # A capture fd leaked by an unkillable worker has no O_CLOEXEC and
+        # would survive execv with our SAME pid, keeping the device claimed
+        # in the restarted app with no way to reclaim it there
+        # (kill_device_holders skips our own PID). Mark such fds
+        # close-on-exec so the exec drops them and the camera comes back.
+        marked = set_cloexec_on_device_fds()
+        if marked:
+            logging.warning(
+                "Marked %d camera fd(s) close-on-exec before restart", marked
+            )
         python = sys.executable
         try:
             os.execv(python, [python] + sys.argv)
@@ -528,6 +574,11 @@ def main() -> None:
             if config.DYNAMIC_FPS_ENABLED:
                 ensure_perf_timer()
 
+    # Created on the GUI thread (parented to mw) so the cross-thread emit in
+    # the rescan done-callback is delivered here as a queued call.
+    rescan_bridge = _RescanBridge(mw)
+    rescan_bridge.results_ready.connect(_apply_rescan_results)
+
     def rescan_and_attach():
         """Scan for new cameras and attach them to placeholders.
 
@@ -592,16 +643,7 @@ def main() -> None:
 
         rescan_inflight["active"] = True
         future = rescan_executor.submit(_run_rescan_tests, candidates)
-
-        def _on_rescan_done(fut) -> None:
-            try:
-                results = fut.result()
-            except Exception:
-                logging.exception("Rescan worker failed")
-                results = []
-            QtCore.QTimer.singleShot(0, lambda: _apply_rescan_results(results))
-
-        future.add_done_callback(_on_rescan_done)
+        future.add_done_callback(_make_rescan_done_callback(rescan_bridge))
 
     rescan_timer = QTimer(mw)
     rescan_timer.setInterval(config.RESCAN_INTERVAL_MS)
@@ -632,6 +674,14 @@ def main() -> None:
     QtGui.QShortcut(QtGui.QKeySequence("q"), mw, quit_handler)
 
     logging.info("Short click=fullscreen toggle. Hold 400ms=swap mode. Q=quit.")
+    # Startup checkpoint: a signal that arrived after discovery but before
+    # exec() could not quit() a not-yet-running loop -- and a plain flag
+    # check here would itself leave a window between the check and the loop
+    # starting. Unconditionally re-check the flag from INSIDE the running
+    # loop instead (see _startup_shutdown_check); quitting goes through the
+    # normal aboutToQuit -> stop_timers/safe_cleanup path since workers are
+    # already spawned here.
+    QTimer.singleShot(0, _startup_shutdown_check)
     sys.exit(app.exec())
 
 

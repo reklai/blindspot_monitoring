@@ -41,3 +41,51 @@ class TestHandleShutdownSignal:
             main._handle_shutdown_signal(signal.SIGTERM, None)
 
         mock_quit.assert_called_once()
+
+    def test_sets_startup_shutdown_flag(self):
+        """QApplication.quit() is a documented no-op before app.exec()
+        starts, so a SIGTERM during the multi-second startup camera
+        discovery would otherwise be silently swallowed (systemd then waits
+        out TimeoutStopSec and SIGKILLs mid-capture). The handler must ALSO
+        set a flag that main()'s startup checkpoints read."""
+        main._shutdown_requested["flag"] = False
+        try:
+            with patch("main.QtWidgets.QApplication.quit"):
+                main._handle_shutdown_signal(signal.SIGTERM, None)
+
+            assert main._shutdown_requested["flag"] is True
+        finally:
+            main._shutdown_requested["flag"] = False
+
+    def test_flag_defaults_false(self):
+        """Fresh import: no shutdown pending."""
+        assert main._shutdown_requested["flag"] is False
+
+
+class TestStartupShutdownCheck:
+    """_startup_shutdown_check is scheduled with QTimer.singleShot(0, ...)
+    right before app.exec() and runs as the first event of the live loop.
+
+    A plain pre-exec `if flag` check leaves a race: a signal landing between
+    that check and the loop actually starting calls quit() while it is still
+    a documented no-op, and the flag would never be read again -- the
+    swallowed-shutdown bug survives in that window. Re-reading the flag from
+    INSIDE the running loop closes it: from there quit() works, and any
+    earlier signal left the flag set."""
+
+    def test_quits_when_flag_set(self):
+        main._shutdown_requested["flag"] = True
+        try:
+            with patch("main.QtWidgets.QApplication.quit") as mock_quit:
+                main._startup_shutdown_check()
+
+            mock_quit.assert_called_once()
+        finally:
+            main._shutdown_requested["flag"] = False
+
+    def test_noop_when_flag_clear(self):
+        main._shutdown_requested["flag"] = False
+        with patch("main.QtWidgets.QApplication.quit") as mock_quit:
+            main._startup_shutdown_check()
+
+        mock_quit.assert_not_called()

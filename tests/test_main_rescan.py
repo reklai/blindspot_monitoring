@@ -127,6 +127,91 @@ class _FakeWidget:
         return self._permanently_failed
 
 
+class TestRescanResultBridge:
+    """Rescan results must be marshalled from the executor thread to the GUI
+    thread through a QObject signal. The previous relay --
+    QTimer.singleShot(0, ...) called inside future.add_done_callback -- runs
+    in the executor thread, where the timer has no event loop and NEVER
+    fires: results were dropped and rescan_inflight stuck True forever,
+    killing hot-plug attach after the first probe.
+    """
+
+    def test_results_delivered_on_gui_thread_from_executor_callback(self, qapp):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        import main as main_mod
+
+        bridge = main_mod._RescanBridge()
+        received = []
+        receiver_threads = []
+
+        def receiver(results):
+            received.append(results)
+            receiver_threads.append(threading.current_thread())
+
+        bridge.results_ready.connect(receiver)
+
+        payload = [("identity-sentinel", 3)]
+        gate = threading.Event()
+        done = threading.Event()
+
+        def probe_task():
+            # Block until the done-callback is registered, so the callback
+            # provably runs on the executor thread (an already-finished
+            # future would run it inline on this test's main thread).
+            assert gate.wait(2.0)
+            return payload
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(probe_task)
+            callback = main_mod._make_rescan_done_callback(bridge)
+
+            def wrapped(fut):
+                callback(fut)
+                done.set()
+
+            future.add_done_callback(wrapped)
+            gate.set()
+            assert done.wait(2.0)
+
+            # Queued cross-thread delivery: nothing may arrive until the GUI
+            # event loop runs.
+            assert received == []
+            qapp.processEvents()
+
+            assert received == [payload]
+            assert receiver_threads == [threading.main_thread()]
+        finally:
+            executor.shutdown(wait=True)
+
+    def test_failed_probe_task_delivers_empty_results(self, qapp):
+        from concurrent.futures import ThreadPoolExecutor
+
+        import main as main_mod
+
+        bridge = main_mod._RescanBridge()
+        received = []
+        bridge.results_ready.connect(received.append)
+
+        def failing_task():
+            raise RuntimeError("probe blew up")
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(failing_task)
+            future.exception(timeout=2.0)  # wait for completion
+            # Callback on a finished future runs inline (same thread) --
+            # fine here; the exception path is what's under test.
+            future.add_done_callback(main_mod._make_rescan_done_callback(bridge))
+            qapp.processEvents()
+
+            assert received == [[]]
+        finally:
+            executor.shutdown(wait=True)
+
+
 class TestPlanDetachSweep:
     """The detach sweep (Finding 1) must run every tick regardless of whether
     any placeholder slots are free -- a widget that leaked its worker in the
