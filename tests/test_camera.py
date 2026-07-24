@@ -1,5 +1,8 @@
-"""
-Tests for core/camera.py - Camera discovery and capture logic.
+"""Camera probing, stream-target, worker lifecycle, and frame-loop contracts.
+
+Hardware and worker scheduling are replaced with deterministic doubles. The
+tests retain real path and array behavior where those details are the contract,
+so failures point to camera logic rather than the host's devices or timing.
 """
 
 import time
@@ -11,11 +14,12 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _isolate_by_path(tmp_path, monkeypatch):
-    """Point BY_PATH_DIR at a nonexistent tmp path for every test in this
-    module, so tests that (transitively, via find_working_cameras) touch
-    /dev/v4l/by-path stay environment-independent instead of reading
-    whatever real by-path tree happens to exist on the machine running
-    them."""
+    """Keep incidental discovery away from the host's ``/dev/v4l/by-path``.
+
+    Several index-based entry points reach identity discovery transitively. A
+    guaranteed-missing temporary directory forces their documented numeric
+    fallback and resetting the one-shot warning prevents cross-test state.
+    """
     import core.camera as camera_module
 
     monkeypatch.setattr(camera_module, "BY_PATH_DIR", str(tmp_path / "does-not-exist"))
@@ -23,18 +27,19 @@ def _isolate_by_path(tmp_path, monkeypatch):
 
 
 class TestGetVideoIndexes:
-    """Test video device index discovery."""
+    """Numeric discovery remains available without USB port path identities."""
 
     def test_get_video_indexes_with_devices(self):
-        """Test finding video device indexes."""
+        """Discovery consistently exposes indexes as a list to index-based callers."""
         from core.camera import get_video_indexes
         
-        # Mock returns devices
+        # The host result is intentionally not asserted; this smoke case only pins
+        # the return shape across machines with and without cameras.
         indexes = get_video_indexes()
         assert isinstance(indexes, list)
 
     def test_get_video_indexes_empty(self):
-        """Test handling no video devices."""
+        """An empty device glob yields an empty candidate list."""
         with patch("core.camera.glob_module.glob") as mock_glob:
             mock_glob.return_value = []
             
@@ -44,17 +49,17 @@ class TestGetVideoIndexes:
 
 
 class TestTestSingleCamera:
-    """Test single camera validation."""
+    """Define how one stream target is validated and normalized to an index."""
 
     def test_single_camera_success(self, mock_video_capture):
-        """Test successful camera open."""
+        """A capture that opens through the shared fixture returns its index."""
         from core.camera import test_single_camera
         
         result = test_single_camera(0, retries=1, retry_delay=0.01)
         assert result == 0
 
     def test_single_camera_failure(self):
-        """Test failed camera open returns None."""
+        """Exhausting the open attempt reports an unusable camera as ``None``."""
         with patch("cv2.VideoCapture") as mock_cap:
             instance = MagicMock()
             instance.isOpened.return_value = False
@@ -65,13 +70,13 @@ class TestTestSingleCamera:
             assert result is None
 
     def test_single_camera_retries(self):
-        """Test camera open retries on failure."""
+        """Transient open failures are retried before the camera is rejected."""
         call_count = 0
 
         def mock_is_opened():
             nonlocal call_count
             call_count += 1
-            # Succeed on third attempt
+            # The third attempt models a device that settles shortly after discovery.
             return call_count >= 3
 
         with patch("cv2.VideoCapture") as mock_cap:
@@ -86,9 +91,10 @@ class TestTestSingleCamera:
             assert call_count >= 2
 
     def test_single_camera_int_target_call_form_unchanged(self, mock_video_capture):
-        """Regression guard: an int target must call cv2.VideoCapture with
-        the exact same args as before device-path support (no CAP_V4L2
-        change, no re-wrapping of the index)."""
+        """Integer targets open explicitly with V4L2 and return their index.
+
+        String-target handling must not wrap or reinterpret numeric callers.
+        """
         from core.camera import test_single_camera
 
         result = test_single_camera(5, retries=1, retry_delay=0.01)
@@ -97,9 +103,11 @@ class TestTestSingleCamera:
         mock_video_capture.assert_called_once_with(5, cv2.CAP_V4L2)
 
     def test_single_camera_str_target_resolves_and_opens(self, tmp_path):
-        """str target: realpath'd first; cv2.VideoCapture is called with
-        the RESOLVED path (not the symlink); success returns the numeric
-        index parsed from the resolved /dev/videoN node."""
+        """A by-path target opens its resolved node and still returns an index.
+
+        Resolving first lets OpenCV and holder-recovery tools agree on the actual
+        V4L2 node while preserving ``Optional[int]`` for callers.
+        """
         video_node = tmp_path / "video7"
         video_node.write_text("")
         symlink = tmp_path / "by-path-camera"
@@ -119,8 +127,7 @@ class TestTestSingleCamera:
         mock_cap.assert_called_once_with(resolved, cv2.CAP_V4L2)
 
     def test_single_camera_str_target_missing_realpath_returns_none(self, tmp_path):
-        """str target whose realpath doesn't exist fails fast: returns
-        None without ever calling cv2.VideoCapture."""
+        """A stale by-path link fails before OpenCV receives a nonexistent node."""
         missing = tmp_path / "gone"
 
         with patch("cv2.VideoCapture") as mock_cap:
@@ -131,8 +138,7 @@ class TestTestSingleCamera:
         mock_cap.assert_not_called()
 
     def test_single_camera_str_target_non_videon_returns_none(self, tmp_path):
-        """str target resolving to a node that isn't a /dev/videoN path
-        returns None (V4L2-only support)."""
+        """Resolved strings outside the ``videoN`` convention are not V4L2 targets."""
         node = tmp_path / "not-a-video-node"
         node.write_text("")
 
@@ -146,9 +152,11 @@ class TestTestSingleCamera:
     def test_single_camera_str_target_kill_uses_resolved_path(
         self, tmp_path, save_restore_config
     ):
-        """When allow_kill triggers, kill_device_holders receives the
-        RESOLVED real path, never the symlink (lsof/fuser can't match a
-        symlink)."""
+        """Holder recovery receives the real node rather than its by-path alias.
+
+        ``lsof`` and ``fuser`` report the opened node, so using the symlink would
+        miss the process that must release the camera.
+        """
         from core import config
 
         video_node = tmp_path / "video2"
@@ -184,11 +192,11 @@ class TestTestSingleCamera:
     def test_single_camera_str_target_post_kill_success_returns_numeric_index(
         self, tmp_path, save_restore_config
     ):
-        """str target that fails the initial retries but succeeds after
-        kill_device_holders must return the parsed NUMERIC index (an
-        int), never the original path string -- honoring the
-        -> Optional[int] contract regardless of which retry loop
-        succeeded."""
+        """Post-reclaim success preserves the same numeric return contract.
+
+        This guards the less common retry branch from leaking its original path
+        argument to callers that expect ``Optional[int]``.
+        """
         from core import config
 
         video_node = tmp_path / "video9"
@@ -203,8 +211,7 @@ class TestTestSingleCamera:
         def mock_is_opened():
             nonlocal call_count
             call_count += 1
-            # Fail every initial-retry attempt; succeed only once kill
-            # has been attempted (i.e. on the post-kill retry loop).
+            # With one initial attempt, only the post-reclaim loop sees call two.
             return call_count > 1
 
         with patch("cv2.VideoCapture") as mock_cap:
@@ -229,9 +236,10 @@ class TestTestSingleCamera:
 
 
 class TestBuildGstreamerPipeline:
-    """Test the extracted GStreamer pipeline string builder."""
+    """Pin the device forms accepted by the V4L2 GStreamer pipeline builder."""
 
     def test_int_device_matches_existing_pipeline_string(self):
+        """An integer expands to its conventional ``/dev/videoN`` source."""
         from core.camera import _build_gstreamer_pipeline
 
         pipeline = _build_gstreamer_pipeline(3, 640, 480)
@@ -245,6 +253,7 @@ class TestBuildGstreamerPipeline:
         )
 
     def test_dev_path_string_uses_device_form(self):
+        """An explicit V4L2 path is inserted without altering the pipeline."""
         from core.camera import _build_gstreamer_pipeline
 
         pipeline = _build_gstreamer_pipeline("/dev/video5", 640, 480)
@@ -258,21 +267,23 @@ class TestBuildGstreamerPipeline:
         )
 
     def test_rtsp_url_returns_none(self):
+        """Network streams fall outside this local-device pipeline helper."""
         from core.camera import _build_gstreamer_pipeline
 
         assert _build_gstreamer_pipeline("rtsp://example.com/stream", 640, 480) is None
 
     def test_non_dev_relative_string_returns_none(self):
+        """Relative strings are rejected instead of producing an invalid source."""
         from core.camera import _build_gstreamer_pipeline
 
         assert _build_gstreamer_pipeline("some/relative/path", 640, 480) is None
 
 
 class TestFindWorkingCameras:
-    """Test multi-camera discovery."""
+    """``find_working_cameras`` exposes only validated camera indexes."""
 
     def test_find_working_cameras_returns_list(self, mock_video_capture):
-        """Test find_working_cameras returns a list."""
+        """Index discovery returns one list even when several candidates exist."""
         from core.camera import find_working_cameras
         
         with patch("core.camera.get_video_indexes", return_value=[0, 2, 4]):
@@ -280,25 +291,26 @@ class TestFindWorkingCameras:
             assert isinstance(cameras, list)
 
     def test_find_working_cameras_filters_invalid(self):
-        """Test invalid cameras are filtered out."""
+        """Candidates that fail validation do not reach index-based callers."""
         with patch("core.camera.get_video_indexes", return_value=[0, 1, 2]):
             with patch("core.camera.test_single_camera") as mock_test:
-                # Only camera 0 and 2 work
+                # Keep one failure between two successes to exercise filtering
+                # without making discovery order part of the expectation.
                 mock_test.side_effect = lambda idx, **kw: idx if idx in [0, 2] else None
                 
                 from core.camera import find_working_cameras
                 cameras = find_working_cameras()
                 
-                # Should only contain working cameras
+                # Membership is the contract here; identity tests cover ordering.
                 for cam in cameras:
                     assert cam in [0, 2]
 
 
 class TestCaptureWorker:
-    """Test CaptureWorker thread class."""
+    """Worker state follows the safety-sensitive thread stop sequence."""
 
     def test_worker_init(self):
-        """Test CaptureWorker initialization."""
+        """Construction retains stream and capture parameters before the thread starts."""
         from core.camera import CaptureWorker
         
         worker = CaptureWorker(
@@ -316,7 +328,7 @@ class TestCaptureWorker:
         assert worker._running is True
 
     def test_worker_set_target_fps(self):
-        """Test setting target FPS on worker."""
+        """Dynamic capture-rate updates replace the worker's active target."""
         from core.camera import CaptureWorker
         
         worker = CaptureWorker(stream_link=0, parent=None, target_fps=30.0)
@@ -325,7 +337,7 @@ class TestCaptureWorker:
         assert worker._target_fps == 15.0
 
     def test_worker_stop_when_not_running(self):
-        """Test stopping worker sets running flag to False."""
+        """Stopping always closes the loop gate, including pre-start workers."""
         from core.camera import CaptureWorker
 
         worker = CaptureWorker(stream_link=0, parent=None)
@@ -334,8 +346,7 @@ class TestCaptureWorker:
         assert worker._running is False
 
     def test_stop_thread_exits_within_wait_closes_capture(self):
-        """wait(2000) succeeds -> thread confirmed dead, capture closed from
-        stop() (belt-and-braces), returns True, not leaked."""
+        """A normally exiting thread closes capture and reports clean disposal."""
         from core.camera import CaptureWorker
 
         worker = CaptureWorker(stream_link=0, parent=None)
@@ -351,9 +362,12 @@ class TestCaptureWorker:
         assert worker.is_leaked is False
 
     def test_stop_unkillable_thread_leaks_capture(self, caplog):
-        """Both waits fail and isRunning stays True -> DO NOT release capture
-        from the main thread (segfault risk); returns False, leaked flag set,
-        ERROR logged."""
+        """A still-running thread keeps ownership of its capture.
+
+        Releasing the OpenCV handle from the GUI thread can segfault while the
+        worker is blocked inside it. The honest recovery path is to mark the
+        worker leaked, retain the handle, and tell the operator to replug.
+        """
         import logging
 
         from core.camera import CaptureWorker
@@ -371,13 +385,13 @@ class TestCaptureWorker:
         worker._close_capture.assert_not_called()
         worker.terminate.assert_called_once()
         assert worker.is_leaked is True
-        # Log states the honest recovery path (no in-process reclaim exists).
+        # The message must give the actionable recovery because no safe
+        # in-process reclaim exists for this state.
         assert "leaking its fd" in caplog.text
         assert "replug" in caplog.text
 
     def test_stop_terminate_then_wait_succeeds_closes_capture(self):
-        """First wait fails, terminate() called, second wait succeeds ->
-        thread gone, capture closed from stop(), returns True, not leaked."""
+        """Successful termination proceeds through the normal capture cleanup."""
         from core.camera import CaptureWorker
 
         worker = CaptureWorker(stream_link=0, parent=None)
@@ -394,8 +408,7 @@ class TestCaptureWorker:
         assert worker.is_leaked is False
 
     def test_stop_terminate_then_not_running_closes_capture(self):
-        """Second wait times out but isRunning() is False -> thread gone
-        anyway, capture closed, returns True."""
+        """Observed thread exit wins even if the second timed wait reports false."""
         from core.camera import CaptureWorker
 
         worker = CaptureWorker(stream_link=0, parent=None)
@@ -411,17 +424,18 @@ class TestCaptureWorker:
         assert worker.is_leaked is False
 
     def test_resolve_stream_target_int_passthrough(self):
-        """int stream_link resolves to itself, unchanged."""
+        """Numeric stream targets bypass filesystem resolution."""
         from core.camera import CaptureWorker
 
         worker = CaptureWorker(stream_link=4, parent=None)
         assert worker._resolve_stream_target() == 4
 
     def test_resolve_stream_target_no_caching_across_replug(self, tmp_path):
-        """str stream_link is realpath'd on EVERY call -- no caching. A
-        by-path symlink re-pointed between two calls (simulating udev
-        re-pointing it after a replug) must resolve to the NEW target on
-        the second call."""
+        """Each open resolves its by-path link after device re-enumeration.
+
+        Udev may repoint the same by-path entry to a new ``videoN`` after a
+        replug, so caching the first real path would reopen the stale node.
+        """
         from core.camera import CaptureWorker
 
         node_a = tmp_path / "video0"
@@ -443,15 +457,16 @@ class TestCaptureWorker:
         assert second != first
 
     def test_worker_str_stream_link_open_uses_resolved_path(self, tmp_path, monkeypatch):
-        """Constructing a worker with a str device path and running
-        _open_capture through its (mocked, failing) fallback cascade must
-        not crash, and every cv2.VideoCapture call must use the RESOLVED
-        path, never the symlink."""
+        """Every V4L2 fallback attempt uses the resolved device node.
+
+        The all-failing cascade also guards string targets from type assumptions
+        that previously appeared only after the first backend failed.
+        """
         import core.camera as camera_module
         from core.camera import CaptureWorker
 
-        # Keep this test to the V4L2 cascade regardless of the local
-        # OpenCV build's GStreamer support.
+        # Disable GStreamer so host-specific codec support cannot bypass the
+        # V4L2 fallback sequence under test.
         monkeypatch.setattr(camera_module.config, "USE_GSTREAMER", False)
 
         video_node = tmp_path / "video4"
@@ -466,7 +481,8 @@ class TestCaptureWorker:
             mock_cap.return_value = instance
 
             worker = CaptureWorker(stream_link=str(symlink), parent=None)
-            worker._open_capture()  # must not raise
+            # Reaching all fallback attempts with a string target is the regression case.
+            worker._open_capture()
 
         assert mock_cap.call_args_list, "expected at least one open attempt"
         for call in mock_cap.call_args_list:
@@ -474,10 +490,10 @@ class TestCaptureWorker:
 
 
 class TestGStreamerPipeline:
-    """Test GStreamer pipeline generation."""
+    """Workers retain the dimensions consumed by GStreamer construction."""
 
     def test_worker_stores_capture_dimensions(self):
-        """Test CaptureWorker stores capture dimensions."""
+        """Requested dimensions remain available when a backend opens later."""
         from core.camera import CaptureWorker
         
         worker = CaptureWorker(
@@ -492,19 +508,18 @@ class TestGStreamerPipeline:
 
 
 class TestFrameRateLimiting:
-    """Test frame rate limiting logic."""
+    """Capture-rate updates keep emission-interval bookkeeping coherent."""
 
     def test_emit_interval_default(self):
-        """Test default emit interval is set."""
+        """A positive target produces a usable throttle interval at construction."""
         from core.camera import CaptureWorker
         
         worker = CaptureWorker(stream_link=0, parent=None, target_fps=20.0)
         
-        # Emit interval should be set
         assert worker._emit_interval > 0
 
     def test_emit_interval_updates_with_fps(self):
-        """Test emit interval updates when FPS changes."""
+        """Lowering FPS lengthens the delay between emitted frames."""
         from core.camera import CaptureWorker
 
         worker = CaptureWorker(stream_link=0, parent=None, target_fps=30.0)
@@ -513,15 +528,19 @@ class TestFrameRateLimiting:
         worker.set_target_fps(15.0)
         new_interval = worker._emit_interval
 
-        # New interval should be longer (lower FPS = longer interval)
+        # Compare direction rather than implementation arithmetic.
         assert new_interval > initial_interval
 
 
 class TestEmitRateAlignment:
-    """Emit rate is bounded by the UI render rate: min(device fps, ui fps)."""
+    """Keep worker emissions at ``min(capture_fps, ui_fps)``.
+
+    Emitting faster than the UI can render wastes decode and signal traffic, so
+    both initial configuration and later rate changes maintain this invariant.
+    """
 
     def test_emit_interval_bounded_by_ui_fps(self):
-        """capture 25 > ui 20 -> emit at 20 (the render rate), not 25."""
+        """When capture is faster, the UI rate sets the emission interval."""
         from core.camera import CaptureWorker
 
         worker = CaptureWorker(stream_link=0, target_fps=25.0, ui_fps=20.0)
@@ -529,7 +548,7 @@ class TestEmitRateAlignment:
         assert worker._emit_interval == pytest.approx(1.0 / 20.0)
 
     def test_emit_interval_uses_capture_when_below_ui(self):
-        """capture 10 < ui 20 -> emit at 10 (min wins the lower value)."""
+        """When capture is slower, no artificial UI-rate speedup is attempted."""
         from core.camera import CaptureWorker
 
         worker = CaptureWorker(stream_link=0, target_fps=10.0, ui_fps=20.0)
@@ -537,7 +556,7 @@ class TestEmitRateAlignment:
         assert worker._emit_interval == pytest.approx(1.0 / 10.0)
 
     def test_emit_interval_unbounded_without_ui_fps(self):
-        """No ui_fps bound -> emit at device fps (back-compat)."""
+        """Without a UI bound, emission follows the configured capture rate."""
         from core.camera import CaptureWorker
 
         worker = CaptureWorker(stream_link=0, target_fps=25.0)
@@ -545,7 +564,7 @@ class TestEmitRateAlignment:
         assert worker._emit_interval == pytest.approx(1.0 / 25.0)
 
     def test_set_ui_fps_lowers_emit_rate_to_new_bound(self):
-        """Dropping the render rate below capture lowers the emit rate to it."""
+        """A runtime UI slowdown immediately tightens the worker's bound."""
         from core.camera import CaptureWorker
 
         worker = CaptureWorker(stream_link=0, target_fps=25.0, ui_fps=20.0)
@@ -556,31 +575,27 @@ class TestEmitRateAlignment:
         assert worker._emit_interval == pytest.approx(1.0 / 12.0)
 
     def test_set_target_fps_stays_bounded_by_ui(self):
-        """Dynamic capture-fps changes never push emit above the render rate.
-
-        Invariant trace: emit rate = min(device, ui) <= ui = render rate,
-        for every device value reachable via set_target_fps.
-        """
+        """Capture-rate changes cannot raise emission above the current UI rate."""
         from core.camera import CaptureWorker
 
         worker = CaptureWorker(stream_link=0, target_fps=25.0, ui_fps=20.0)
         worker._configure_fps_from_camera()
 
-        # Lower capture below ui -> emit follows capture (min).
+        # Below the UI bound, capture is the limiting side of the invariant.
         worker.set_target_fps(10.0)
         assert worker._emit_interval == pytest.approx(1.0 / 10.0)
 
-        # Raise capture back above ui -> emit clamped to ui.
+        # Crossing back above the bound must not restore the faster emit rate.
         worker.set_target_fps(25.0)
         assert worker._emit_interval == pytest.approx(1.0 / 20.0)
 
 
 def _run_worker_for_grabs(worker, cap, n_grabs):
-    """Drive worker.run() synchronously for exactly `n_grabs` grab() calls.
+    """Run the capture loop deterministically for a fixed number of grabs.
 
-    Sets worker._cap to the mock capture, makes msleep a no-op, and stops
-    the loop after `n_grabs` grab() calls. Returns nothing; inspect the
-    mock and any connected collectors afterward.
+    The helper injects an already-open mock capture, removes sleeping, and
+    lowers ``_running`` from ``grab``'s side effect. Tests can then inspect
+    decode calls and emitted objects without starting a ``QThread``.
     """
     cap.isOpened.return_value = True
     worker._cap = cap
@@ -599,18 +614,16 @@ def _run_worker_for_grabs(worker, cap, n_grabs):
 
 
 class TestRunLoopEmit:
-    """Behavioral tests for the run() capture loop: throttle-before-retrieve
-    and direct (no-copy) emission of the retrieve() array."""
+    """Protect the capture loop's decode avoidance and zero-copy handoff."""
 
     def test_emit_sends_retrieve_array_identity_no_copy(self):
-        """With the throttle open every iteration, the emitted object IS the
-        exact numpy array retrieve() returned -- no pool copy in between."""
+        """An admitted frame is the exact array returned by ``retrieve``."""
         import numpy as np
 
         from core.camera import CaptureWorker
 
         worker = CaptureWorker(stream_link=0, parent=None, target_fps=30.0)
-        # Open the throttle fully so every grabbed frame emits.
+        # A zero interval isolates handoff behavior from timing.
         worker._emit_interval = 0.0
         worker._last_emit = 0.0
 
@@ -624,20 +637,22 @@ class TestRunLoopEmit:
         _run_worker_for_grabs(worker, cap, n_grabs=1)
 
         assert len(emitted) == 1
-        # Identity, not just equality: no copy was made.
+        # Object identity is the regression guard against a hidden buffer copy.
         assert emitted[0] is frame
 
     def test_throttle_before_retrieve_skips_decode_for_dropped_frames(self):
-        """grab() runs every iteration (drains driver buffer) but retrieve()
-        -- the JPEG decode on the V4L2 MJPG path -- runs ONLY for frames the
-        throttle admits. With a huge emit interval only the first frame is
-        due, so retrieve() is called once while grab() is called N times."""
+        """Throttled frames are grabbed for freshness but not decoded.
+
+        On the V4L2 MJPG path, ``retrieve`` performs the expensive JPEG decode.
+        A very large interval admits only the first of four grabs, pinning the
+        optimization that places the throttle before retrieval.
+        """
         import numpy as np
 
         from core.camera import CaptureWorker
 
         worker = CaptureWorker(stream_link=0, parent=None, target_fps=30.0)
-        # Effectively never due again after the first emit.
+        # This interval is deliberately far longer than the synchronous test run.
         worker._emit_interval = 10_000.0
         worker._last_emit = 0.0
 

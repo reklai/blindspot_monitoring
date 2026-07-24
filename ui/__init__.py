@@ -1,4 +1,4 @@
-"""UI modules for widgets and layout."""
+"""Public dashboard widgets and grid-layout helpers."""
 
 __all__ = [
     "CameraWidget",

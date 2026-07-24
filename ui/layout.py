@@ -1,14 +1,14 @@
-"""
-Grid layout helpers for Camera Dashboard.
-
-Calculates optimal row/column layouts based on camera count.
-"""
+"""Choose dashboard grid dimensions for the visible tiles."""
 
 from __future__ import annotations
 
 
 def get_smart_grid(num_cameras: int) -> tuple[int, int]:
-    """Return a sensible grid (rows, cols) for N cameras."""
+    """Return ``(rows, columns)`` for the requested number of dashboard tiles.
+
+    Small counts use fixed, readable arrangements. Larger counts add rows
+    while limiting the dashboard to four columns.
+    """
     if num_cameras <= 1:
         return 1, 1
     elif num_cameras == 2:

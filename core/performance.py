@@ -1,8 +1,4 @@
-"""
-Performance monitoring for Camera Dashboard.
-
-Handles CPU load and temperature monitoring.
-"""
+"""Best-effort CPU load and temperature signals for dynamic FPS control."""
 
 from __future__ import annotations
 
@@ -13,7 +9,7 @@ from core import config
 
 
 def read_cpu_load_ratio() -> Optional[float]:
-    """Read 1-minute load average normalized to CPU count."""
+    """Return the one-minute load per CPU, capped at 1.0 when available."""
     try:
         load1, _, _ = os.getloadavg()
         cpu_count = os.cpu_count() or 1
@@ -23,7 +19,11 @@ def read_cpu_load_ratio() -> Optional[float]:
 
 
 def read_cpu_temp_c() -> Optional[float]:
-    """Read CPU temperature in Celsius if the system exposes it."""
+    """Return the first readable Linux thermal sensor value in Celsius.
+
+    Kernel sensors commonly report millidegrees, so values above 1000 are
+    converted before returning. Missing or malformed sensor files are skipped.
+    """
     paths = [
         "/sys/class/thermal/thermal_zone0/temp",
         "/sys/class/hwmon/hwmon0/temp1_input",
@@ -44,9 +44,10 @@ def read_cpu_temp_c() -> Optional[float]:
 
 
 def is_system_stressed() -> tuple[bool, Optional[float], Optional[float]]:
-    """
-    Check CPU load or temperature thresholds.
-    Returns: (stressed: bool, load_ratio: float|None, temp_c: float|None)
+    """Return whether either available CPU metric meets its stress threshold.
+
+    The remaining tuple values are ``(load_ratio, temperature_c)``; either may
+    be ``None`` when the host does not expose that metric.
     """
     load_ratio = read_cpu_load_ratio()
     temp_c = read_cpu_temp_c()

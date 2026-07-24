@@ -1,5 +1,8 @@
-"""
-Tests for utils/helpers.py utility functions.
+"""Contracts for the process, device-owner, and health-reporting helpers.
+
+External commands and camera widgets are mocked where their behavior is not
+the subject of the test. The close-on-exec tests use real file descriptors
+because descriptor inheritance is the behavior they need to protect.
 """
 
 import os
@@ -13,70 +16,70 @@ from utils import helpers
 
 
 class TestRunCmd:
-    """Tests for run_cmd function."""
+    """Define how shell command outcomes are normalized for callers."""
 
     def test_run_cmd_success(self):
-        """Test successful command execution."""
+        """A successful command exposes trimmed stdout and a zero status."""
         stdout, stderr, code = helpers.run_cmd("echo hello")
         assert code == 0
         assert stdout == "hello"
         assert stderr == ""
 
     def test_run_cmd_failure(self):
-        """Test command that fails."""
+        """A nonzero child exit remains visible to recovery code."""
         stdout, stderr, code = helpers.run_cmd("false")
         assert code == 1
 
     def test_run_cmd_timeout(self):
-        """Test command timeout returns error."""
+        """A timeout is reported as failure instead of escaping as an exception."""
         stdout, stderr, code = helpers.run_cmd("sleep 10", timeout=1)
         assert code == 1
         assert stdout == ""
 
     def test_run_cmd_invalid_command(self):
-        """Test invalid command returns error."""
+        """An unknown executable produces an error result the caller can inspect."""
         stdout, stderr, code = helpers.run_cmd("nonexistent_command_xyz")
         assert code != 0 or stderr != ""
 
 
 class TestGetPidsFromLsof:
-    """Tests for get_pids_from_lsof function."""
+    """``lsof`` results become validated candidate process IDs."""
 
     def test_get_pids_empty_when_no_device(self):
-        """Test returns empty set for non-existent device."""
+        """A missing device is treated as having no holders."""
         pids = helpers.get_pids_from_lsof("/dev/nonexistent_device_xyz")
         assert pids == set()
 
     @mock.patch("utils.helpers.run_cmd")
     def test_get_pids_parses_output(self, mock_run):
-        """Test parsing of lsof output."""
+        """One numeric PID per line is converted to a deduplicated integer set."""
         mock_run.return_value = ("1234\n5678\n", "", 0)
         pids = helpers.get_pids_from_lsof("/dev/video0")
         assert pids == {1234, 5678}
 
     @mock.patch("utils.helpers.run_cmd")
     def test_get_pids_handles_non_numeric(self, mock_run):
-        """Test graceful handling of non-numeric output."""
+        """Diagnostic lines are ignored without discarding valid neighboring PIDs."""
         mock_run.return_value = ("1234\nabc\n5678\n", "", 0)
         pids = helpers.get_pids_from_lsof("/dev/video0")
         assert pids == {1234, 5678}
 
     @mock.patch("utils.helpers.run_cmd")
     def test_get_pids_returns_empty_on_failure(self, mock_run):
-        """Test returns empty set on command failure."""
+        """A failed ``lsof`` lookup cannot be mistaken for confirmed holders."""
         mock_run.return_value = ("", "error", 1)
         pids = helpers.get_pids_from_lsof("/dev/video0")
         assert pids == set()
 
 
 class TestGetPidsFromFuser:
-    """Tests for get_pids_from_fuser function."""
+    """``fuser`` provides candidate PIDs when ``lsof`` finds no holder."""
 
     @mock.patch("utils.helpers.run_cmd")
     def test_get_pids_parses_fuser_output(self, mock_run):
-        """Test parsing of fuser output with regex."""
-        # fuser output format varies - it outputs to stderr and may have suffixes like 'm'
-        # The regex looks for digit sequences, so "5678m" would only match 5678
+        """Extract PID fields from the command's captured standard output."""
+        # The helper reads the first ``run_cmd`` result because ``fuser`` writes
+        # matching PIDs to stdout; verbose headings may be written to stderr.
         mock_run.return_value = ("/dev/video0: 1234 5678", "", 0)
         pids = helpers.get_pids_from_fuser("/dev/video0")
         assert 1234 in pids
@@ -84,32 +87,32 @@ class TestGetPidsFromFuser:
 
     @mock.patch("utils.helpers.run_cmd")
     def test_get_pids_returns_empty_on_failure(self, mock_run):
-        """Test returns empty set on command failure."""
+        """A failed fallback lookup contributes no unverified PIDs."""
         mock_run.return_value = ("", "", 1)
         pids = helpers.get_pids_from_fuser("/dev/video0")
         assert pids == set()
 
 
 class TestIsPidAlive:
-    """Tests for is_pid_alive function."""
+    """Exercise the process-existence probe at both ends of its contract."""
 
     def test_current_process_is_alive(self):
-        """Test that current process is detected as alive."""
+        """The test process provides a stable positive case on every host."""
         assert helpers.is_pid_alive(os.getpid()) is True
 
     def test_nonexistent_pid_not_alive(self):
-        """Test that very high PID is not alive."""
-        # Use a PID that almost certainly doesn't exist
+        """An out-of-range practical PID provides a stable negative case."""
+        # Linux PID limits are far below this value on supported deployments.
         assert helpers.is_pid_alive(999999999) is False
 
 
 class TestKillDeviceHolders:
-    """Tests for kill_device_holders function."""
+    """Protect the opt-in and escalation rules for reclaiming camera devices."""
 
     @mock.patch("utils.helpers.get_pids_from_lsof")
     @mock.patch("core.config.KILL_DEVICE_HOLDERS", False)
     def test_disabled_when_config_false(self, mock_lsof):
-        """Test function does nothing when config disabled."""
+        """The safety flag prevents even a holder lookup when killing is disabled."""
         result = helpers.kill_device_holders("/dev/video0")
         assert result is False
         mock_lsof.assert_not_called()
@@ -118,7 +121,7 @@ class TestKillDeviceHolders:
     @mock.patch("utils.helpers.get_pids_from_fuser")
     @mock.patch("core.config.KILL_DEVICE_HOLDERS", True)
     def test_returns_false_when_no_holders(self, mock_fuser, mock_lsof):
-        """Test returns False when no processes hold device."""
+        """No discovered owner means there was nothing to reclaim."""
         mock_lsof.return_value = set()
         mock_fuser.return_value = set()
         result = helpers.kill_device_holders("/dev/video0")
@@ -133,11 +136,12 @@ class TestKillDeviceHolders:
     def test_kills_processes_with_sigterm(
         self, mock_sleep, mock_kill, mock_fuser, mock_lsof, mock_alive
     ):
-        """Test sends SIGTERM to holding processes."""
+        """Known holders receive the graceful signal before any harder recovery."""
         fake_pid = 12345
         mock_lsof.return_value = {fake_pid}
         mock_fuser.return_value = set()
-        mock_alive.return_value = False  # Process dies after SIGTERM
+        # Model a holder that exits during the grace period, avoiding SIGKILL.
+        mock_alive.return_value = False
 
         result = helpers.kill_device_holders("/dev/video0", grace=0.1)
 
@@ -146,19 +150,20 @@ class TestKillDeviceHolders:
 
 
 class TestLogHealthSummary:
-    """Tests for log_health_summary function."""
+    """Describe how widget state is reduced to operator-facing health logs."""
 
     @mock.patch("logging.info")
     @mock.patch("logging.warning")
     def test_logs_health_summary(self, mock_warning, mock_log):
-        """Test logs camera health information."""
+        """Fresh frames count as online in the aggregate summary."""
         import time
         now = time.time()
         
-        # Create mock camera widgets with required attributes
+        # Use the minimal widget protocol consumed by ``log_health_summary``;
+        # constructing real Qt widgets would obscure the aggregation contract.
         mock_widget1 = mock.MagicMock()
         mock_widget1._latest_frame = "frame_data"
-        mock_widget1._last_frame_ts = now  # fresh frame
+        mock_widget1._last_frame_ts = now
         mock_widget1.worker = None
         mock_widget1.camera_stream_link = 0
         
@@ -170,7 +175,7 @@ class TestLogHealthSummary:
         
         mock_widget3 = mock.MagicMock()
         mock_widget3._latest_frame = "frame_data"
-        mock_widget3._last_frame_ts = now  # fresh frame
+        mock_widget3._last_frame_ts = now
         mock_widget3.worker = None
         mock_widget3.camera_stream_link = 4
 
@@ -186,19 +191,20 @@ class TestLogHealthSummary:
         mock_log.assert_called_once()
         call_args = mock_log.call_args
         assert "Health" in call_args[0][0]
-        assert call_args[0][1] == 2  # online count (widgets with fresh frames)
+        # Only widgets with a recent frame contribute to the online count.
+        assert call_args[0][1] == 2
     
     @mock.patch("logging.info")
     @mock.patch("logging.warning")
     def test_detects_stale_frames(self, mock_warning, mock_log):
-        """Test that stale frames are detected and logged."""
+        """An old frame is surfaced separately from a camera with no frame."""
         import time
         now = time.time()
         
-        # Create widget with stale frame (last frame 15 seconds ago)
+        # Fifteen seconds is beyond the helper's freshness window.
         mock_widget = mock.MagicMock()
         mock_widget._latest_frame = "frame_data"
-        mock_widget._last_frame_ts = now - 15.0  # stale
+        mock_widget._last_frame_ts = now - 15.0
         mock_widget.worker = None
         mock_widget.camera_stream_link = 0
 
@@ -206,7 +212,7 @@ class TestLogHealthSummary:
             [mock_widget], [], set(), {}
         )
         
-        # Should log a warning about stale frame
+        # Match the operator-facing category without coupling to full wording.
         mock_warning.assert_called()
         warning_call = mock_warning.call_args[0][0]
         assert "stale" in warning_call.lower()
@@ -214,11 +220,11 @@ class TestLogHealthSummary:
     @mock.patch("logging.info")
     @mock.patch("logging.warning")
     def test_detects_unhealthy_worker(self, mock_warning, mock_log):
-        """Test that unhealthy workers are detected and logged."""
+        """Worker health failures remain visible even when a recent frame exists."""
         import time
         now = time.time()
         
-        # Create widget with unhealthy worker
+        # A fresh frame isolates worker health from the stale-frame warning path.
         mock_worker = mock.MagicMock()
         mock_worker.is_healthy.return_value = False
         
@@ -232,19 +238,20 @@ class TestLogHealthSummary:
             [mock_widget], [], set(), {}
         )
         
-        # Should log a warning about unhealthy worker
+        # Match the warning category without freezing incidental formatting.
         mock_warning.assert_called()
         warning_call = mock_warning.call_args[0][0]
         assert "unhealthy" in warning_call.lower()
 
 
 class TestSetCloexecOnDeviceFds:
-    """set_cloexec_on_device_fds marks open fds whose /proc/self/fd target
-    matches the prefix as close-on-exec, so the settings-tile restart's
-    os.execv does not carry a leaked capture fd into the replacement
-    process. OpenCV's V4L2 open() has no O_CLOEXEC, and exec keeps the PID,
-    so kill_device_holders (which skips our own PID) could never reclaim
-    the device in the restarted app -- the kernel must drop the fd at exec.
+    """Protect camera descriptor cleanup across the settings-tile restart.
+
+    OpenCV's V4L2 descriptor may be inheritable, while ``os.execv`` preserves
+    the process ID. If the replacement inherited that descriptor,
+    ``kill_device_holders`` would skip its own PID and could not reclaim the
+    camera. Marking only matching descriptors close-on-exec avoids that leak
+    without disturbing unrelated files.
     """
 
     def test_sets_cloexec_only_on_matching_fds(self, tmp_path):
@@ -256,7 +263,7 @@ class TestSetCloexecOnDeviceFds:
         dev_fd = os.open(device, os.O_RDONLY)
         other_fd = os.open(other, os.O_RDONLY)
         try:
-            # Simulate OpenCV's V4L2 open(): fd inheritable (no CLOEXEC).
+            # Reproduce the descriptor state OpenCV's V4L2 backend can leave.
             os.set_inheritable(dev_fd, True)
             os.set_inheritable(other_fd, True)
 
@@ -265,7 +272,7 @@ class TestSetCloexecOnDeviceFds:
             )
 
             assert count == 1
-            # inheritable is the inverse of FD_CLOEXEC.
+            # Python exposes the inverse of the underlying ``FD_CLOEXEC`` bit.
             assert os.get_inheritable(dev_fd) is False
             assert os.get_inheritable(other_fd) is True
         finally:

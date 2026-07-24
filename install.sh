@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Camera Dashboard installer for Raspberry Pi / Linux
-# Run with sudo (will reboot automatically):
+# Provision a dedicated Raspberry Pi or Debian-based dashboard host.
+# This script changes host settings and reboots when installation completes:
 #   chmod +x install.sh
 #   sudo ./install.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# ---------- 0) parse args ----------
 SKIP_UPDATE=false
 
 for arg in "$@"; do
@@ -18,8 +17,7 @@ for arg in "$@"; do
   esac
 done
 
-# ---------- 0) basic checks ----------
-
+# Host provisioning requires root access throughout.
 if [[ "$EUID" -ne 0 ]]; then
   echo "This script must be run with sudo."
   echo "Usage: sudo ./install.sh"
@@ -29,10 +27,8 @@ fi
 
 SUDO_USER="${SUDO_USER:-$(whoami)}"
 
-# ---------- 0b) power settings ----------
-
-# echo_section "0b) Configuring USB and PSU current"
-
+# On supported Pi hosts, reserve hardware resources for multiple USB cameras:
+# raise USB/PSU current and disable Wi-Fi, Bluetooth, and HDMI audio.
 CONFIG_TXT="/boot/firmware/config.txt"
 if [[ -f "$CONFIG_TXT" ]]; then
   sed -i "/^usb_max_current_enable=/d" "$CONFIG_TXT"
@@ -75,8 +71,7 @@ echo_section() {
   echo "========================================"
 }
 
-# ---------- 1) update the system ----------
-
+# --skip-update bypasses package-index and system upgrades, not dependency setup.
 if [[ "$SKIP_UPDATE" == "false" ]]; then
   echo_section "1) Updating system packages"
   apt update
@@ -84,8 +79,6 @@ if [[ "$SKIP_UPDATE" == "false" ]]; then
 else
   echo_section "1) Skipping update (--skip-update)"
 fi
-
-# ---------- 2) install system dependencies ----------
 
 echo_section "2) Installing system dependencies"
 
@@ -98,19 +91,16 @@ apt install -y \
   libqt6gui6 libqt6widgets6 \
   v4l-utils gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad || true
 
-# ---------- 3) kill processes holding cameras ----------
-
 echo_section "3) Clearing camera devices"
 
-# Kill any process using any video device (generic approach)
+# Clear current device holders; the installed service repeats this before startup.
 for dev in /dev/video*; do
   fuser -k "$dev" 2>/dev/null || true
 done
 
-# Kill common camera-holding processes
 killall -9 zmc zma zoneminder 2>/dev/null || true
 
-# Disable ZoneMinder and other common camera services
+# Best-effort stop and disable known camera daemons before reboot.
 for svc in zoneminder motion mjpeg-streamer; do
   if systemctl list-unit-files | grep -q "^$svc.service"; then
     echo "Disabling $svc..."
@@ -118,8 +108,6 @@ for svc in zoneminder motion mjpeg-streamer; do
     systemctl disable "$svc" 2>/dev/null || true
   fi
 done
-
-# ---------- 4) add user to video group ----------
 
 echo_section "4) Adding user to video group"
 
@@ -130,12 +118,8 @@ else
   echo "$SUDO_USER is already in video group."
 fi
 
-# ---------- 5) create logs directory ----------
-
 echo_section "5) Creating logs directory"
 mkdir -p "$SCRIPT_DIR/logs"
-
-# ---------- 6) create desktop shortcut ----------
 
 echo_section "6) Creating desktop shortcut"
 
@@ -158,8 +142,6 @@ EOF
 chown "$SUDO_USER:$SUDO_USER" "$DESKTOP_FILE"
 chmod +x "$DESKTOP_FILE"
 
-# ---------- 7) setup systemd service ----------
-
 echo_section "7) Setting up systemd service"
 
 SYSTEMD_DIR="/home/$SUDO_USER/.config/systemd/user"
@@ -171,10 +153,8 @@ cat > "$SYSTEMD_DIR/camera-dashboard.service" <<EOF
 Description=Camera Dashboard
 After=default.target
 Wants=default.target
-# Never give up restarting: a dead monitor is worse than a restart loop for
-# a driver-facing safety display. StartLimitIntervalSec=0 disables systemd's
-# crash-loop lockout entirely; Restart=always + RestartSec=5 below keeps
-# retrying forever, 5s apart.
+# Keep Restart=always eligible after repeated failures; RestartSec below
+# prevents a tight retry loop.
 StartLimitIntervalSec=0
 
 [Service]
@@ -198,18 +178,17 @@ EOF
 
 chown -R "$SUDO_USER:$SUDO_USER" "$SYSTEMD_DIR"
 
-# Enable service and linger - start user bus if needed
+# Linger keeps the user service alive without a login session. If --machine
+# cannot reach its user bus yet, reload that bus under the target user's runtime.
 loginctl enable-linger "$SUDO_USER" 2>/dev/null || true
 systemctl --machine="$SUDO_USER@" --user daemon-reload 2>/dev/null || \
   su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user daemon-reload" 2>/dev/null || \
   echo "Note: User systemd may not be running (will start on login)"
 su - "$SUDO_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user enable camera-dashboard.service" 2>/dev/null || true
 
-# ---------- 8) quick test ----------
-
 echo_section "8) Quick test"
 
-# Kill any processes using cameras before testing
+# Clear devices again in case dependency setup started a camera service.
 for dev in /dev/video*; do
   fuser -k "$dev" 2>/dev/null || true
 done
@@ -232,8 +211,6 @@ else:
 else
   echo "Quick test had issues (may be normal if no camera connected)"
 fi
-
-# ---------- done ----------
 
 echo_section "Installation complete"
 

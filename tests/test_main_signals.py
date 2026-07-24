@@ -1,10 +1,8 @@
-"""
-Tests for main._install_signal_handlers / _handle_shutdown_signal.
+"""Signal-to-Qt shutdown handoff, including the pre-event-loop race.
 
-Importing main is side-effect free (main() is guarded by
-`if __name__ == "__main__"`), which lets these unit tests import it
-without pulling in Qt event-loop or camera-discovery side effects (see
-tests/test_main_rescan.py for the same rationale).
+``main`` is safe to import because startup is guarded by its script entry
+point. Tests can therefore exercise signal helpers without running discovery
+or entering Qt's event loop.
 """
 
 import signal
@@ -14,11 +12,14 @@ import main
 
 
 class TestInstallSignalHandlers:
+    """Keep interactive and service shutdown on one cleanup path."""
+
     def test_registers_sigint_and_sigterm_with_same_handler(self):
-        """Both SIGINT (Ctrl+C) and SIGTERM (systemd `stop`, KillSignal
-        default per install.sh) must route through the same shutdown
-        handler so a service stop follows the same
-        QApplication.quit() -> aboutToQuit -> safe_cleanup path as Ctrl+C."""
+        """SIGINT and SIGTERM both feed Qt's ``aboutToQuit`` cleanup chain.
+
+        This makes a terminal interrupt and the service manager's default stop
+        signal release camera resources identically.
+        """
         fake_app = MagicMock()
 
         with patch("main.signal.signal") as mock_signal:
@@ -34,20 +35,22 @@ class TestInstallSignalHandlers:
 
 
 class TestHandleShutdownSignal:
+    """Define the handler's immediate and deferred shutdown effects."""
+
     def test_requests_qapplication_quit(self):
-        """The shared handler requests a clean shutdown via
-        QApplication.quit()."""
+        """Once Qt is running, the handler requests an ordinary event-loop exit."""
         with patch("main.QtWidgets.QApplication.quit") as mock_quit:
             main._handle_shutdown_signal(signal.SIGTERM, None)
 
         mock_quit.assert_called_once()
 
     def test_sets_startup_shutdown_flag(self):
-        """QApplication.quit() is a documented no-op before app.exec()
-        starts, so a SIGTERM during the multi-second startup camera
-        discovery would otherwise be silently swallowed (systemd then waits
-        out TimeoutStopSec and SIGKILLs mid-capture). The handler must ALSO
-        set a flag that main()'s startup checkpoints read."""
+        """A signal received before ``app.exec`` remains pending.
+
+        Qt documents ``quit`` as a no-op before the event loop starts. Without
+        the flag, a stop during slow camera discovery could be swallowed until
+        the service manager resorts to a hard kill.
+        """
         main._shutdown_requested["flag"] = False
         try:
             with patch("main.QtWidgets.QApplication.quit"):
@@ -58,22 +61,20 @@ class TestHandleShutdownSignal:
             main._shutdown_requested["flag"] = False
 
     def test_flag_defaults_false(self):
-        """Fresh import: no shutdown pending."""
+        """Importing the application does not fabricate a pending shutdown."""
         assert main._shutdown_requested["flag"] is False
 
 
 class TestStartupShutdownCheck:
-    """_startup_shutdown_check is scheduled with QTimer.singleShot(0, ...)
-    right before app.exec() and runs as the first event of the live loop.
+    """Close the final race between startup checks and Qt's live event loop.
 
-    A plain pre-exec `if flag` check leaves a race: a signal landing between
-    that check and the loop actually starting calls quit() while it is still
-    a documented no-op, and the flag would never be read again -- the
-    swallowed-shutdown bug survives in that window. Re-reading the flag from
-    INSIDE the running loop closes it: from there quit() works, and any
-    earlier signal left the flag set."""
+    ``main`` schedules this helper as the first zero-delay event. Reading the
+    flag from inside the running loop catches a signal that arrived after the
+    last synchronous check, when an earlier call to ``quit`` was still a no-op.
+    """
 
     def test_quits_when_flag_set(self):
+        """The first live-loop checkpoint honors a pending startup signal."""
         main._shutdown_requested["flag"] = True
         try:
             with patch("main.QtWidgets.QApplication.quit") as mock_quit:
@@ -84,6 +85,7 @@ class TestStartupShutdownCheck:
             main._shutdown_requested["flag"] = False
 
     def test_noop_when_flag_clear(self):
+        """Normal startup continues when no signal was recorded."""
         main._shutdown_requested["flag"] = False
         with patch("main.QtWidgets.QApplication.quit") as mock_quit:
             main._startup_shutdown_check()

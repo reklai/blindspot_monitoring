@@ -1,7 +1,7 @@
-"""Core modules for camera capture, configuration, and performance monitoring."""
+"""Public core API for capture, configuration, and system-stress monitoring."""
 
 __all__ = [
-    # config module exports
+    # Configuration
     "load_config",
     "apply_config",
     "configure_logging",
@@ -19,7 +19,7 @@ __all__ = [
     "RESCAN_INTERVAL_MS",
     "FAILED_CAMERA_COOLDOWN_SEC",
     "HEALTH_LOG_INTERVAL_SEC",
-    # camera module exports
+    # Capture and camera discovery
     "CaptureWorker",
     "CameraIdentity",
     "find_working_cameras",
@@ -30,7 +30,7 @@ __all__ = [
     "get_video_indexes",
     "probe_group_fallback",
     "test_single_camera",
-    # performance module exports
+    # System monitoring
     "is_system_stressed",
 ]
 

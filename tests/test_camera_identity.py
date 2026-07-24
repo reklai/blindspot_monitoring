@@ -1,10 +1,9 @@
-"""
-Tests for core/camera.py camera identity model + /dev/v4l/by-path discovery.
+"""USB port path identity and ``/dev/v4l/by-path`` discovery contracts.
 
-Covers CameraIdentity, list_by_path_nodes, _test_identity, _natural_key,
-discover_camera_identities and find_working_camera_identities, plus the
-find_working_cameras() compatibility wrapper. No real devices are touched;
-a fake /dev/v4l/by-path tree is built under tmp_path per test.
+The suite follows identities from cheap enumeration through probing and the
+index-only wrapper. A temporary symlink tree reproduces udev's relevant layout,
+keeping grouping and replug behavior realistic without touching the host's
+camera devices.
 """
 
 import logging
@@ -15,15 +14,14 @@ import pytest
 
 @pytest.fixture
 def fake_by_path(tmp_path, monkeypatch):
-    """Build a fake /dev/v4l/by-path tree.
+    """Provide an isolated udev-like by-path tree and link factory.
 
-    Layout: tmp_path/dev/videoN are real files standing in for capture
-    nodes; tmp_path/dev/by-path/<name>-video-indexN are symlinks pointing
-    at them, mirroring how the kernel actually populates by-path.
+    ``dev/videoN`` files stand in for capture nodes and ``dev/by-path`` entries
+    point to them using the names parsed by production discovery.
 
-    Monkeypatches core.camera.BY_PATH_DIR to the fake by-path dir and
-    resets the module's one-shot "degraded" warning flag so tests don't
-    leak state into each other.
+    Redirecting ``BY_PATH_DIR`` prevents host-device access. Resetting the
+    one-shot degraded-mode warning makes logging assertions independent of
+    test order.
     """
     dev_dir = tmp_path / "dev"
     dev_dir.mkdir()
@@ -53,9 +51,10 @@ PORT_B = "platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.4:1.0"
 
 
 class TestListByPathNodes:
-    """Requirement 1: grouping and skip behavior."""
+    """Raw by-path entries become ordered USB port path groups."""
 
     def test_groups_two_ports_with_sorted_nodes(self, fake_by_path):
+        """Entries group by port while each group's nodes sort by video index."""
         by_path_dir = fake_by_path["by_path_dir"]
         make_link = fake_by_path["make_link"]
 
@@ -63,8 +62,8 @@ class TestListByPathNodes:
         make_link(f"{PORT_A}-video-index0", 0)
         make_link(f"{PORT_B}-video-index0", 2)
         make_link(f"{PORT_B}-video-index1", 3)
-        # Non-matching entry name: must be skipped even though it resolves
-        # to a real video node.
+        # A valid target alone is insufficient: unrecognized entry names carry
+        # no index metadata and must not create a camera group.
         (by_path_dir / "not-a-camera-entry").symlink_to(fake_by_path["dev_dir"] / "video0")
 
         from core.camera import list_by_path_nodes
@@ -76,19 +75,18 @@ class TestListByPathNodes:
         assert [idx for idx, _ in groups[PORT_B]] == [2, 3]
 
     def test_missing_dir_returns_empty_dict(self, tmp_path):
+        """Missing udev state is represented as no groups, enabling fallback."""
         from core.camera import list_by_path_nodes
 
         assert list_by_path_nodes(str(tmp_path / "does-not-exist")) == {}
 
     def test_dangling_symlink_is_skipped(self, fake_by_path):
-        """A by-path entry whose realpath target doesn't exist (device was
-        unplugged but the symlink hasn't been cleaned up yet) must be
-        skipped rather than surfaced as a phantom camera group."""
+        """A stale udev link cannot surface an unplugged camera as a group."""
         by_path_dir = fake_by_path["by_path_dir"]
         dev_dir = fake_by_path["dev_dir"]
 
-        # Symlink to a video node that was never created (dangling target),
-        # named so it still matches the "-video-indexN" pattern.
+        # Preserve a syntactically valid entry name so existence of the resolved
+        # node is the only rejection reason.
         (by_path_dir / f"{PORT_A}-video-index0").symlink_to(dev_dir / "video0")
 
         from core.camera import list_by_path_nodes
@@ -99,13 +97,14 @@ class TestListByPathNodes:
 
 
 class TestTestIdentity:
-    """Requirements 2-3: metadata-node dedupe and lowest-index-wins."""
+    """Each USB port path group yields at most one usable capture node."""
 
     def test_dedupes_metadata_node_when_capture_node_is_not_index0(self, fake_by_path):
+        """A failed metadata node falls through to the group's capture node."""
         by_path_dir = fake_by_path["by_path_dir"]
         make_link = fake_by_path["make_link"]
-        make_link(f"{PORT_A}-video-index0", 0)  # metadata node, fails grab()
-        make_link(f"{PORT_A}-video-index1", 1)  # actual capture node
+        make_link(f"{PORT_A}-video-index0", 0)  # Enumerated first but cannot capture.
+        make_link(f"{PORT_A}-video-index1", 1)  # Usable node for the same camera.
 
         from core.camera import list_by_path_nodes, _test_identity
 
@@ -121,6 +120,7 @@ class TestTestIdentity:
         assert ident.device_path == str(by_path_dir / f"{PORT_A}-video-index1")
 
     def test_lowest_node_wins_when_both_grab(self, fake_by_path):
+        """The first usable node wins, avoiding duplicate probes and identities."""
         by_path_dir = fake_by_path["by_path_dir"]
         make_link = fake_by_path["make_link"]
         make_link(f"{PORT_A}-video-index0", 0)
@@ -139,6 +139,7 @@ class TestTestIdentity:
         assert mock_test.call_count == 1
 
     def test_all_nodes_fail_returns_none(self, fake_by_path):
+        """A USB port path group with no usable node yields no working identity."""
         by_path_dir = fake_by_path["by_path_dir"]
         make_link = fake_by_path["make_link"]
         make_link(f"{PORT_A}-video-index0", 0)
@@ -154,18 +155,19 @@ class TestTestIdentity:
 
 
 class TestProbeGroupFallback:
-    """probe_group_fallback: the public rescan-side sibling of the startup
-    group probe. When a group's provisional (lowest) node failed, it probes
-    the group's REMAINING nodes ascending, exactly as startup does, so a
-    camera whose capture node isn't its group's lowest can still hot-plug
-    reattach.
+    """Keep rescan fallback consistent with startup's per-group probing.
+
+    Cheap discovery offers the lowest node as a provisional identity. If that
+    node is metadata-only, rescan must try the remaining nodes in order so the
+    camera can reattach without being unplugged again.
     """
 
     def test_probes_remaining_nodes_and_skips_excluded(self, fake_by_path):
+        """Fallback skips the known failure and returns the next usable node."""
         by_path_dir = fake_by_path["by_path_dir"]
         make_link = fake_by_path["make_link"]
-        make_link(f"{PORT_A}-video-index0", 0)  # already probed, failed
-        make_link(f"{PORT_A}-video-index1", 1)  # real capture node
+        make_link(f"{PORT_A}-video-index0", 0)  # The rescan fast path tried this.
+        make_link(f"{PORT_A}-video-index1", 1)  # The group's usable capture node.
 
         from core.camera import probe_group_fallback
 
@@ -177,11 +179,11 @@ class TestProbeGroupFallback:
         assert ident.port_path == PORT_A
         assert ident.index == 1
         assert ident.device_path == str(by_path_dir / f"{PORT_A}-video-index1")
-        # The excluded (already-probed) node is never re-probed.
+        # Avoid duplicating the fast-path attempt before walking alternatives.
         assert all(call.args[0] != 0 for call in mock_test.call_args_list)
 
     def test_port_without_group_returns_none(self, fake_by_path):
-        # A fallback "index:N" identity has no by-path group to expand.
+        """Numeric fallback identities have no sibling nodes to explore."""
         from core.camera import probe_group_fallback
 
         with patch("core.camera.test_single_camera") as mock_test:
@@ -191,6 +193,7 @@ class TestProbeGroupFallback:
         mock_test.assert_not_called()
 
     def test_single_node_group_has_nothing_left_to_probe(self, fake_by_path):
+        """Excluding a group's only node ends fallback without another open."""
         make_link = fake_by_path["make_link"]
         make_link(f"{PORT_A}-video-index0", 0)
 
@@ -204,9 +207,10 @@ class TestProbeGroupFallback:
 
 
 class TestNaturalKey:
-    """Requirement 3: natural sort ('1.2' before '1.10')."""
+    """Numeric segments determine ordering inside textual USB port paths."""
 
     def test_natural_key_orders_multidigit_segments_numerically(self):
+        """Port 1.2 precedes 1.10 instead of following lexical digit order."""
         from core.camera import _natural_key
 
         ports = ["usb-0:1.10", "usb-0:1.2"]
@@ -214,9 +218,10 @@ class TestNaturalKey:
 
 
 class TestDiscoverCameraIdentities:
-    """Requirement 6: cheap, non-probing discovery."""
+    """Periodic rescans enumerate identities without opening camera nodes."""
 
     def test_natural_sort_of_by_path_identities(self, fake_by_path, monkeypatch):
+        """By-path identities follow USB port path order, not lexical quirks."""
         by_path_dir = fake_by_path["by_path_dir"]
         make_link = fake_by_path["make_link"]
 
@@ -234,6 +239,7 @@ class TestDiscoverCameraIdentities:
         assert [i.port_path for i in idents] == [port_small, port_big]
 
     def test_missing_by_path_dir_falls_back_to_numeric_order(self, tmp_path, monkeypatch, caplog):
+        """A missing by-path directory degrades deterministically and warns once."""
         missing_dir = str(tmp_path / "nonexistent-by-path")
         monkeypatch.setattr("core.camera.BY_PATH_DIR", missing_dir)
         monkeypatch.setattr("core.camera._by_path_degraded_warned", False)
@@ -257,10 +263,11 @@ class TestDiscoverCameraIdentities:
         assert len(degraded_warnings) == 1
 
     def test_mixed_tree_by_path_identity_before_orphan(self, fake_by_path, monkeypatch):
+        """USB port path groups precede numeric orphans in a mixed tree."""
         by_path_dir = fake_by_path["by_path_dir"]
         make_link = fake_by_path["make_link"]
         make_link(f"{PORT_A}-video-index0", 0)
-        # index 5 has no by-path entry at all -> orphan fallback.
+        # Index 5 models a node for which udev supplied no by-path entry.
         monkeypatch.setattr("core.camera.get_video_indexes", lambda: [0, 5])
 
         from core.camera import discover_camera_identities
@@ -276,18 +283,19 @@ class TestDiscoverCameraIdentities:
 
 
 class TestFindWorkingCameraIdentities:
-    """Requirement 7: probing discovery, one submission per physical group."""
+    """Full discovery deduplicates USB port path groups before confirmation."""
 
     def test_end_to_end_over_fake_tree(self, fake_by_path, monkeypatch, caplog):
+        """Each USB port path group is probed once, confirmed, and ordered."""
         by_path_dir = fake_by_path["by_path_dir"]
         make_link = fake_by_path["make_link"]
 
         port_low = "platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.2:1.0"
         port_high = "platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.10:1.0"
 
-        make_link(f"{port_low}-video-index0", 0)  # metadata node
-        make_link(f"{port_low}-video-index1", 1)  # capture node
-        make_link(f"{port_high}-video-index0", 2)  # capture node
+        make_link(f"{port_low}-video-index0", 0)  # Same camera, unusable metadata.
+        make_link(f"{port_low}-video-index1", 1)  # Same camera, usable capture.
+        make_link(f"{port_high}-video-index0", 2)  # A second physical camera.
 
         monkeypatch.setattr("core.camera.get_video_indexes", lambda: [0, 1, 2])
 
@@ -317,11 +325,11 @@ class TestFindWorkingCameraIdentities:
             with caplog.at_level(logging.INFO):
                 idents = find_working_camera_identities(str(by_path_dir))
 
-        # One _test_identity submission per physical group (2 groups), not per node.
+        # The metadata and capture nodes for ``port_low`` share one task.
         assert sorted(test_identity_calls) == sorted([port_low, port_high])
         assert len(test_identity_calls) == 2
 
-        # Round 2 re-confirms each surviving identity's resolved index.
+        # Confirmation probes the selected nodes, not every enumerated candidate.
         assert mock_confirm.call_count == 2
         confirmed_indexes = {c.args[0] for c in mock_confirm.call_args_list}
         assert confirmed_indexes == {1, 2}
@@ -333,6 +341,7 @@ class TestFindWorkingCameraIdentities:
         assert any("FINAL Working camera identities" in r.getMessage() for r in caplog.records)
 
     def test_round2_failure_drops_identity(self, fake_by_path, monkeypatch):
+        """A node that fails confirmation cannot survive on first-pass success."""
         by_path_dir = fake_by_path["by_path_dir"]
         make_link = fake_by_path["make_link"]
         make_link(f"{PORT_A}-video-index0", 0)
@@ -341,7 +350,7 @@ class TestFindWorkingCameraIdentities:
         from core.camera import find_working_camera_identities
 
         with patch("core.camera.test_single_camera") as mock_test:
-            # Round 1 succeeds, round 2 (allow_kill=False) fails.
+            # Distinguish the no-kill confirmation pass from initial probing.
             def side_effect(idx, **kw):
                 if kw.get("allow_kill", True) is False:
                     return None
@@ -354,9 +363,10 @@ class TestFindWorkingCameraIdentities:
 
 
 class TestFindWorkingCamerasWrapper:
-    """Requirement 8: compatibility wrapper delegates to identities."""
+    """``find_working_cameras`` projects discovered identities to indexes."""
 
     def test_wrapper_returns_identity_indexes(self, monkeypatch):
+        """By-path and numeric fallback identities both project to indexes."""
         import core.camera as camera_module
         from core.camera import CameraIdentity, find_working_cameras
 
@@ -372,15 +382,17 @@ class TestFindWorkingCamerasWrapper:
 
 
 class TestStreamTarget:
-    """Requirement 2 (property): stream_target picks device_path or index."""
+    """Define the open target chosen from each identity representation."""
 
     def test_by_path_identity_stream_target_is_device_path(self):
+        """USB port path identities open through their re-resolvable by-path link."""
         from core.camera import CameraIdentity
 
         ident = CameraIdentity(PORT_A, f"/dev/v4l/by-path/{PORT_A}-video-index0", 0)
         assert ident.stream_target == f"/dev/v4l/by-path/{PORT_A}-video-index0"
 
     def test_fallback_identity_stream_target_is_index(self):
+        """Degraded identities fall back to their numeric device index."""
         from core.camera import CameraIdentity
 
         ident = CameraIdentity("index:3", None, 3)

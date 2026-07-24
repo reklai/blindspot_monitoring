@@ -1,8 +1,4 @@
-"""
-UI Widgets for Camera Dashboard.
-
-Contains CameraWidget for camera tiles and FullscreenOverlay for fullscreen view.
-"""
+"""Dashboard tiles, fullscreen presentation, and UI-side capture recovery."""
 
 from __future__ import annotations
 
@@ -21,22 +17,19 @@ from core import config
 from core.camera import CaptureWorker
 
 
-# Parking lot for worker threads that could not be stopped. deleteLater()
-# on a still-running QThread is fatal: when the event loop processes the
-# deferred delete, ~QThread hits qFatal("QThread: Destroyed while thread
-# is still running") and SIGABRTs the whole process. Dropping the last
-# Python reference to a running QThread destroys the C++ object the same
-# way. So an unstoppable worker is held here by a strong reference and
-# only deleteLater'd once its thread has actually exited, checked by a
-# periodic reap pass. Its device fd stays leaked the whole time (see
-# CaptureWorker.stop()); parking only keeps the process alive.
+# Qt must retain a live QThread wrapper until its thread exits. Calling
+# deleteLater(), or dropping the last Python reference, while it is running
+# aborts the process. Workers that stop() cannot join are therefore held
+# strongly here and deleted by a timer after exit. Their capture descriptors
+# may remain open meanwhile; parking protects process lifetime, not device
+# availability.
 _zombie_workers: list[CaptureWorker] = []
 _zombie_reap_timer: Optional[QTimer] = None
 _ZOMBIE_REAP_INTERVAL_MS = 30_000
 
 
 def _park_zombie_worker(worker: CaptureWorker) -> None:
-    """Hold a still-running worker and arm the reap timer."""
+    """Keep an unjoinable worker alive and ensure it is polled for exit."""
     global _zombie_reap_timer
     _zombie_workers.append(worker)
     if _zombie_reap_timer is None:
@@ -48,7 +41,7 @@ def _park_zombie_worker(worker: CaptureWorker) -> None:
 
 
 def _reap_zombie_workers() -> None:
-    """Release parked workers whose thread has exited; keep the rest."""
+    """Delete stopped parked workers and retain those that are still running."""
     still_running: list[CaptureWorker] = []
     for worker in _zombie_workers:
         try:
@@ -57,7 +50,7 @@ def _reap_zombie_workers() -> None:
                 continue
             worker.deleteLater()
         except RuntimeError:
-            # C++ object already gone; nothing left to release.
+            # Qt already destroyed the wrapped object; no deferred delete remains.
             pass
     _zombie_workers[:] = still_running
     if not still_running and _zombie_reap_timer is not None:
@@ -65,10 +58,10 @@ def _reap_zombie_workers() -> None:
 
 
 class FullscreenOverlay(QtWidgets.QWidget):
-    """Transparent top-level widget for fullscreen display."""
+    """Frameless top-level window that presents one tile fullscreen."""
 
     def __init__(self, on_click_exit: Callable[[], None]) -> None:
-        """Create a full-window view with a centered QLabel."""
+        """Build the lazily created overlay and bind its exit callback."""
         super().__init__(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.on_click_exit = on_click_exit
         self._touch_active = False
@@ -86,13 +79,13 @@ class FullscreenOverlay(QtWidgets.QWidget):
         layout.addWidget(self.label)
 
     def mousePressEvent(self, a0: QtGui.QMouseEvent) -> None:  # type: ignore[override]
-        """Exit fullscreen on left click/tap."""
+        """Exit fullscreen for a left-button press."""
         if a0.button() == QtCore.Qt.MouseButton.LeftButton:
             self.on_click_exit()
         super().mousePressEvent(a0)
 
     def event(self, a0: QtCore.QEvent) -> bool:  # type: ignore[override]
-        # Only trigger exit on TouchEnd to prevent double-triggering
+        """Consume a touch sequence and invoke the exit callback once at its end."""
         if a0.type() == QtCore.QEvent.Type.TouchBegin:
             self._touch_active = True
             return True
@@ -105,12 +98,11 @@ class FullscreenOverlay(QtWidgets.QWidget):
 
 
 class CameraWidget(QtWidgets.QWidget):
-    """One tile in the grid. Manages UI input and rendering."""
+    """Dashboard tile for a camera, placeholder, or the shared settings controls."""
 
-    # How long a press needs to be to enter "swap mode".
+    # Minimum press duration used to select a tile for swapping.
     hold_threshold_ms: int = 400
 
-    # Instance type hints
     camera_stream_link: Optional[Union[int, str]]
     worker: Optional[CaptureWorker]
     _fs_overlay: Optional[FullscreenOverlay]
@@ -129,11 +121,15 @@ class CameraWidget(QtWidgets.QWidget):
         on_night_mode_toggle: Optional[Callable[[], None]] = None,
         on_brightness_change: Optional[Callable[[int], None]] = None,
     ) -> None:
-        """Initialize tile UI, worker thread, and timers."""
+        """Build a camera, placeholder, or settings tile.
+
+        Capture starts only when both ``enable_capture`` and ``stream_link`` are
+        set. A settings tile replaces video presentation with callback-backed
+        controls but still participates in the grid's swap behavior.
+        """
         super().__init__(parent)
         logging.debug("Creating camera %s", stream_link)
 
-        # Widget configuration: touch enabled, expands in grid, dark theme.
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
         self.setMouseTracking(True)
@@ -143,18 +139,15 @@ class CameraWidget(QtWidgets.QWidget):
         )
 
         self.camera_stream_link = stream_link
-        # For str stream links (by-path symlinks) keep only the readable
-        # tail (e.g. "...usb-0:1.3:1.0-video-index0") so log lines stay
-        # short; int links are unchanged.
+        # Object names need per-instance uniqueness; retaining the path tail
+        # keeps logs readable without conflating two tiles for the same stream.
         id_label = stream_link[-24:] if isinstance(stream_link, str) else stream_link
         self.widget_id = f"cam{id_label}_{id(self)}"
 
-        # Grid slot this tile occupies. Real value is assigned by main.py at
-        # slot creation; the identity/rescan machinery relies on its
-        # uniqueness across tiles. -1 means "not yet placed in a slot".
+        # main.py assigns one stable, unique index per camera slot. Rescans
+        # reuse the same tile object; -1 means it has not been placed yet.
         self.slot_index: int = -1
 
-        # State used for fullscreen toggle + drag/hold swap mode.
         self.is_fullscreen = False
         self.grid_position = None
         self._press_widget_id = None
@@ -163,7 +156,8 @@ class CameraWidget(QtWidgets.QWidget):
         self._touch_active = False
         self.swap_active = False
         self._last_fullscreen_toggle_ts = 0.0
-        self._fullscreen_debounce_ms = 200  # Minimum ms between fullscreen toggles
+        # Suppress duplicate rapid input, including mouse events synthesized from touch.
+        self._fullscreen_debounce_ms = 200
 
         self._fs_overlay = None
 
@@ -171,15 +165,15 @@ class CameraWidget(QtWidgets.QWidget):
         self.placeholder_text = placeholder_text
         self.settings_mode = settings_mode
         self.night_mode_enabled = False
-        self.brightness = 1.0  # Brightness multiplier: 1.0 = default, <1.0 = darker, >1.0 = brighter
+        self.brightness = 1.0  # Rendering multiplier; 1.0 leaves pixels unchanged.
 
-        # Normal state: solid black background; Swap state: yellow border for visual feedback
         self.normal_style = "background: black;"
         self.swap_ready_style = "border: 6px solid #FFFF00; background: black;"
         self.setStyleSheet(self.normal_style)
         self.setObjectName(self.widget_id)
 
-        # QLabel displays video frames or placeholder text; touch events enabled for interaction
+        # The label fills the tile and receives pointer events, so it installs
+        # the same gesture handling as the parent widget.
         self.video_label = QtWidgets.QLabel(self)
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_label.setScaledContents(True)
@@ -194,20 +188,18 @@ class CameraWidget(QtWidgets.QWidget):
             QtCore.Qt.WidgetAttribute.WA_AcceptTouchEvents, True
         )
 
-        # Zero margins/spacing creates seamless grid layout with no borders between tiles
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self._layout = layout  # Reference for swap mode margin changes
+        self._layout = layout  # Swap selection changes these margins.
 
-        # Settings tile provides controls: Restart, Nightmode toggle, and Brightness adjustment
         if self.settings_mode:
-            self.video_label.setText("")  # Hide placeholder text
-            self.video_label.setFixedSize(0, 0)  # Remove from layout
+            self.video_label.setText("")
+            self.video_label.setFixedSize(0, 0)
 
-            # Styled QLabels act as touch-friendly buttons
+            # QLabel controls provide large touch targets; eventFilter dispatches
+            # their callbacks by object name.
             btn_style = "QLabel { padding: 8px 12px; margin: 2px; background: #333; color: white; border-radius: 4px; }"
 
-            # Map object names to callbacks for event handling
             self._label_buttons = {}
 
             def add_setting_button(text: str, callback):
@@ -223,14 +215,13 @@ class CameraWidget(QtWidgets.QWidget):
             night_mode_label = add_setting_button("Nightmode: Off", on_night_mode_toggle)
             self.night_mode_button = night_mode_label
 
-            # Brightness adjustment: 5 levels from dim to max
             brightness_layout = QtWidgets.QHBoxLayout()
             brightness_layout.setSpacing(4)
             self._brightness_buttons = {}
             brightness_values = [15, 60, 80, 100, 150]
             brightness_labels = ["15%", "60%", "80%", "100%", "150%"]
 
-            # Propagate brightness changes to all camera widgets
+            # The outer callback keeps every camera tile synchronized.
             self._on_brightness_change = on_brightness_change
 
             def brightness_callback(v):
@@ -245,18 +236,16 @@ class CameraWidget(QtWidgets.QWidget):
                 btn.installEventFilter(self)
                 btn.setObjectName(f"brightness_{val}")
                 self._brightness_buttons[val] = btn
-                # Map button to callback for touch handling
+                # Bind val now; eventFilter invokes the callback after this loop.
                 self._label_buttons[btn.objectName()] = lambda v=val, cb=brightness_callback: cb(v)
                 brightness_layout.addWidget(btn)
 
             self._current_brightness = 100
 
-            # Header label above brightness buttons
             brightness_label = QtWidgets.QLabel("Brightness")
             brightness_label.setStyleSheet("color: white; padding: 4px; font-weight: bold;")
             brightness_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-            # Vertical layout: Restart → Nightmode → Brightness controls
             left_layout = QtWidgets.QVBoxLayout()
             left_layout.addWidget(restart_label, alignment=Qt.AlignmentFlag.AlignCenter)
             left_layout.addSpacing(8)
@@ -266,20 +255,18 @@ class CameraWidget(QtWidgets.QWidget):
             brightness_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
             left_layout.addLayout(brightness_layout)
 
-            # Center everything in the settings tile
             main_layout = QtWidgets.QHBoxLayout()
             main_layout.addStretch(1)
             main_layout.addLayout(left_layout, stretch=1)
             main_layout.addStretch(1)
 
-            # Final layout stack
             layout.addStretch(1)
             layout.addLayout(main_layout)
             layout.addStretch(1)
         else:
             layout.addWidget(self.video_label)
 
-        # Render state, staleness tracking, and caches.
+        # Frame freshness, restart-budget state, and render caches.
         self.frame_count = 0
         self.prev_time = time.time()
         self._latest_frame = None
@@ -296,25 +283,14 @@ class CameraWidget(QtWidgets.QWidget):
         self._restart_events = deque(maxlen=config.MAX_RESTARTS_PER_WINDOW * 2)
         self._last_restart_ts = 0.0
         self._restart_limit_logged = False
-        # First-frame watchdog: timestamp of the most recent successful
-        # (re)attach. Set here, in attach_camera, and on successful restart
-        # in _restart_capture_if_stale. Used by _render_latest_frame to
-        # detect a worker that attached but never delivered a frame (a
-        # wedged first grab()) -- not covered by the stale-frame check
-        # below, which only runs once a frame has arrived at least once.
+        # This timestamp starts a first-frame watchdog for each worker lifetime.
         self._attach_ts = 0.0
         self._first_frame_timeout_sec = config.FIRST_FRAME_TIMEOUT_SEC
-        # True once the CURRENT attach has delivered at least one frame.
-        # The watchdog keys on this, NOT on _last_frame_ts:
-        # on_status_changed(True) refreshes _last_frame_ts as grace for the
-        # stale check, so a timestamp comparison would let a worker that
-        # went online but wedged before its first frame escape the watchdog
-        # forever (no read timeout exists on the V4L2/GStreamer paths, so
-        # its own reconnect loop is stuck inside the blocked call too).
+        # Keep this separate from _last_frame_ts: an online status refreshes
+        # that timestamp even when the first grab/retrieve never completes.
         self._frame_since_attach = False
-        # Set True when a stale restart bails out because the old worker could
-        # not be stopped (leaked/zombie thread). Marks the widget detachable so
-        # the app-level rescan can reclaim its slot (see is_permanently_failed).
+        # An unjoinable worker cannot advance the restart budget once self.worker
+        # is cleared, so this flag independently lets rescan reclaim the slot.
         self._leaked_worker = False
         self._last_status_log_ts = 0.0
         self._last_status_log_interval_sec = 10.0
@@ -323,41 +299,35 @@ class CameraWidget(QtWidgets.QWidget):
         self._scaled_pixmap_cache_size = None
         self._night_gray = None
         self._night_bgr = None
-        # Reusable brightness output buffer (lazily (re)allocated per
-        # resolution, like the night-mode buffers). Keeps the brightness LUT
-        # out of self._latest_frame so re-rendering never double-applies.
+        # Brightness uses a separate, per-resolution buffer so a size-triggered
+        # re-render never applies the LUT twice to _latest_frame.
         self._brightness_buffer = None
-        # Pre-computed LUT for night mode brightness (1.6x gain, clamped to 255)
         self._night_lut = np.clip(np.arange(256, dtype=np.float32) * 1.6, 0, 255).astype(np.uint8)
-        # Brightness LUT - computed dynamically based on brightness setting
-        self._brightness_lut = np.arange(256, dtype=np.uint8)  # identity by default
+        self._brightness_lut = np.arange(256, dtype=np.uint8)
 
-        # Base FPS is the desired target; current FPS is adjusted dynamically.
+        # Stress control changes the live software-emission/UI targets and later
+        # recovers them toward their configured baselines.
         self.base_target_fps = target_fps
         self.current_target_fps = target_fps
 
-        # Render rate. Established before the worker is spawned so _spawn_worker
-        # can pass it as the emit-rate bound (min(capture_fps, ui_fps)).
-        # Settings tiles never render, so their render rate is 0.
+        # Establish the target UI cadence before spawning; the same value is the
+        # worker's emission ceiling. Settings tiles do not render frames.
         if not self.settings_mode:
             self.ui_render_fps = max(1, int(ui_fps))
-            self.base_ui_fps = self.ui_render_fps  # Store original for FPS recovery
+            self.base_ui_fps = self.ui_render_fps
         else:
             self.ui_render_fps = 0
             self.base_ui_fps = 0
 
-        # Start capture worker in background thread (if enabled)
         self.worker = None
         if self.capture_enabled and stream_link is not None:
             self._spawn_worker(stream_link, target_fps, request_capture_size)
             self._attach_ts = time.time()
         elif not self.settings_mode:
-            # No capture: set placeholder immediately
             self._latest_frame = None
             self._render_placeholder(self.placeholder_text or "DISCONNECTED")
 
-        # Timer to render latest frame at a stable UI FPS.
-        # Compensate for render overhead to hit actual target FPS.
+        # The GUI timer samples only the newest frame at the target cadence.
         if not self.settings_mode:
             interval = max(1, int(1000 / self.ui_render_fps) - config.RENDER_OVERHEAD_MS)
             self.render_timer = QTimer(self)
@@ -367,7 +337,6 @@ class CameraWidget(QtWidgets.QWidget):
         else:
             self.render_timer = None
 
-        # Optional UI FPS diagnostics (only for real cameras)
         if self.capture_enabled and not self.settings_mode and config.UI_FPS_LOGGING:
             self.ui_timer = QTimer(self)
             self.ui_timer.setInterval(1000)
@@ -376,7 +345,6 @@ class CameraWidget(QtWidgets.QWidget):
         else:
             self.ui_timer = None
 
-        # Periodic status logging for observability.
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(5000)
         self._status_timer.timeout.connect(self._log_status)
@@ -388,22 +356,22 @@ class CameraWidget(QtWidgets.QWidget):
         logging.debug("Widget %s ready", self.widget_id)
 
     def _exit_app(self) -> None:
-        """Exit the application gracefully."""
+        """Request event-loop shutdown when a QApplication exists."""
         app = QtWidgets.QApplication.instance()
         if app:
             app.quit()
 
     def _ensure_fullscreen_overlay(self) -> None:
-        """Create fullscreen overlay only when needed."""
+        """Create the top-level overlay lazily instead of one per tile at startup."""
         if self._fs_overlay is None:
             self._fs_overlay = FullscreenOverlay(self.exit_fullscreen)
 
     def _apply_ui_fps(self, ui_fps: int) -> None:
-        """Update UI render timer to match camera UI FPS.
+        """Set the target UI cadence and the worker's matching emission ceiling.
 
-        Compensates for render overhead to achieve actual target FPS. Also
-        propagates the new render rate to the worker as the emit-rate bound
-        so emit rate <= render rate holds after dynamic UI-FPS changes.
+        The timer subtracts configured render overhead to approximate the
+        requested paint rate; actual painting still depends on GUI workload.
+        The worker receives the numeric target as a strict emission bound.
         """
         self.ui_render_fps = max(1, int(ui_fps))
         if self.render_timer:
@@ -418,11 +386,11 @@ class CameraWidget(QtWidgets.QWidget):
         target_fps: Optional[float],
         capture_size: Optional[tuple[int, int]],
     ) -> None:
-        """Construct, wire, and start a CaptureWorker; assigns self.worker.
+        """Create, connect, and start the tile's capture worker.
 
-        Passes the widget's render rate as `ui_fps` so the worker throttles
-        emits to min(capture_fps, ui_fps) -- it never emits frames the render
-        dedup would just discard. Device configuration still uses target_fps.
+        ``target_fps`` requests the V4L2 device rate and seeds the software
+        emission throttle for either capture backend. ``ui_render_fps`` is a
+        separate emission ceiling aligned with this tile's target UI cadence.
         """
         cap_w, cap_h = capture_size if capture_size else (None, None)
         self.worker = CaptureWorker(
@@ -444,7 +412,7 @@ class CameraWidget(QtWidgets.QWidget):
         request_capture_size: tuple[int, int],
         ui_fps: Optional[int] = None,
     ) -> None:
-        """Attach a camera to an existing placeholder slot."""
+        """Convert this placeholder into an active camera without changing its slot."""
         if self.capture_enabled and self.worker:
             return
 
@@ -460,7 +428,7 @@ class CameraWidget(QtWidgets.QWidget):
 
         if ui_fps is not None:
             self._apply_ui_fps(ui_fps)
-            self.base_ui_fps = max(1, int(ui_fps))  # Store original for FPS recovery
+            self.base_ui_fps = max(1, int(ui_fps))
 
         self._spawn_worker(stream_link, target_fps, request_capture_size)
         self._attach_ts = time.time()
@@ -477,8 +445,7 @@ class CameraWidget(QtWidgets.QWidget):
         logging.info("Attached camera %s to widget %s", stream_link, self.widget_id)
 
     def eventFilter(self, a0: QtCore.QObject, a1: QtCore.QEvent) -> bool:  # type: ignore[override]
-        """Route touch/click events to appropriate handlers: settings buttons or camera widgets."""
-        # Settings tile: handle touch/click on Restart, Nightmode, and Brightness buttons
+        """Normalize settings-control and tile input into one gesture path."""
         if self.settings_mode and isinstance(a0, QtWidgets.QLabel):
             obj_name = a0.objectName()
             if obj_name in self._label_buttons:
@@ -501,7 +468,7 @@ class CameraWidget(QtWidgets.QWidget):
                         callback()
                     return True
 
-        # Allow standard button event processing
+        # Preserve native handling if settings controls return to QPushButton.
         if isinstance(a0, QtWidgets.QPushButton):
             return super().eventFilter(a0, a1)
 
@@ -520,7 +487,7 @@ class CameraWidget(QtWidgets.QWidget):
         return super().eventFilter(a0, a1)
 
     def _on_touch_begin(self, event: Any) -> bool:
-        """Record touch-down timestamp and source widget."""
+        """Begin a single-touch gesture, consuming multitouch without state changes."""
         try:
             if not event.points():
                 return True
@@ -535,7 +502,7 @@ class CameraWidget(QtWidgets.QWidget):
         return True
 
     def _on_touch_end(self, event: Any) -> bool:
-        """Handle touch-up as a click/hold action."""
+        """Resolve an active touch through the same release path as the mouse."""
         try:
             if not self._touch_active:
                 return True
@@ -546,11 +513,14 @@ class CameraWidget(QtWidgets.QWidget):
         return True
 
     def _handle_release_as_left_click(self) -> bool:
-        """
-        Unified release handler:
-        - short tap: fullscreen toggle
-        - long press: swap select
-        - swap if another camera is selected
+        """Resolve a completed primary-pointer gesture.
+
+        On grid parents that expose ``selected_camera``, an existing selection
+        takes priority: releasing it cancels, and releasing another tile swaps.
+        Otherwise a long press selects this tile and a short press toggles
+        fullscreen. Settings tiles remain swappable but ignore that short-release
+        action; right-click uses a separate immediate fullscreen path for every
+        tile.
         """
         try:
             if not self._press_widget_id or self._press_widget_id != self.widget_id:
@@ -570,7 +540,6 @@ class CameraWidget(QtWidgets.QWidget):
 
             selected = getattr(swap_parent, "selected_camera", None)
 
-            # Cancel swap if tapping the already-selected widget
             if selected == self:
                 logging.debug("Clear swap %s", self.widget_id)
                 setattr(swap_parent, "selected_camera", None)
@@ -579,7 +548,6 @@ class CameraWidget(QtWidgets.QWidget):
                 self._reset_mouse_state()
                 return True
 
-            # Complete swap: tap a different widget while one is selected
             if selected and selected != self and not self.is_fullscreen:
                 other = selected
                 logging.debug("SWAP %s <-> %s", other.widget_id, self.widget_id)
@@ -590,17 +558,16 @@ class CameraWidget(QtWidgets.QWidget):
                 self._reset_mouse_state()
                 return True
 
-            # Long press: initiate swap mode (allowed for all tiles including settings)
             if hold_time >= self.hold_threshold_ms and not self.is_fullscreen:
                 logging.debug("ENTER swap %s", self.widget_id)
                 setattr(swap_parent, "selected_camera", self)
                 self.swap_active = True
-                self._layout.setContentsMargins(6, 6, 6, 6)  # Expand margin for yellow border
+                # Inset the zero-margin content so the selection border is visible.
+                self._layout.setContentsMargins(6, 6, 6, 6)
                 self.setStyleSheet(self.swap_ready_style)
                 self._reset_mouse_state()
                 return True
 
-            # Settings tile: don't allow fullscreen on short tap
             if self.settings_mode:
                 self._reset_mouse_state()
                 return True
@@ -615,7 +582,7 @@ class CameraWidget(QtWidgets.QWidget):
         return True
 
     def _on_mouse_press(self, event: Any) -> bool:
-        """Record mouse down position and time."""
+        """Begin a primary-button gesture; right-click toggles fullscreen immediately."""
         try:
             if event.button() == QtCore.Qt.MouseButton.LeftButton:
                 self._press_time = time.time() * 1000.0
@@ -629,13 +596,13 @@ class CameraWidget(QtWidgets.QWidget):
         return True
 
     def _on_mouse_release(self, event: Any) -> bool:
-        """Handle mouse release as click/hold action."""
+        """Resolve a primary-button release through the shared gesture path."""
         if event.button() != QtCore.Qt.MouseButton.LeftButton:
             return True
         return self._handle_release_as_left_click()
 
     def _reset_mouse_state(self) -> None:
-        """Clear press state to avoid accidental reuse."""
+        """Clear the gesture origin so an unrelated release cannot reuse it."""
         self._press_time = 0
         self._press_widget_id = None
         self._grid_parent = None
@@ -646,7 +613,7 @@ class CameraWidget(QtWidgets.QWidget):
         target: CameraWidget,
         layout_parent: Any,
     ) -> None:
-        """Swap two widgets inside the grid layout."""
+        """Exchange two tiles' layout cells and their cached grid positions."""
         try:
             source_pos = getattr(source, "grid_position", None)
             target_pos = getattr(target, "grid_position", None)
@@ -665,8 +632,7 @@ class CameraWidget(QtWidgets.QWidget):
             logging.exception("do_swap")
 
     def toggle_fullscreen(self) -> None:
-        """Toggle between fullscreen and grid view with debounce protection."""
-        # Debounce rapid toggles to prevent race conditions
+        """Toggle the overlay, ignoring duplicate events inside the debounce window."""
         now = time.time() * 1000.0
         if (now - self._last_fullscreen_toggle_ts) < self._fullscreen_debounce_ms:
             logging.debug("Fullscreen toggle debounced for %s", self.widget_id)
@@ -679,7 +645,7 @@ class CameraWidget(QtWidgets.QWidget):
             self.go_fullscreen()
 
     def go_fullscreen(self) -> None:
-        """Enter fullscreen mode for this camera."""
+        """Present this tile on the primary screen's fullscreen overlay."""
         if self.is_fullscreen:
             return
         self._ensure_fullscreen_overlay()
@@ -700,7 +666,7 @@ class CameraWidget(QtWidgets.QWidget):
             self._render_placeholder(self.placeholder_text or "DISCONNECTED")
 
     def exit_fullscreen(self) -> None:
-        """Exit fullscreen and return to grid view."""
+        """Hide this tile's overlay and resume grid presentation."""
         if not self.is_fullscreen:
             return
         if self._fs_overlay:
@@ -709,10 +675,10 @@ class CameraWidget(QtWidgets.QWidget):
 
     @pyqtSlot(object)
     def on_frame(self, frame_bgr: NDArray[np.uint8]) -> None:
-        """Receive latest camera frame from worker.
+        """Retain the newest worker frame for the GUI render timer.
 
-        The worker emits a fresh, private array per frame (queued-connection
-        safe), so we simply retain the reference -- no buffer recycling.
+        Each queued signal carries a fresh private array, so retaining the
+        reference is safe and avoids another full-frame copy.
         """
         try:
             if frame_bgr is None:
@@ -725,17 +691,15 @@ class CameraWidget(QtWidgets.QWidget):
             logging.exception("on_frame")
 
     def _release_current_frame(self) -> None:
-        """Drop the reference to the current frame buffer."""
+        """Drop the retained frame so the next render shows placeholder state."""
         self._latest_frame = None
 
     def _dispose_worker(self, worker: CaptureWorker) -> None:
-        """Disconnect a worker and schedule it for deletion, zombie-safely.
+        """Disconnect and release a worker without destroying a live QThread.
 
-        A worker whose thread is still running (stop() failed or was
-        skipped) must NOT be deleteLater'd -- that is a qFatal abort of the
-        whole process (see the parking-lot comment at module level). Such a
-        worker is parked instead and deleted by the reap pass once its
-        thread exits.
+        A stopped worker follows Qt's normal deferred-deletion path. A running
+        worker is parked under a strong reference until the reaper observes
+        that its thread has exited.
         """
         try:
             worker.frame_ready.disconnect(self.on_frame)
@@ -755,7 +719,7 @@ class CameraWidget(QtWidgets.QWidget):
             pass
 
     def _render_placeholder(self, text: str) -> None:
-        """Render placeholder text when no frame is available."""
+        """Show text on the active label, skipping identical QLabel updates."""
         if self.settings_mode:
             return
         if (
@@ -784,8 +748,10 @@ class CameraWidget(QtWidgets.QWidget):
         target_size: QtCore.QSize,
         needs_scale: bool,
     ) -> None:
-        """Blit `self._pixmap_cache` onto `target_label`, scaling into
-        `target_size` via the cached scaled pixmap when `needs_scale` is True.
+        """Copy the frame pixmap to a label, reusing the target-sized buffer.
+
+        ``needs_scale`` selects an explicit paint into the cached black pixmap;
+        otherwise the source pixmap can be assigned directly.
         """
         if needs_scale:
             if (
@@ -807,28 +773,18 @@ class CameraWidget(QtWidgets.QWidget):
         target_label.setText("")
 
     def _render_latest_frame(self) -> None:
-        """Convert latest frame to QPixmap and display it."""
+        """Render when the frame or target size changes and enforce stale recovery."""
         if self.settings_mode:
             return
         try:
             frame_bgr = self._latest_frame
             if frame_bgr is None:
                 self._render_placeholder(self.placeholder_text or "DISCONNECTED")
-                # First-frame watchdog: a worker that attached but has never
-                # delivered a frame is invisible to the stale-frame check
-                # below (it only runs once _last_frame_ts has been set by a
-                # first frame). Settings tiles never reach here (early
-                # return above); capture_enabled/worker guard against
-                # placeholder/detached slots. The _frame_since_attach guard
-                # restricts the watchdog to "no FRAME delivered since this
-                # (re)attach": a camera that goes offline MID-RUN also lands
-                # here (on_status_changed(False) clears _latest_frame), but
-                # its worker's reconnect loop is the designed recovery --
-                # restarting that healthy worker would block the GUI up to
-                # 2s per stop() and refresh _last_restart_ts forever. A
-                # dedicated flag (not _last_frame_ts, which
-                # on_status_changed(True) also refreshes) keeps the
-                # online-but-wedged-before-first-frame worker covered.
+                # The first-frame flag distinguishes an initial read wedge from
+                # a mid-run disconnect. The worker owns mid-run reconnection,
+                # while an initial grab can block before its loop can recover.
+                # _last_frame_ts cannot make that distinction because an online
+                # status refreshes it before any frame is delivered.
                 if (
                     self.capture_enabled
                     and self.worker is not None
@@ -849,7 +805,6 @@ class CameraWidget(QtWidgets.QWidget):
                     stale_duration,
                 )
                 self._release_current_frame()
-                # Reset frame IDs to ensure placeholder renders on next call
                 self._last_rendered_id = -1
                 self._render_placeholder("DISCONNECTED")
                 self._restart_capture_if_stale()
@@ -873,35 +828,28 @@ class CameraWidget(QtWidgets.QWidget):
                     else:
                         h, w = frame_bgr.shape[:2]
 
-                    # Lazy allocate night mode buffers (only once per resolution)
+                    # Reuse contiguous transform buffers until resolution changes.
                     if self._night_gray is None or self._night_gray.shape != (h, w):
                         self._night_gray = np.empty((h, w), dtype=np.uint8)
                     if self._night_bgr is None or self._night_bgr.shape[:2] != (h, w):
-                        # Use contiguous array for efficient Qt buffer access
                         self._night_bgr = np.zeros((h, w, 3), dtype=np.uint8, order='C')
 
                     if frame_bgr.ndim == 2:
-                        # Apply brightness LUT directly to grayscale (in-place)
                         cv2.LUT(frame_bgr, self._night_lut, dst=self._night_gray)
                     else:
-                        # Convert to grayscale, then apply brightness LUT (in-place)
                         cv2.cvtColor(
                             frame_bgr, cv2.COLOR_BGR2GRAY, dst=self._night_gray
                         )
                         cv2.LUT(self._night_gray, self._night_lut, dst=self._night_gray)
 
-                    # Optimized: only update red channel, B/G stay zero from allocation
-                    # Use direct slice assignment (faster than np.copyto for this pattern)
+                    # Night mode is red-only; B/G remain zero in this buffer.
                     self._night_bgr[:, :, 2] = self._night_gray
                     frame_bgr = self._night_bgr
                 except Exception:
                     logging.debug("Night mode processing failed", exc_info=True)
 
-            # Apply brightness adjustment (if not 1.0). One whole-array LUT: a
-            # 256-entry uint8 LUT applies element-wise to every channel, so a
-            # single cv2.LUT replaces the per-channel loop. Output goes into a
-            # reusable buffer, leaving self._latest_frame untouched (no
-            # double-apply when the same frame re-renders).
+            # A whole-array LUT handles every channel into a separate reusable
+            # buffer, preserving _latest_frame across size-triggered re-renders.
             if self.brightness != 1.0:
                 try:
                     if (
@@ -914,8 +862,7 @@ class CameraWidget(QtWidgets.QWidget):
                 except Exception:
                     logging.debug("Brightness processing failed", exc_info=True)
 
-            # Convert numpy frame to Qt image, handling grayscale or BGR.
-            # Ensure contiguous memory layout for direct buffer access (avoids copy).
+            # QImage wraps the numpy memory directly, so rows must be contiguous.
             if not frame_bgr.flags['C_CONTIGUOUS']:
                 frame_bgr = np.ascontiguousarray(frame_bgr)
 
@@ -943,7 +890,7 @@ class CameraWidget(QtWidgets.QWidget):
 
             self._pixmap_cache.convertFromImage(img)
 
-            # Fullscreen scales to screen size; grid uses label size.
+            # Fullscreen always fills the overlay; grid skips work at native size.
             if self.is_fullscreen and self._fs_overlay:
                 needs_scale = target_size.width() > 0 and target_size.height() > 0
                 self._blit_scaled(self._fs_overlay.label, target_size, needs_scale)
@@ -966,9 +913,12 @@ class CameraWidget(QtWidgets.QWidget):
 
     @pyqtSlot(bool)
     def on_status_changed(self, online: bool) -> None:
-        """Update UI when camera goes online or offline."""
+        """Reflect worker connectivity without treating online as a received frame.
+
+        The online timestamp gives normal stale detection a grace period.
+        ``_frame_since_attach`` remains the separate first-frame authority.
+        """
         if online:
-            # Preserve yellow border if swap mode is active
             self.setStyleSheet(
                 self.swap_ready_style if self.swap_active else self.normal_style
             )
@@ -980,7 +930,7 @@ class CameraWidget(QtWidgets.QWidget):
             self._render_placeholder("DISCONNECTED")
 
     def reset_style(self) -> None:
-        """Restore default border styling and margins."""
+        """Apply margins and border for the tile's current swap-selection state."""
         self.video_label.setStyleSheet("")
         if self.swap_active:
             self._layout.setContentsMargins(6, 6, 6, 6)
@@ -990,7 +940,7 @@ class CameraWidget(QtWidgets.QWidget):
             self.setStyleSheet(self.normal_style)
 
     def _print_fps(self) -> None:
-        """Log rendering FPS for this widget."""
+        """Log this tile's measured render rate when diagnostics are enabled."""
         if not config.UI_FPS_LOGGING:
             return
         try:
@@ -1005,7 +955,7 @@ class CameraWidget(QtWidgets.QWidget):
             logging.debug("FPS logging exception", exc_info=True)
 
     def set_dynamic_fps(self, fps: Optional[float]) -> None:
-        """Apply dynamic FPS change from stress monitor."""
+        """Apply the stress monitor's software-emission target, clamped to its floor."""
         if fps is None or not self.capture_enabled:
             return
         try:
@@ -1019,7 +969,7 @@ class CameraWidget(QtWidgets.QWidget):
             logging.exception("set_dynamic_fps")
 
     def set_dynamic_ui_fps(self, ui_fps: int) -> None:
-        """Apply dynamic UI FPS change from stress monitor."""
+        """Apply a stress-driven UI target and update the worker's emission ceiling."""
         if self.settings_mode:
             return
         try:
@@ -1032,27 +982,22 @@ class CameraWidget(QtWidgets.QWidget):
 
     @property
     def _extended_cooldown_sec(self) -> float:
-        """Extended cooldown applied once the restart limit is hit (2x the restart window)."""
+        """Return the long backoff shared by budget reset and detach eligibility."""
         return self._restart_window_sec * 2
 
     def is_permanently_failed(self, now: float) -> bool:
-        """Return True once the widget can no longer recover on its own and the
-        extended cooldown has elapsed since the last restart attempt.
+        """Return whether rescan may detach this tile after capture failure.
 
-        Two independent triggers, both gated by the extended cooldown so the
-        rescan does not reclaim the slot instantly:
-          * `_restart_limit_logged` -- the restart budget was exhausted.
-          * `_leaked_worker` -- a stale restart bailed out on an unkillable
-            worker and cleared `self.worker`, so no further restart attempts
-            can accumulate to hit the budget; without this flag the widget
-            would never become detachable (dead end).
+        Exhausting the restart budget or parking an unjoinable worker makes the
+        tile eligible. Both cases wait through the extended cooldown so the
+        slot is not reclaimed immediately after the last attempt.
         """
         if not (self._restart_limit_logged or self._leaked_worker):
             return False
         return (now - self._last_restart_ts) >= self._extended_cooldown_sec
 
     def _restart_capture_if_stale(self) -> None:
-        """Restart the capture worker after a stale frame timeout."""
+        """Try to replace a nonproducing worker within restart and cooldown limits."""
         if not self.capture_enabled or not self.worker:
             return
         now = time.time()
@@ -1062,7 +1007,7 @@ class CameraWidget(QtWidgets.QWidget):
             t for t in self._restart_events if (now - t) <= self._restart_window_sec
         ]
         if len(recent) >= self._max_restarts_per_window:
-            # Don't give up forever - schedule a retry after extended cooldown
+            # Pause before resetting the budget rather than abandon recovery.
             extended_cooldown = self._extended_cooldown_sec
             if (now - self._last_restart_ts) < extended_cooldown:
                 if not getattr(self, '_restart_limit_logged', False):
@@ -1073,7 +1018,6 @@ class CameraWidget(QtWidgets.QWidget):
                     )
                     self._restart_limit_logged = True
                 return
-            # Extended cooldown passed, clear events and allow restart
             logging.info(
                 "Extended cooldown passed for %s, attempting recovery",
                 self.camera_stream_link
@@ -1081,12 +1025,10 @@ class CameraWidget(QtWidgets.QWidget):
             self._restart_events.clear()
             self._restart_limit_logged = False
 
-        # Cooldown always applies from this attempt onward (requirement (b): no
-        # hot-loop -- even the bail-out path leaves _last_restart_ts set so the
-        # stale detector backs off instead of retrying every render tick).
+        # Stamp before stop(): even an unjoinable worker must not be retried on
+        # every render tick.
         self._last_restart_ts = now
 
-        # Store old worker reference to verify cleanup
         old_worker = self.worker
         cap_w = getattr(old_worker, "capture_width", None)
         cap_h = getattr(old_worker, "capture_height", None)
@@ -1096,9 +1038,7 @@ class CameraWidget(QtWidgets.QWidget):
             "Restarting capture for %s after stale frames", self.camera_stream_link
         )
 
-        # Stop the old worker. stop() returns False if the thread could not be
-        # terminated (leaked/zombie); we then must NOT spawn a replacement that
-        # would fight the zombie for the device.
+        # Never spawn a replacement while the old worker may still own the device.
         stopped = False
         try:
             stopped = old_worker.stop()
@@ -1106,38 +1046,27 @@ class CameraWidget(QtWidgets.QWidget):
             logging.exception("Error stopping old worker for %s", self.camera_stream_link)
 
         if not stopped:
-            # Bail-out path. Budget/backoff trade-off (requirements a & b):
-            #   (a) do NOT record this into _restart_events -- a wedged thread
-            #       must not eat the N-per-window budget a later successful
-            #       restart could use (record-after-success: we only append on
-            #       the success path below).
-            #   (b) _last_restart_ts stays set to `now` (above) so the normal
-            #       cooldown still gates the next attempt (no hot-loop).
+            # A failed stop is not a completed restart, so it does not consume
+            # budget; the timestamp above still enforces normal backoff.
             logging.error(
                 "Old worker for %s could not be stopped; disposing zombie and "
                 "leaving slot for rescan/detach",
                 self.camera_stream_link,
             )
-            # Disconnect signals so the zombie can't emit into the UI, and drop
-            # our reference. _dispose_worker parks a still-running worker in
-            # the module zombie list (deleteLater on a live QThread would
-            # qFatal-abort the process) and frees it once the thread exits.
             self._dispose_worker(old_worker)
             self.worker = None
-            # Mark detachable: with self.worker == None no further stale
-            # restarts can accumulate to hit the budget limit, so flag the
-            # leak explicitly (is_permanently_failed reads _leaked_worker).
+            # With no current worker, no later render can advance the budget;
+            # the leak flag gives the detach sweep an independent trigger.
             self._leaked_worker = True
-            # Show DISCONNECTED so the tile reflects the dead capture.
             self.on_status_changed(False)
             return
 
-        # Success path: this restart counts against the budget.
+        # Only attempts that stopped the old worker consume restart budget.
         self._restart_events.append(now)
 
         self._dispose_worker(old_worker)
 
-        # camera_stream_link is guaranteed to be set if capture_enabled is True
+        # Retain a guard for partial teardown despite the capture-enabled invariant.
         if self.camera_stream_link is None:
             return
 
@@ -1147,7 +1076,7 @@ class CameraWidget(QtWidgets.QWidget):
         self._render_placeholder("CONNECTING...")
 
     def _log_status(self) -> None:
-        """Periodic status log for observability."""
+        """Log periodic per-tile capture and render state."""
         if self.settings_mode:
             return
         if self.camera_stream_link is None:
@@ -1169,39 +1098,36 @@ class CameraWidget(QtWidgets.QWidget):
         )
 
     def set_night_mode(self, enabled: bool) -> None:
-        """Enable or disable night mode rendering."""
+        """Select normal color or red-only low-light rendering."""
         self.night_mode_enabled = bool(enabled)
 
     def set_night_mode_button_label(self, enabled: bool) -> None:
-        """Update settings tile button label for night mode."""
+        """Keep the settings label synchronized with the shared night-mode state."""
         if self.settings_mode and hasattr(self, "night_mode_button"):
             label = "Nightmode: On" if enabled else "Nightmode: Off"
             self.night_mode_button.setText(label)
 
     def set_brightness(self, value: float) -> None:
-        """Apply brightness multiplier to camera output (1.0 = default, <1.0 = darker, >1.0 = brighter)."""
+        """Set the render multiplier, clamped to 0.5–3.0, and rebuild its LUT."""
         self.brightness = max(0.5, min(3.0, value))
-        # Pre-compute LUT for efficient per-pixel brightness adjustment
+        # Precompute once per setting change instead of multiplying every frame.
         input_vals = np.arange(256, dtype=np.float32)
         if self.brightness < 1.0:
-            # Darker: squash the input range to a smaller output range
             max_out = 255 * self.brightness
             self._brightness_lut = (input_vals * (max_out / 255.0)).astype(np.uint8)
         else:
-            # Brighter: amplify then clamp to prevent overflow
             self._brightness_lut = np.clip(input_vals * self.brightness, 0, 255).astype(np.uint8)
-        # Highlight selected button
         self._update_brightness_buttons()
 
     def _set_brightness_value(self, value: int) -> None:
-        """Convert percentage value (15-150) to brightness factor and apply."""
+        """Translate a settings percentage; ``set_brightness`` applies its clamp."""
         self._current_brightness = value
         brightness_factor = value / 100.0
         self.set_brightness(brightness_factor)
         self._update_brightness_buttons()
 
     def _update_brightness_buttons(self) -> None:
-        """Highlight the currently selected brightness level."""
+        """Highlight the settings preset matching ``_current_brightness``."""
         if not hasattr(self, '_brightness_buttons'):
             return
         btn_style = "QLabel { padding: 8px 12px; margin: 2px; background: #333; color: white; border-radius: 4px; }"
@@ -1210,7 +1136,7 @@ class CameraWidget(QtWidgets.QWidget):
             btn.setStyleSheet(selected_style if val == self._current_brightness else btn_style)
 
     def cleanup(self) -> None:
-        """Stop the capture worker thread cleanly."""
+        """Best-effort stop timers, dispose the worker, and delete the overlay."""
         try:
             if self.render_timer is not None and self.render_timer.isActive():
                 self.render_timer.stop()
@@ -1250,17 +1176,16 @@ class CameraWidget(QtWidgets.QWidget):
             pass
 
     def detach_camera(self) -> Optional[Union[int, str]]:
-        """Detach camera from this widget and return to placeholder state.
+        """Convert an active camera tile back into a reusable placeholder.
 
-        Returns the camera stream link that was detached (an int device index
-        or a str device path/stream URL), or None if not applicable.
+        Returns the previous stream link as a success value for status logging.
+        Placeholder and settings tiles return ``None`` without changing state.
         """
         if not self.capture_enabled or self.settings_mode:
             return None
         
         detached_index = self.camera_stream_link
         
-        # Stop capture worker
         worker = self.worker
         if worker:
             try:
@@ -1271,7 +1196,6 @@ class CameraWidget(QtWidgets.QWidget):
             self._dispose_worker(worker)
             self.worker = None
         
-        # Reset to placeholder state
         self.capture_enabled = False
         self.camera_stream_link = None
         if self._latest_frame is not None:
@@ -1284,7 +1208,6 @@ class CameraWidget(QtWidgets.QWidget):
         self._restart_limit_logged = False
         self._leaked_worker = False
 
-        # Update display
         self._render_placeholder(self.placeholder_text or "DISCONNECTED")
         
         logging.info("Detached camera %s from widget %s", detached_index, self.widget_id)

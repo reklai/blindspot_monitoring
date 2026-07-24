@@ -1,5 +1,8 @@
-"""
-Pytest configuration and shared fixtures for Camera Dashboard tests.
+"""Shared pytest setup for configuration, capture, and Qt-facing tests.
+
+The fixtures here isolate process-wide state that the application normally
+owns, so individual tests can focus on one contract without depending on a
+camera, display server, or a previous test's configuration.
 """
 
 import os
@@ -11,14 +14,20 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Add project root to path
+# Tests import the application as top-level packages, matching the launcher's
+# import layout even when pytest is invoked from outside the repository root.
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
 @pytest.fixture
 def temp_config_file() -> Generator[Path, None, None]:
-    """Create a temporary config file for testing."""
+    """Provide a representative config file and remove it after the test.
+
+    The values intentionally cover every application section used by the
+    parsing tests; callers can therefore exercise normal loading without
+    depending on the developer's local ``config.ini``.
+    """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".ini", delete=False) as f:
         f.write("""
 [logging]
@@ -66,7 +75,11 @@ log_interval_sec = 30
 
 @pytest.fixture
 def mock_video_capture():
-    """Mock cv2.VideoCapture for testing without real cameras."""
+    """Replace ``cv2.VideoCapture`` with a reusable, successful capture.
+
+    Camera tests can override individual return values for their edge case
+    while keeping hardware access out of the suite.
+    """
     with patch("cv2.VideoCapture") as mock_cap:
         instance = MagicMock()
         instance.isOpened.return_value = True
@@ -78,7 +91,8 @@ def mock_video_capture():
         yield mock_cap
 
 
-# Config globals that apply_config and tests may mutate.
+# ``apply_config`` writes these module globals in place. Keep the inventory
+# explicit so the fixture below restores the full public configuration state.
 _CONFIG_GLOBALS = [
     "LOG_LEVEL", "LOG_FILE", "LOG_MAX_BYTES", "LOG_BACKUP_COUNT", "LOG_TO_STDOUT",
     "DYNAMIC_FPS_ENABLED", "PERF_CHECK_INTERVAL_MS", "MIN_DYNAMIC_FPS",
@@ -95,7 +109,11 @@ _CONFIG_GLOBALS = [
 
 @pytest.fixture(autouse=False)
 def save_restore_config():
-    """Save config globals before a test and restore them afterwards."""
+    """Restore mutable ``core.config`` globals after an opted-in test.
+
+    This fixture is deliberately not autouse: only tests that mutate
+    configuration pay the setup cost, while still receiving strict isolation.
+    """
     from core import config as _cfg
     saved = {name: getattr(_cfg, name) for name in _CONFIG_GLOBALS}
     yield
@@ -105,18 +123,20 @@ def save_restore_config():
 
 @pytest.fixture(scope="session")
 def qapp():
-    """Create a QApplication instance for widget tests.
-    
-    This fixture is session-scoped to avoid creating multiple QApplication instances.
+    """Provide the single ``QApplication`` allowed by a test process.
+
+    Qt permits only one application instance, so the session scope reuses an
+    existing instance. ``offscreen`` keeps widget tests usable on CI and other
+    headless hosts; environments without PyQt6 skip only the Qt-dependent tests.
     """
-    # Only import PyQt6 if running widget tests
+    # Delay the optional Qt import until a widget test requests this fixture.
     try:
         from PyQt6.QtWidgets import QApplication
         
-        # Check if QApplication already exists
+        # Another plugin or test module may already own the process singleton.
         app = QApplication.instance()
         if app is None:
-            # Use offscreen platform for headless testing
+            # Set the platform before construction; Qt reads it only at startup.
             os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
             app = QApplication([])
         yield app

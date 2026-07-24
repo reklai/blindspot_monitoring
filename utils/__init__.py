@@ -1,4 +1,4 @@
-"""Utility modules for system helpers and process management."""
+"""Public process-recovery and dashboard-health helpers."""
 
 __all__ = [
     "run_cmd",

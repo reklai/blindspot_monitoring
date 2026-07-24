@@ -1,8 +1,4 @@
-"""
-Utility functions for Camera Dashboard.
-
-Includes system helpers and process management.
-"""
+"""Process-recovery and health-reporting helpers used by the dashboard."""
 
 from __future__ import annotations
 
@@ -21,9 +17,11 @@ if TYPE_CHECKING:
 
 
 def run_cmd(cmd: str, timeout: int = 2) -> tuple[str, str, int]:
-    """Run a command and return stdout, stderr, returncode.
+    """Run ``cmd`` without a shell and return stripped output plus exit status.
 
-    The command string is split with shlex to avoid ``shell=True``.
+    Shell syntax is intentionally unsupported: ``shlex.split`` converts the
+    string directly to an argument vector. Startup, timeout, and other
+    execution errors collapse to ``("", "", 1)`` for best-effort callers.
     """
     try:
         result = subprocess.run(
@@ -35,7 +33,7 @@ def run_cmd(cmd: str, timeout: int = 2) -> tuple[str, str, int]:
 
 
 def get_pids_from_lsof(device_path: str) -> set[int]:
-    """Get PIDs holding device using lsof."""
+    """Return numeric PIDs reported by ``lsof`` for ``device_path``."""
     out, _, code = run_cmd(f"lsof -t {device_path}")
     if code != 0 or not out:
         return set()
@@ -48,7 +46,7 @@ def get_pids_from_lsof(device_path: str) -> set[int]:
 
 
 def get_pids_from_fuser(device_path: str) -> set[int]:
-    """Get PIDs holding device using fuser."""
+    """Return numeric PID tokens reported by ``fuser`` for ``device_path``."""
     out, _, code = run_cmd(f"fuser -v {device_path}")
     if code != 0 or not out:
         return set()
@@ -59,7 +57,7 @@ def get_pids_from_fuser(device_path: str) -> set[int]:
 
 
 def is_pid_alive(pid: int) -> bool:
-    """Check if a PID exists."""
+    """Return whether sending signal 0 to ``pid`` succeeds."""
     try:
         os.kill(pid, 0)
         return True
@@ -68,9 +66,15 @@ def is_pid_alive(pid: int) -> bool:
 
 
 def kill_device_holders(device_path: str, grace: float = 0.4) -> bool:
-    """
-    Attempt to terminate any process holding a camera device.
-    Useful for kiosk-style setups.
+    """Best-effort terminate other processes holding a camera device.
+
+    This kiosk recovery path is disabled unless ``KILL_DEVICE_HOLDERS`` is
+    enabled. It tries ``lsof`` before ``fuser``, excludes this process, sends
+    SIGTERM, then SIGKILL to survivors after ``grace`` seconds. A permissions
+    failure falls back to ``sudo fuser -k``.
+
+    Returns ``True`` when at least one holder was found; it does not guarantee
+    that every holder exited.
     """
     from core import config
     
@@ -111,20 +115,17 @@ def kill_device_holders(device_path: str, grace: float = 0.4) -> bool:
 
 
 def set_cloexec_on_device_fds(prefix: str = "/dev/video") -> int:
-    """Set FD_CLOEXEC on every open fd whose target starts with `prefix`.
+    """Mark matching open device descriptors close-on-exec.
 
-    Used right before the settings-tile restart's os.execv: a capture fd
-    leaked by an unkillable worker thread (see CaptureWorker.stop()) was
-    opened by OpenCV WITHOUT O_CLOEXEC, so it would survive the exec, keep
-    the device claimed in the replacement process, and -- because exec
-    keeps the PID -- be unreclaimable there (kill_device_holders skips our
-    own PID). Marking it close-on-exec makes the kernel drop it at exec so
-    the restarted app can reopen the camera. Setting the flag does not
-    close the fd, so a wedged thread still blocked in grab() on it is
-    unaffected until the exec replaces the process image.
+    Camera-tile cleanup is best-effort and may leave an OpenCV descriptor open.
+    The settings-tile restart uses ``os.execv``, which keeps the same PID, while
+    holder cleanup deliberately excludes that PID. Marking any matching
+    descriptors prevents a successful exec from carrying them into the
+    replacement process.
 
-    Best-effort: returns the number of fds marked; unreadable entries and
-    fcntl failures are skipped.
+    Marking a descriptor does not close it or interrupt current I/O; the
+    kernel closes it only during a successful ``exec``. This Linux ``/proc``
+    scan is best-effort and returns the number successfully marked.
     """
     count = 0
     try:
@@ -155,14 +156,14 @@ def log_health_summary(
     failed_ports: dict[str, float],
     stale_threshold_sec: float = 10.0,
 ) -> None:
-    """Log a health summary of all cameras.
+    """Log aggregate tile health and warnings for stale frames or workers.
 
-    Args:
-        camera_widgets: List of active camera widgets
-        placeholder_slots: List of placeholder widgets
-        active_ports: Set of active camera port_paths
-        failed_ports: Dict mapping failed camera port_paths to failure timestamps
-        stale_threshold_sec: Seconds after which a frame is considered stale
+    A retained frame counts as online unless its positive timestamp is older
+    than ``stale_threshold_sec``. Worker health is counted independently
+    because a stalled worker can leave its last frame displayed. The other
+    collections provide slot and camera-identity bookkeeping totals for the
+    summary line. Identity keys are stable USB port paths when available and
+    synthetic ``index:N`` values otherwise.
     """
     now = time.time()
     online = 0
@@ -174,14 +175,12 @@ def log_health_summary(
         last_ts = getattr(w, "_last_frame_ts", 0.0)
         worker = getattr(w, "worker", None)
         
-        # Check if worker thread is healthy
         if worker is not None and hasattr(worker, "is_healthy"):
             if not worker.is_healthy():
                 unhealthy_workers += 1
                 cam_idx = getattr(w, "camera_stream_link", "?")
                 logging.warning("Camera %s worker unhealthy (thread dead or stalled)", cam_idx)
         
-        # Check frame freshness
         if has_frame:
             if last_ts > 0 and (now - last_ts) > stale_threshold_sec:
                 stale += 1

@@ -1,5 +1,9 @@
-"""
-Tests for ui/widgets.py - Widget lifecycle and fullscreen behavior.
+"""Camera widget state, rendering, watchdog, and worker-lifecycle contracts.
+
+Most cases use capture-disabled widgets or mocked workers so they exercise Qt
+behavior without camera hardware or background threads. Dedicated regression
+cases use real arrays and one controlled ``QThread`` where object lifetime is
+the behavior being protected.
 """
 
 import threading
@@ -12,8 +16,11 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _clear_zombie_workers():
-    """Empty the module-level zombie parking lot between tests so parked
-    MagicMock workers from one test never leak into another's reap pass."""
+    """Reset the process-wide zombie-worker registry after every test.
+
+    Parking intentionally retains strong references, so mocked workers and the
+    reap timer would otherwise leak state into later lifecycle cases.
+    """
     yield
     import ui.widgets as widgets_mod
 
@@ -25,11 +32,11 @@ def _clear_zombie_workers():
 
 
 class TestCameraWidgetInit:
-    """Test CameraWidget initialization."""
+    """The grid's placeholder and settings tiles both remain capture-free."""
 
     @pytest.mark.requires_display
     def test_widget_creation_placeholder(self, qapp):
-        """Test creating a placeholder widget (no camera)."""
+        """An empty camera slot retains its label and starts capture-disabled."""
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
@@ -47,7 +54,7 @@ class TestCameraWidgetInit:
 
     @pytest.mark.requires_display
     def test_widget_creation_settings_mode(self, qapp):
-        """Test creating a settings tile widget."""
+        """The settings tile is distinct from a camera placeholder and never captures."""
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
@@ -64,11 +71,11 @@ class TestCameraWidgetInit:
 
 
 class TestFullscreenBehavior:
-    """Test fullscreen enter/exit behavior."""
+    """Protect the grid-to-overlay fullscreen state transitions."""
 
     @pytest.mark.requires_display
     def test_toggle_fullscreen_enters(self, qapp):
-        """Test toggle_fullscreen enters fullscreen when not fullscreen."""
+        """Entering fullscreen moves the widget into overlay state."""
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
@@ -85,7 +92,7 @@ class TestFullscreenBehavior:
 
     @pytest.mark.requires_display
     def test_toggle_fullscreen_exits(self, qapp):
-        """Test toggle_fullscreen exits fullscreen when fullscreen."""
+        """Exiting the overlay restores the non-fullscreen state."""
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
@@ -103,7 +110,7 @@ class TestFullscreenBehavior:
 
     @pytest.mark.requires_display
     def test_go_fullscreen_idempotent(self, qapp):
-        """Test calling go_fullscreen multiple times is safe."""
+        """A duplicate enter request does not create conflicting overlay state."""
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
@@ -114,7 +121,7 @@ class TestFullscreenBehavior:
         widget.go_fullscreen()
         assert widget.is_fullscreen
         
-        # Calling again should not crash or change state
+        # Repeating the transition models duplicate click or key events.
         widget.go_fullscreen()
         assert widget.is_fullscreen
         
@@ -123,7 +130,7 @@ class TestFullscreenBehavior:
 
     @pytest.mark.requires_display
     def test_exit_fullscreen_idempotent(self, qapp):
-        """Test calling exit_fullscreen multiple times is safe."""
+        """An exit request is harmless when the widget is already in the grid."""
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
@@ -133,7 +140,6 @@ class TestFullscreenBehavior:
         
         assert not widget.is_fullscreen
         
-        # Calling exit when not fullscreen should not crash
         widget.exit_fullscreen()
         assert not widget.is_fullscreen
         
@@ -141,7 +147,7 @@ class TestFullscreenBehavior:
 
     @pytest.mark.requires_display
     def test_rapid_fullscreen_toggle(self, qapp):
-        """Test rapid fullscreen toggling doesn't cause issues."""
+        """Repeated toggle events leave a valid boolean state and clean up safely."""
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
@@ -149,11 +155,11 @@ class TestFullscreenBehavior:
             enable_capture=False,
         )
         
-        # Rapid toggles
+        # Ten transitions return to the starting state, while still exercising
+        # repeated overlay creation and teardown.
         for _ in range(10):
             widget.toggle_fullscreen()
         
-        # Should end up in a consistent state (either fullscreen or not)
         final_state = widget.is_fullscreen
         assert isinstance(final_state, bool)
         
@@ -162,11 +168,11 @@ class TestFullscreenBehavior:
 
 
 class TestNightMode:
-    """Test night mode functionality."""
+    """Define the user-visible night-mode flag transitions."""
 
     @pytest.mark.requires_display
     def test_night_mode_default_off(self, qapp):
-        """Test night mode is off by default."""
+        """New tiles preserve unmodified color unless night mode is requested."""
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
@@ -180,7 +186,7 @@ class TestNightMode:
 
     @pytest.mark.requires_display
     def test_set_night_mode(self, qapp):
-        """Test setting night mode."""
+        """Night mode can be enabled and subsequently disabled on the same tile."""
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
@@ -198,11 +204,11 @@ class TestNightMode:
 
 
 class TestWidgetCleanup:
-    """Test widget cleanup and resource release."""
+    """Keep cleanup safe for placeholder and repeated teardown paths."""
 
     @pytest.mark.requires_display
     def test_cleanup_without_worker(self, qapp):
-        """Test cleanup works when no worker is present."""
+        """A capture-free tile requires no worker-specific teardown."""
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
@@ -210,12 +216,11 @@ class TestWidgetCleanup:
             enable_capture=False,
         )
         
-        # Should not raise
         widget.cleanup()
 
     @pytest.mark.requires_display
     def test_cleanup_idempotent(self, qapp):
-        """Test calling cleanup multiple times is safe."""
+        """Repeated ownership teardown does not revisit released resources."""
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
@@ -224,15 +229,16 @@ class TestWidgetCleanup:
         )
         
         widget.cleanup()
-        widget.cleanup()  # Second call should not crash
+        # Qt owners may invoke explicit cleanup before ``aboutToQuit`` does it again.
+        widget.cleanup()
 
 
 class TestSwapMode:
-    """Test camera swap mode behavior."""
+    """Manual camera swapping starts inactive and can restore normal styling."""
 
     @pytest.mark.requires_display
     def test_swap_active_default(self, qapp):
-        """Test swap mode is inactive by default."""
+        """A new tile does not appear selected for a swap."""
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
@@ -246,7 +252,7 @@ class TestSwapMode:
 
     @pytest.mark.requires_display
     def test_reset_style(self, qapp):
-        """Test reset_style restores normal appearance."""
+        """Style reset accepts an unselected placeholder without special setup."""
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
@@ -254,18 +260,17 @@ class TestSwapMode:
             enable_capture=False,
         )
         
-        # Should not crash
         widget.reset_style()
         
         widget.cleanup()
 
 
 class TestDynamicFPS:
-    """Test dynamic FPS adjustment."""
+    """Define dynamic capture and render-rate guards at the widget boundary."""
 
     @pytest.mark.requires_display
     def test_set_dynamic_fps(self, qapp):
-        """Test setting dynamic FPS (requires capture_enabled=True)."""
+        """Capture-rate changes are ignored for placeholders."""
         from ui.widgets import CameraWidget
         
         widget = CameraWidget(
@@ -274,17 +279,15 @@ class TestDynamicFPS:
             target_fps=30.0,
         )
         
-        # When capture_enabled=False, set_dynamic_fps is a no-op
-        # This tests the early return path
+        # ``enable_capture=False`` deliberately selects the early-return branch.
         widget.set_dynamic_fps(15.0)
-        # FPS remains unchanged because capture is disabled
         assert widget.current_target_fps == 30.0
         
         widget.cleanup()
 
     @pytest.mark.requires_display
     def test_set_dynamic_fps_respects_minimum(self, qapp):
-        """Test dynamic FPS clamps to MIN_DYNAMIC_FPS when value is too low."""
+        """An active tile clamps capture rate at the configured safe floor."""
         from ui.widgets import CameraWidget
         from core import config
         
@@ -294,10 +297,10 @@ class TestDynamicFPS:
             target_fps=30.0,
         )
         
-        # Simulate an active capture widget so set_dynamic_fps doesn't early-return
+        # Opening a real worker is unnecessary; the flag alone selects active behavior.
         widget.capture_enabled = True
         
-        # Try to set below minimum
+        # One FPS is below the supported dynamic range in the default config.
         widget.set_dynamic_fps(1.0)
         assert widget.current_target_fps == config.MIN_DYNAMIC_FPS
         
@@ -305,7 +308,7 @@ class TestDynamicFPS:
 
     @pytest.mark.requires_display
     def test_set_dynamic_ui_fps(self, qapp):
-        """Test setting dynamic UI FPS."""
+        """Requested render rates cannot fall below the configured UI floor."""
         from ui.widgets import CameraWidget
         from core import config
         
@@ -315,24 +318,24 @@ class TestDynamicFPS:
             ui_fps=15,
         )
         
-        # UI FPS is adjusted to account for RENDER_OVERHEAD_MS
-        # The actual ui_render_fps may differ slightly from the requested value
+        # Rendering overhead can adjust the stored value, so the stable contract
+        # is the lower bound rather than exact equality.
         widget.set_dynamic_ui_fps(10)
-        # Just verify it's at or above minimum
         assert widget.ui_render_fps >= config.MIN_DYNAMIC_UI_FPS
 
         widget.cleanup()
 
 
 class TestPermanentFailure:
-    """Truth table for is_permanently_failed: limit-logged AND extended
-    cooldown elapsed must both hold before a widget is treated as
-    permanently failed.
+    """Define when restart exhaustion becomes eligible for detach.
+
+    Both a recorded restart-limit breach and the extended cooldown must hold;
+    separating these inputs protects the recovery grace period.
     """
 
     @pytest.mark.requires_display
     def test_limit_not_logged_is_not_permanently_failed(self, qapp):
-        """Restart limit never hit -> never permanently failed, regardless of timing."""
+        """Elapsed time alone cannot fail a widget that retained restart budget."""
         from ui.widgets import CameraWidget
 
         widget = CameraWidget(stream_link=None, enable_capture=False)
@@ -345,7 +348,7 @@ class TestPermanentFailure:
 
     @pytest.mark.requires_display
     def test_limit_logged_but_cooldown_not_elapsed_is_not_permanently_failed(self, qapp):
-        """Limit hit but extended cooldown hasn't passed yet -> not permanently failed."""
+        """A restart-limit breach still receives its extended recovery cooldown."""
         from ui.widgets import CameraWidget
 
         widget = CameraWidget(stream_link=None, enable_capture=False)
@@ -359,7 +362,7 @@ class TestPermanentFailure:
 
     @pytest.mark.requires_display
     def test_limit_logged_and_cooldown_elapsed_is_permanently_failed(self, qapp):
-        """Limit hit and extended cooldown has passed -> permanently failed."""
+        """Exhausted budget after the cooldown marks the widget for detachment."""
         from ui.widgets import CameraWidget
 
         widget = CameraWidget(stream_link=None, enable_capture=False)
@@ -373,14 +376,16 @@ class TestPermanentFailure:
 
 
 class TestSpawnWorker:
-    """Characterization tests pinning CaptureWorker construction/wiring/start
-    at each of the three call sites (__init__, attach_camera,
-    _restart_capture_if_stale), before/after the _spawn_worker extraction.
+    """Keep all worker creation paths on the shared wiring contract.
+
+    Construction, later attachment, and stale recovery must pass equivalent
+    capture settings, connect both signals, and start exactly one worker. These
+    cases preserve that behavior across refactors of ``_spawn_worker``.
     """
 
     @pytest.mark.requires_display
     def test_init_spawns_and_wires_worker(self, qapp):
-        """__init__ constructs, wires, and starts a CaptureWorker when capture is enabled."""
+        """An initially populated tile starts a fully connected worker."""
         from ui.widgets import CameraWidget
 
         with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
@@ -413,7 +418,7 @@ class TestSpawnWorker:
 
     @pytest.mark.requires_display
     def test_attach_camera_spawns_and_wires_worker(self, qapp):
-        """attach_camera constructs, wires, and starts a new CaptureWorker."""
+        """Filling a placeholder later uses the same worker wiring as construction."""
         from ui.widgets import CameraWidget
 
         with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
@@ -450,8 +455,10 @@ class TestSpawnWorker:
 
     @pytest.mark.requires_display
     def test_restart_capture_if_stale_spawns_and_wires_worker(self, qapp):
-        """_restart_capture_if_stale replaces a stopped worker with a new one,
-        reading the previous capture size back off the old worker via getattr.
+        """A clean stale restart carries the old worker's capture size forward.
+
+        Requested dimensions live on the worker after initial construction, so
+        replacement must read them before disposing the old instance.
         """
         from ui.widgets import CameraWidget
 
@@ -494,16 +501,18 @@ class TestSpawnWorker:
 
     @pytest.mark.requires_display
     def test_restart_bail_out_preserves_budget_and_is_detachable(self, qapp):
-        """When the old worker cannot be stopped (stop() -> False), the stale
-        restart must NOT consume restart budget, must dispose the zombie and
-        clear self.worker, must NOT spawn a replacement, must keep the cooldown
-        (no hot-loop), and must leave the widget detachable via
-        is_permanently_failed()."""
+        """An unkillable worker exits restart logic without spawning another.
+
+        The failed stop is not a completed restart, so it preserves budget. It
+        still advances cooldown to prevent a hot loop and leaves the widget
+        eligible for eventual detach while the zombie is parked safely.
+        """
         from ui.widgets import CameraWidget
 
         with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
             old_worker = MagicMock()
-            old_worker.stop.return_value = False  # leaked / unkillable
+            # ``False`` is the worker's explicit signal that its thread remains alive.
+            old_worker.stop.return_value = False
             old_worker.isRunning.return_value = True
             old_worker.capture_width = 320
             old_worker.capture_height = 240
@@ -515,7 +524,8 @@ class TestSpawnWorker:
                 target_fps=10.0,
                 request_capture_size=(320, 240),
             )
-            widget._last_restart_ts = 0.0  # allow the cooldown gate to pass
+            # Move beyond the ordinary gate so the stop branch is reached.
+            widget._last_restart_ts = 0.0
             events_before = len(widget._restart_events)
 
             mock_worker_cls.reset_mock()
@@ -523,15 +533,15 @@ class TestSpawnWorker:
             now = time.time()
             widget._restart_capture_if_stale()
 
-            # (a) budget deque untouched -- a wedged thread must not eat the window
+            # Only a successfully replaced worker should consume the rolling budget.
             assert len(widget._restart_events) == events_before
-            # (b) cooldown still applies -- _last_restart_ts advanced to ~now
+            # Timestamp advancement prevents each render tick retrying the same wedge.
             assert widget._last_restart_ts >= now
-            # zombie disposed, worker cleared, no replacement spawned
+            # Clearing the active reference allows main's detach planner to take over.
             old_worker.stop.assert_called_once()
             assert widget.worker is None
             mock_worker_cls.assert_not_called()
-            # detachable: once the extended cooldown elapses, permanently failed
+            # Simulate the later sweep boundary without waiting in real time.
             widget._last_restart_ts = now - widget._extended_cooldown_sec
             assert widget.is_permanently_failed(now) is True
 
@@ -539,8 +549,11 @@ class TestSpawnWorker:
 
     @pytest.mark.requires_display
     def test_restart_success_consumes_budget(self, qapp):
-        """Regression: on the normal (stop() -> True) path the restart budget
-        is consumed (one event recorded) and a replacement is spawned."""
+        """A completed replacement records exactly one restart-budget event.
+
+        This complements the bail-out case so preserving budget there does not
+        accidentally make normal restarts unlimited.
+        """
         from ui.widgets import CameraWidget
 
         with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
@@ -574,13 +587,11 @@ class TestSpawnWorker:
 
 
 class TestEmitRateAlignment:
-    """Widget wires the render rate into the worker as the emit-rate bound,
-    keeping emit rate <= render rate through dynamic UI-FPS changes."""
+    """Keep the worker's emission ceiling synchronized with widget rendering."""
 
     @pytest.mark.requires_display
     def test_spawn_worker_passes_render_rate_as_ui_fps(self, qapp):
-        """_spawn_worker passes the widget's ui_render_fps as the worker's
-        emit-rate bound so it targets min(capture_fps, ui_fps)."""
+        """Worker construction receives both capture rate and render ceiling."""
         from ui.widgets import CameraWidget
 
         with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
@@ -599,8 +610,7 @@ class TestEmitRateAlignment:
 
     @pytest.mark.requires_display
     def test_dynamic_ui_fps_pushes_new_bound_to_worker(self, qapp):
-        """set_dynamic_ui_fps propagates the new render rate to the worker so
-        the emit-rate bound tracks the live render rate (invariant upkeep)."""
+        """A runtime render-rate change immediately updates the active worker."""
         from ui.widgets import CameraWidget
 
         with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
@@ -623,13 +633,16 @@ class TestEmitRateAlignment:
 
 
 class TestBrightnessRendering:
-    """Brightness is one whole-array LUT into a reusable buffer, leaving the
-    stored latest frame untouched (fixes the double-apply-on-re-render bug)."""
+    """Protect non-destructive brightness correction and buffer reuse.
+
+    Rendering applies one lookup table to the whole image while retaining the
+    original latest frame. Mutating that source would compound brightness after
+    a resize or any other forced re-render of the same frame.
+    """
 
     @pytest.mark.requires_display
     def test_single_lut_matches_independent_numpy_result(self, qapp):
-        """The single 3-channel LUT output equals the per-channel result,
-        computed here independently as lut[frame] (cv2.LUT == fancy index)."""
+        """Whole-array lookup matches an independent NumPy indexing result."""
         from ui.widgets import CameraWidget
 
         widget = CameraWidget(stream_link=None, enable_capture=False)
@@ -641,7 +654,7 @@ class TestBrightnessRendering:
         widget.on_frame(frame)
         widget.set_brightness(1.5)
 
-        # Independent expected: apply the widget's LUT to every channel.
+        # Fancy indexing supplies an implementation-independent expected array.
         expected = widget._brightness_lut[original]
 
         widget._render_latest_frame()
@@ -653,8 +666,7 @@ class TestBrightnessRendering:
 
     @pytest.mark.requires_display
     def test_brightness_does_not_mutate_latest_frame(self, qapp):
-        """Rendering with brightness != 1.0 leaves self._latest_frame bytes
-        unchanged; re-rendering the SAME frame does not double-apply."""
+        """Re-rendering one frame cannot apply brightness a second time."""
         from ui.widgets import CameraWidget
 
         widget = CameraWidget(stream_link=None, enable_capture=False)
@@ -669,7 +681,7 @@ class TestBrightnessRendering:
         widget._render_latest_frame()
         assert np.array_equal(widget._latest_frame, original)
 
-        # Force a re-render of the same frame (as a size-change would).
+        # Reset render-cache markers to reproduce the path taken after a resize.
         widget._last_rendered_id = -1
         widget._last_rendered_size = None
         widget._render_latest_frame()
@@ -679,8 +691,7 @@ class TestBrightnessRendering:
 
     @pytest.mark.requires_display
     def test_brightness_buffer_reused_across_renders(self, qapp):
-        """The brightness buffer is allocated once per resolution and reused,
-        mirroring the night-mode buffer pattern."""
+        """Repeated renders at one resolution reuse the correction buffer."""
         from ui.widgets import CameraWidget
 
         widget = CameraWidget(stream_link=None, enable_capture=False)
@@ -701,13 +712,11 @@ class TestBrightnessRendering:
 
 
 class TestBlitScaled:
-    """Characterization tests pinning the scaled-pixmap blit path in
-    _render_latest_frame, for both grid and fullscreen targets.
-    """
+    """Keep scaled-frame output correct for both available render targets."""
 
     @pytest.mark.requires_display
     def test_render_latest_frame_blits_grid_pixmap(self, qapp):
-        """Feeding a frame produces a pixmap on the grid video_label."""
+        """Grid rendering replaces placeholder text with a valid pixmap."""
         from ui.widgets import CameraWidget
 
         widget = CameraWidget(
@@ -730,7 +739,7 @@ class TestBlitScaled:
 
     @pytest.mark.requires_display
     def test_render_latest_frame_blits_fullscreen_pixmap(self, qapp):
-        """Feeding a frame while fullscreen produces a pixmap on the overlay label."""
+        """Fullscreen rendering targets the overlay label rather than the grid label."""
         from ui.widgets import CameraWidget
 
         widget = CameraWidget(
@@ -753,15 +762,16 @@ class TestBlitScaled:
 
 
 class TestFirstFrameWatchdog:
-    """First-frame watchdog: a worker that attaches but never emits a frame
-    must eventually trigger _restart_capture_if_stale() itself -- recovery
-    can't rely solely on the worker's internal reconnect loop, which covers
-    open-failures but not a wedged first grab().
+    """A new worker that never delivers its first frame remains recoverable.
+
+    The worker's reconnect loop handles open failures, but cannot progress if
+    its first ``grab`` blocks. The widget therefore tracks each attachment
+    lifetime and invokes stale recovery after a separate first-frame timeout.
     """
 
     @pytest.mark.requires_display
     def test_attach_ts_set_on_init(self, qapp):
-        """__init__ stamps _attach_ts when it spawns a worker."""
+        """Initial worker creation starts a fresh first-frame timeout window."""
         from ui.widgets import CameraWidget
 
         with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
@@ -776,7 +786,7 @@ class TestFirstFrameWatchdog:
 
     @pytest.mark.requires_display
     def test_attach_ts_set_on_attach_camera(self, qapp):
-        """attach_camera stamps _attach_ts when it spawns a new worker."""
+        """Filling a placeholder starts its own first-frame timeout window."""
         from ui.widgets import CameraWidget
 
         with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
@@ -796,7 +806,7 @@ class TestFirstFrameWatchdog:
 
     @pytest.mark.requires_display
     def test_attach_ts_set_on_successful_restart(self, qapp):
-        """_restart_capture_if_stale stamps _attach_ts on the success path."""
+        """A replacement worker receives a new grace period for its first frame."""
         from ui.widgets import CameraWidget
 
         with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
@@ -824,8 +834,7 @@ class TestFirstFrameWatchdog:
 
     @pytest.mark.requires_display
     def test_attach_ts_not_bumped_on_restart_bail_out(self, qapp):
-        """The bail-out path (stop() -> False) does not spawn a replacement,
-        so _attach_ts must not be touched."""
+        """A failed stop cannot claim that a new attachment lifetime began."""
         from ui.widgets import CameraWidget
 
         with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
@@ -850,8 +859,7 @@ class TestFirstFrameWatchdog:
 
     @pytest.mark.requires_display
     def test_watchdog_triggers_restart_after_timeout(self, qapp):
-        """No frame ever received; once FIRST_FRAME_TIMEOUT_SEC elapses since
-        attach, the render tick calls _restart_capture_if_stale()."""
+        """A worker with no first frame is restarted after its grace period."""
         from ui.widgets import CameraWidget
 
         with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
@@ -867,7 +875,7 @@ class TestFirstFrameWatchdog:
 
     @pytest.mark.requires_display
     def test_watchdog_does_not_trigger_before_timeout(self, qapp):
-        """A recent attach must not trigger the watchdog."""
+        """A newly attached worker receives the full startup grace period."""
         from ui.widgets import CameraWidget
 
         with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
@@ -883,12 +891,12 @@ class TestFirstFrameWatchdog:
 
     @pytest.mark.requires_display
     def test_watchdog_not_triggered_after_midrun_offline(self, qapp):
-        """Camera unplugged mid-run: on_status_changed(False) clears the
-        latest frame, but the worker's own reconnect loop is the designed
-        recovery -- the watchdog must NOT keep restarting the healthy
-        reconnecting worker (each restart would block the GUI up to 2s in
-        stop() and refresh _last_restart_ts forever). The watchdog only
-        covers a worker that has delivered NOTHING since (re)attach."""
+        """A mid-run disconnect remains the worker reconnect loop's responsibility.
+
+        After at least one frame, restarting from every render tick would block
+        the GUI during ``stop`` and continually refresh cooldown state. The
+        widget watchdog is limited to attachment lifetimes with no frame at all.
+        """
         from ui.widgets import CameraWidget
 
         with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
@@ -896,7 +904,8 @@ class TestFirstFrameWatchdog:
             widget = CameraWidget(stream_link=0, enable_capture=True)
             widget._attach_ts = time.time() - widget._first_frame_timeout_sec - 1.0
 
-            # A frame arrived after attach, then the camera went offline.
+            # Deliver once before the offline status to distinguish this from a
+            # first-frame wedge; going offline clears the displayed frame.
             widget.on_frame(np.zeros((4, 4, 3), dtype=np.uint8))
             widget.on_status_changed(False)
             assert widget._latest_frame is None
@@ -909,14 +918,12 @@ class TestFirstFrameWatchdog:
 
     @pytest.mark.requires_display
     def test_watchdog_fires_when_online_but_never_delivered_a_frame(self, qapp):
-        """Wedge between open-success and first frame: _open_capture()
-        succeeds so the worker emits status_changed(True) -- which refreshes
-        _last_frame_ts as grace for the stale check -- then grab()/retrieve()
-        blocks forever before the first frame_ready. Neither the V4L2 nor
-        the GStreamer path has a read timeout, so the worker's own reconnect
-        loop is stuck inside the blocked call and the watchdog is the ONLY
-        recovery. "Delivered nothing since attach" must mean no FRAME, not
-        no status transition."""
+        """Online status alone does not disarm first-frame recovery.
+
+        A backend can open and emit ``status_changed(True)`` before blocking in
+        ``grab`` or ``retrieve``. Those calls have no read timeout, so receipt
+        of an actual frame—not a status transition—is the watchdog boundary.
+        """
         from ui.widgets import CameraWidget
 
         with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
@@ -924,7 +931,8 @@ class TestFirstFrameWatchdog:
             widget = CameraWidget(stream_link=0, enable_capture=True)
             widget._attach_ts = time.time() - widget._first_frame_timeout_sec - 1.0
 
-            # The worker went online after attach but never emitted a frame.
+            # Online status updates timing metadata but deliberately leaves frame
+            # receipt false for this attachment.
             widget.on_status_changed(True)
             assert widget._latest_frame is None
 
@@ -936,9 +944,7 @@ class TestFirstFrameWatchdog:
 
     @pytest.mark.requires_display
     def test_watchdog_rearms_on_reattach_after_earlier_frames(self, qapp):
-        """A frame delivered in a PREVIOUS attach life must not disarm the
-        watchdog for the next life: after detach + attach_camera, a worker
-        that goes online but never delivers is still caught."""
+        """Frames from an earlier attachment cannot satisfy a replacement worker."""
         from ui.widgets import CameraWidget
 
         with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
@@ -959,13 +965,14 @@ class TestFirstFrameWatchdog:
 
     @pytest.mark.requires_display
     def test_watchdog_ignored_for_settings_tile(self, qapp):
-        """Settings tiles never run the watchdog (or any frame rendering)."""
+        """The non-camera settings tile bypasses rendering and watchdog work."""
         from ui.widgets import CameraWidget
 
         widget = CameraWidget(
             stream_link=None, enable_capture=False, settings_mode=True
         )
-        widget._attach_ts = 0.0  # arbitrarily stale
+        # An obviously stale timestamp proves settings mode is the deciding guard.
+        widget._attach_ts = 0.0
 
         with patch.object(widget, "_restart_capture_if_stale") as mock_restart:
             widget._render_latest_frame()
@@ -975,8 +982,7 @@ class TestFirstFrameWatchdog:
 
     @pytest.mark.requires_display
     def test_watchdog_ignored_when_capture_disabled(self, qapp):
-        """capture_enabled False suppresses the watchdog even with a stale
-        _attach_ts and a worker reference (e.g. mid-detach)."""
+        """A tile mid-detach does not restart merely because a worker is referenced."""
         from ui.widgets import CameraWidget
 
         with patch("ui.widgets.CaptureWorker") as mock_worker_cls:
@@ -993,11 +999,12 @@ class TestFirstFrameWatchdog:
 
     @pytest.mark.requires_display
     def test_watchdog_ignored_when_worker_none(self, qapp):
-        """worker is None suppresses the watchdog even with a stale _attach_ts."""
+        """Capture state without a worker is left for attachment planning."""
         from ui.widgets import CameraWidget
 
         widget = CameraWidget(stream_link=None, enable_capture=False)
-        widget.capture_enabled = True  # force the other guard open
+        # Open the capture-enabled guard so absence of the worker is isolated.
+        widget.capture_enabled = True
         widget._attach_ts = 0.0
         assert widget.worker is None
 
@@ -1009,19 +1016,17 @@ class TestFirstFrameWatchdog:
 
 
 class TestZombieWorkerDisposal:
-    """deleteLater() on a still-running QThread is a qFatal abort (Qt kills
-    the whole process with "QThread: Destroyed while thread is still
-    running" once the event loop processes the deferred delete). The same
-    abort fires if the last Python reference to a running QThread is
-    dropped. So _dispose_worker must never deleteLater a running worker:
-    it parks the zombie with a strong reference and only deletes it once
-    isRunning() goes False.
+    """Protect Qt thread ownership when a capture worker cannot stop.
+
+    Calling ``deleteLater`` on a running ``QThread``—or dropping its final
+    Python reference—causes Qt to abort the process when deferred deletion is
+    processed. Disposal therefore parks a strong reference and reaps it only
+    after ``isRunning`` becomes false.
     """
 
     @pytest.mark.requires_display
     def test_dispose_running_worker_parks_instead_of_delete(self, qapp):
-        """A worker still running after a failed stop() is parked, not
-        deleteLater'd."""
+        """A running worker is retained without scheduling Qt deletion."""
         import ui.widgets as widgets_mod
         from ui.widgets import CameraWidget
 
@@ -1038,8 +1043,7 @@ class TestZombieWorkerDisposal:
 
     @pytest.mark.requires_display
     def test_dispose_stopped_worker_deletes_immediately(self, qapp):
-        """A confirmed-dead worker takes the normal deleteLater path and is
-        never parked."""
+        """A confirmed-dead worker follows normal deferred Qt deletion."""
         import ui.widgets as widgets_mod
         from ui.widgets import CameraWidget
 
@@ -1056,8 +1060,7 @@ class TestZombieWorkerDisposal:
 
     @pytest.mark.requires_display
     def test_park_starts_reap_timer(self, qapp):
-        """Parking arms the periodic reap timer -- without it a zombie that
-        eventually dies would never be released."""
+        """Parking starts the timer that eventually releases exited workers."""
         import ui.widgets as widgets_mod
 
         zombie = MagicMock()
@@ -1070,8 +1073,7 @@ class TestZombieWorkerDisposal:
 
     @pytest.mark.requires_display
     def test_reap_disposes_only_dead_zombies(self, qapp):
-        """The reap pass deleteLater's zombies whose thread has exited and
-        keeps holding the ones still running."""
+        """One reap pass deletes exited workers and retains live ones."""
         import ui.widgets as widgets_mod
 
         still_running = MagicMock()
@@ -1090,9 +1092,12 @@ class TestZombieWorkerDisposal:
 
     @pytest.mark.requires_display
     def test_real_running_qthread_survives_dispose(self, qapp):
-        """Crash repro: disposing a REAL running QThread and then processing
-        deferred deletes must not abort the process (unfixed code dies here
-        with SIGABRT), and the parked thread is released once it exits."""
+        """A real running ``QThread`` survives deferred-event processing.
+
+        This is the process-abort regression test that mocks cannot reproduce:
+        the thread must remain parked through Qt's delete queue, then become
+        reapable after its controlled exit.
+        """
         from PyQt6 import QtCore
 
         import ui.widgets as widgets_mod
@@ -1112,8 +1117,8 @@ class TestZombieWorkerDisposal:
         assert thread.isRunning()
 
         widget._dispose_worker(thread)
-        # Unfixed code scheduled deleteLater on the running thread; Qt's
-        # qFatal fires right here when the deferred delete is processed.
+        # The former implementation aborted at this event flush because it had
+        # queued deletion of a live thread.
         qapp.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
         qapp.processEvents()
 

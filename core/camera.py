@@ -1,9 +1,4 @@
-"""
-Camera capture and discovery for Camera Dashboard.
-
-Contains CaptureWorker for threaded video capture and
-functions for discovering available cameras.
-"""
+"""Camera capture, device discovery, stable identity, and slot assignment."""
 
 from __future__ import annotations
 
@@ -25,21 +20,22 @@ from core import config
 from utils import kill_device_holders
 
 
-# Cache for GStreamer availability check
+# OpenCV build capabilities do not change while the process is running.
 _gstreamer_available: Optional[bool] = None
 
 
 def _check_gstreamer_available() -> bool:
-    """Check if OpenCV was built with GStreamer support.
-    
-    Caches the result to avoid repeated checks.
+    """Best-effort parse and cache OpenCV's reported GStreamer availability.
+
+    The parser recognizes the build-info form whose final token is ``YES``.
+    Missing, unrecognized, or unreadable build information is treated as
+    unavailable so capture can use the fallback path.
     """
     global _gstreamer_available
     if _gstreamer_available is not None:
         return _gstreamer_available
     
     try:
-        # Check if OpenCV has GStreamer backend support
         build_info = cv2.getBuildInformation()
         gstreamer_line = None
         for line in build_info.splitlines():
@@ -67,17 +63,11 @@ def _check_gstreamer_available() -> bool:
 def _build_gstreamer_pipeline(
     device: Union[int, str], width: int, height: int
 ) -> Optional[str]:
-    """Build the GStreamer v4l2src pipeline string for `device`.
+    """Build a low-latency MJPEG ``v4l2src`` pipeline for a local device.
 
-    `device` is either:
-      - int: a /dev/videoN index -- produces exactly today's pipeline
-        string (`device=/dev/video{N}`).
-      - str starting with `/dev/`: an already-resolved device path --
-        produces `device={device}`.
-      - any other str (e.g. an `rtsp://...` URL or a relative path):
-        returns None. This GStreamer pipeline is V4L2-only; the caller
-        must skip it and fall through to the V4L2/software cascade
-        rather than feed an arbitrary string into v4l2src.
+    Integer indexes become ``/dev/videoN`` paths; absolute ``/dev`` paths are
+    used as given. Other strings return ``None`` because URLs and general file
+    paths are not valid inputs to this V4L2-only pipeline.
     """
     if isinstance(device, int):
         device_arg = f"/dev/video{device}"
@@ -86,12 +76,8 @@ def _build_gstreamer_pipeline(
     else:
         return None
 
-    # Use jpegdec (libjpeg) for MJPEG decoding - stable and efficient
-    # GStreamer pipeline optimized for low-latency:
-    # - v4l2src: capture from V4L2 device
-    # - queue: decouple source from decode (max 2 buffers, leaky=downstream)
-    # - appsink: sync=false for no A/V sync overhead, drop=1 for frame dropping
-    # - max-buffers=1: only keep latest frame to minimize latency
+    # Both the leaky queue and one-buffer appsink discard stale frames. The
+    # dashboard values low latency over processing every frame from the camera.
     return (
         f"v4l2src device={device_arg} ! "
         f"image/jpeg,width={width},height={height} ! "
@@ -102,11 +88,11 @@ def _build_gstreamer_pipeline(
 
 
 class CaptureWorker(QThread):
-    """Background thread for capturing frames from a camera."""
+    """Capture frames on a dedicated thread that owns the camera handle."""
     
-    # Signal emitted when a new frame is ready for the UI thread.
+    # Consumers receive complete BGR arrays; capture status changes only on
+    # transitions so the UI does not process duplicate online/offline events.
     frame_ready = pyqtSignal(object)
-    # Signal emitted when camera connection status changes.
     status_changed = pyqtSignal(bool)
 
     def __init__(
@@ -118,13 +104,13 @@ class CaptureWorker(QThread):
         capture_height: Optional[int] = None,
         ui_fps: Optional[float] = None,
     ) -> None:
-        """Initialize camera capture settings and state.
+        """Initialize capture configuration without opening the device.
 
-        `target_fps` configures the capture DEVICE (cv2 CAP_PROP_FPS on the
-        V4L2 path). `ui_fps`, when given, is an upper bound on the EMIT rate:
-        the throttle interval targets min(device fps, ui_fps) so the worker
-        never emits faster than the UI renders (no frames copied then
-        discarded by the render dedup). Device configuration is unaffected.
+        ``target_fps`` is requested from V4L2 when the handle opens and also
+        seeds the software emission throttle. ``ui_fps`` limits emissions to
+        the widget's render rate. For the supported rates of at least 1 FPS, the
+        effective emit rate is the lower of the capture rate estimate and the
+        UI bound.
         """
         super().__init__(parent)
         self.stream_link = stream_link
@@ -136,40 +122,36 @@ class CaptureWorker(QThread):
         # stays the health-check timestamp of the last successful emission.
         self._next_emit_due = 0.0
         self._target_fps = target_fps
-        # Upper bound on the emit rate (render rate); None means unbounded.
+        # ``None`` leaves the emit rate bounded only by the capture rate estimate.
         self._ui_fps = float(ui_fps) if (ui_fps and ui_fps > 0) else None
-        # Effective device fps used to derive the emit interval; refined by
-        # _configure_fps_from_camera once a capture is open.
+        # The open handle supplies a better estimate when no target was requested.
         self._device_fps = (
             float(target_fps) if (target_fps and target_fps > 0) else 30.0
         )
-        # _recompute_emit_interval_locked() assigns _emit_interval
-        # unconditionally from _device_fps/_ui_fps -- no seed value needed.
         self._recompute_emit_interval_locked()
         self.capture_width = capture_width
         self.capture_height = capture_height
         self._online = False
         self._start_ts = time.time()
         self._open_fail_count = 0
-        # Track if using GStreamer backend for proper cleanup
+        # GStreamer handles need a short settling period before release.
         self._using_gstreamer = False
-        # Cached FOURCC string, updated by worker thread, read by main thread.
+        # The capture worker replaces this snapshot after each successful open.
         self._fourcc: str = "unknown"
-        # Lock protects changes to FPS/emit interval from other threads.
+        # Dynamic FPS setters run on the UI thread while ``run`` reads the interval.
         self._fps_lock = threading.Lock()
         self._stop_event = threading.Event()
-        # Set True by stop() when the thread could not be terminated and the
-        # capture handle was intentionally leaked (see stop() for rationale).
+        # See ``stop``: releasing a handle still in use can crash the process.
         self._leaked = False
 
     def run(self) -> None:
-        """Capture loop: open camera, grab frames, emit, reconnect on failure."""
+        """Capture frames until stopped, reopening the device after failures."""
         self._start_ts = time.time()
         self._stop_event.clear()
         logging.info("Camera %s thread started", self.stream_link)
         while self._running:
             try:
-                # Ensure capture is open; reconnect if it fails.
+                # Failed opens back off, but a successful reconnect resets the delay.
                 if self._cap is None or not self._cap.isOpened():
                     self._open_capture()
                     if not (self._cap and self._cap.isOpened()):
@@ -194,8 +176,8 @@ class CaptureWorker(QThread):
                         self._online = True
                         self.status_changed.emit(True)
 
-                # Always grab() to drain the driver buffer and keep latency
-                # low; this is cheap (no decode).
+                # Always drain one driver frame. Decoding is deferred to ``retrieve``
+                # so throttled frames are cheap on the V4L2 MJPEG path.
                 grabbed = self._cap.grab()
                 if not grabbed:
                     logging.debug(
@@ -209,10 +191,8 @@ class CaptureWorker(QThread):
                     continue
 
                 now = time.time()
-                # Throttle BEFORE retrieve(): frames the throttle drops never
-                # get decoded. On the V4L2 MJPG fallback path retrieve() runs
-                # the JPEG decode, so this skips that work for dropped frames.
-                # (GStreamer decodes in-pipeline regardless -- no effect there.)
+                # Throttle before ``retrieve`` to avoid JPEG decoding frames the UI
+                # cannot render. GStreamer has already decoded them in its pipeline.
                 if self._emit_due(now):
                     ret, frame = self._cap.retrieve()
                     if not ret or frame is None:
@@ -225,8 +205,8 @@ class CaptureWorker(QThread):
                             self._online = False
                             self.status_changed.emit(False)
                         continue
-                    # retrieve() hands back a fresh, private, contiguous array
-                    # every call, so it is safe to emit directly (no copy).
+                    # OpenCV returns a frame array owned by this call, so the queued
+                    # UI consumer can retain it without an additional copy.
                     self.frame_ready.emit(frame)
                     self._last_emit = now
 
@@ -243,19 +223,13 @@ class CaptureWorker(QThread):
         logging.info("Camera %s thread stopped", self.stream_link)
 
     def _resolve_stream_target(self) -> Union[int, str]:
-        """Resolve `stream_link` to the value actually passed to
-        cv2.VideoCapture for this open attempt.
+        """Resolve the configured source for the current open attempt.
 
-        int targets pass through unchanged (no behavior change). str
-        targets are realpath'd on EVERY call -- deliberately not cached.
-        This is the fast-recovery mechanism: a worker holding a
-        /dev/v4l/by-path/... symlink re-resolves it on each reconnect
-        attempt, so once udev re-points the symlink at a re-enumerated
-        camera after a replug, the existing reconnect loop picks up the
-        new /dev/videoN node within one backoff interval. If realpath
-        fails for any reason, the original string is returned unchanged
-        so the subsequent open attempt fails and the reconnect loop
-        retries.
+        Integer sources pass through unchanged. String sources are deliberately
+        resolved on every reconnect rather than cached: after a USB replug, the
+        same ``/dev/v4l/by-path`` link may point to a new ``/dev/videoN`` node.
+        If resolution raises, returning the original value lets the normal open
+        failure and retry path handle it.
         """
         if isinstance(self.stream_link, int):
             return self.stream_link
@@ -265,7 +239,7 @@ class CaptureWorker(QThread):
             return self.stream_link
 
     def _open_capture(self) -> None:
-        """Open the camera and apply preferred capture settings."""
+        """Open the source through the preferred backend cascade and configure it."""
         try:
             cap = None
             backend_name = "V4L2"
@@ -323,10 +297,8 @@ class CaptureWorker(QThread):
                     return None
                 return local_cap
 
-            # Try GStreamer first if enabled and available (more efficient MJPEG pipeline).
-            # _build_gstreamer_pipeline returns None for stream targets it can't
-            # build a V4L2 pipeline for (e.g. non-/dev/ strings), in which case
-            # we skip straight to the V4L2/fallback cascade below.
+            # GStreamer is preferred for local MJPEG devices. Unsupported source
+            # forms produce no pipeline and proceed directly to the OpenCV cascade.
             w = int(self.capture_width) if self.capture_width else 640
             h = int(self.capture_height) if self.capture_height else 480
             pipeline = (
@@ -342,7 +314,7 @@ class CaptureWorker(QThread):
                 try:
                     cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
                     if cap and cap.isOpened():
-                        # Test if we can actually grab a frame
+                        # An open pipeline is not usable until its source yields data.
                         test_ret = cap.grab()
                         if test_ret:
                             backend_name = "GStreamer"
@@ -363,7 +335,8 @@ class CaptureWorker(QThread):
                     )
                     cap = None
 
-            # Fallback to V4L2 if GStreamer failed or not enabled/available
+            # Some cameras reject a forced format, so try MJPG, then YUYV, then
+            # driver-selected format. Each attempt also verifies an initial grab.
             if cap is None:
                 if config.USE_GSTREAMER and _check_gstreamer_available():
                     logging.info(
@@ -457,14 +430,12 @@ class CaptureWorker(QThread):
         return True
 
     def _recompute_emit_interval_locked(self) -> None:
-        """Recompute `_emit_interval` from `_device_fps` bounded by `_ui_fps`.
+        """Derive the emit interval from the capture and render rate bounds.
 
-        Single point where the emit throttle is derived: the emit rate is
-        min(device fps, ui fps). Because the widget keeps `_ui_fps` in sync
-        with its live render rate (set_ui_fps), this guarantees the
-        emit-rate <= render-rate invariant holds after any dynamic
-        adjustment. Caller must hold `_fps_lock` (or be single-threaded, as
-        during __init__).
+        The caller must hold ``_fps_lock``, except during single-threaded
+        construction before the capture worker can start. Rates are floored at
+        1 FPS; application callers provide bounds at or above that floor, which
+        preserves the invariant that emit rate cannot exceed render rate.
         """
         fps = self._device_fps
         if self._ui_fps is not None:
@@ -472,7 +443,11 @@ class CaptureWorker(QThread):
         self._emit_interval = 1.0 / max(1.0, fps)
 
     def _configure_fps_from_camera(self) -> None:
-        """Pick a usable device FPS value and update the emit interval."""
+        """Refresh the capture rate estimate used by the emission throttle.
+
+        A requested target takes precedence over the driver's reported value.
+        Implausible or unavailable driver values fall back to 30 FPS.
+        """
         if self._target_fps and self._target_fps > 0:
             fps = float(self._target_fps)
         else:
@@ -486,10 +461,11 @@ class CaptureWorker(QThread):
             self._recompute_emit_interval_locked()
 
     def set_target_fps(self, fps: Optional[float]) -> None:
-        """Update target/device FPS at runtime (software throttling only).
+        """Update the runtime capture rate estimate and software emit throttle.
 
-        The emit interval stays bounded by `_ui_fps` (min of the two), so a
-        capture-fps change never pushes the emit rate above the render rate.
+        This does not reconfigure an open device. Restarting a GStreamer pipeline
+        for a rate change causes disconnects, while throttling emissions is enough
+        for the stress controller. The UI-rate bound remains in force.
         """
         if fps is None:
             return
@@ -501,18 +477,11 @@ class CaptureWorker(QThread):
                 self._target_fps = fps
                 self._device_fps = fps
                 self._recompute_emit_interval_locked()
-            # Note: We don't call cap.set(CAP_PROP_FPS) here because:
-            # 1. GStreamer pipelines restart when FPS is changed, causing disconnects
-            # 2. Software throttling via _emit_interval is sufficient for stress management
         except Exception:
             logging.exception("set_target_fps")
 
     def set_ui_fps(self, ui_fps: Optional[float]) -> None:
-        """Update the UI render-rate bound used to cap the emit rate.
-
-        Called by the widget whenever its render rate changes (dynamic UI
-        FPS) so the emit throttle keeps targeting min(device fps, ui fps).
-        """
+        """Update the render rate bound after the widget changes its UI FPS."""
         if ui_fps is None:
             return
         try:
@@ -526,18 +495,15 @@ class CaptureWorker(QThread):
             logging.exception("set_ui_fps")
 
     def _close_capture(self) -> None:
-        """Release camera handle if open.
-        
-        For GStreamer captures, we add a small delay to allow the pipeline
-        to properly transition through states before releasing, which helps
-        avoid "Pipeline is live and does not need PREROLL" warnings and
-        potential segfaults during cleanup.
+        """Release the capture worker's camera handle.
+
+        GStreamer gets a short settling delay before release. This reduces
+        cleanup warnings and crashes while pipeline operations are still pending.
         """
         try:
             if self._cap:
-                # For GStreamer backend, give pipeline time to drain
                 if self._using_gstreamer:
-                    # Small delay helps GStreamer complete pending operations
+                    # Let pending pipeline operations settle before teardown.
                     time.sleep(0.05)
                 self._cap.release()
                 self._cap = None
@@ -549,47 +515,30 @@ class CaptureWorker(QThread):
 
     @property
     def is_leaked(self) -> bool:
-        """True if stop() gave up terminating the thread and deliberately
-        leaked the capture handle (device cleanup deferred to rescan)."""
+        """Whether ``stop`` timed out while the capture thread still owned its handle."""
         return self._leaked
 
     def stop(self) -> bool:
-        """Stop the capture loop and release the device, safely.
+        """Stop the thread and release its device only when release is safe.
 
-        Returns True if the thread fully stopped and the capture handle was
-        closed; False if the thread could not be terminated and the handle
-        was intentionally leaked.
+        Returns ``True`` once the thread is confirmed stopped and the handle is
+        closed. Returns ``False`` when termination fails; in that case the handle
+        is intentionally left with the live thread and ``is_leaked`` becomes true.
 
-        Threading / race-window rationale: _close_capture() calls
-        cv2.VideoCapture.release(). release() is NOT safe to call from this
-        (the main) thread while the capture thread may still be executing
-        inside grab()/retrieve() on the same handle -- that data race is a
-        segfault vector, and a segfault takes down the whole safety display.
-        So we only ever release the handle once the capture thread is
-        CONFIRMED dead:
-          * wait(2000) succeeds  -> run() returned; it already called
-            _close_capture() on its way out (line ~263), so the handle is
-            typically None already. The thread is confirmed dead, so this
-            extra release is safe belt-and-braces (a None handle is a no-op).
-          * terminate() + a wait/isRunning check confirming the thread is
-            gone -> terminate() abandons run() mid-flight, so its exit-time
-            _close_capture() may NOT have run; the handle can still be open.
-            The thread is confirmed dead here, so we release it ourselves.
-          * thread STILL alive after terminate() -> we must NOT release; we
-            leak the handle instead. There is NO in-process reclaim of this
-            fd: it is held open by THIS process's zombie capture thread, and
-            runtime rescan probes run with allow_kill=False while
-            kill_device_holders() deliberately excludes our own PID -- so
-            neither the rescan nor kill_device_holders can free it. Real
-            recovery is a physical replug (udev issues a fresh /dev/videoN
-            node the zombie doesn't hold, which the reconnect loop picks up)
-            or a process restart. The app-level detach only frees the tile
-            for reuse; it does not reclaim the leaked device fd.
+        ``VideoCapture.release`` must not race with ``grab`` or ``retrieve`` in
+        another thread because OpenCV may segfault. A graceful exit closes its own
+        handle. If forced termination is confirmed, this method closes any handle
+        the abandoned cleanup missed. If the thread remains alive, no code in this
+        process can safely reclaim its descriptor: rescan probes do not kill
+        holders, and holder cleanup excludes this process. The parked worker may
+        still unblock later, exit ``run``, and release its own handle. Otherwise,
+        recovery requires a replug or process restart; detaching the widget only
+        frees its UI slot.
         """
         self._running = False
         self._stop_event.set()
 
-        # Graceful exit: run() returned on its own, thread confirmed dead.
+        # ``run`` normally closes the handle; this is a safe idempotent fallback.
         if self.wait(2000):
             self._close_capture()
             return True
@@ -598,18 +547,14 @@ class CaptureWorker(QThread):
             "Camera %s thread did not stop in 2s, attempting terminate",
             self.stream_link,
         )
-        # Force terminate the thread - last resort.
+        # Forced termination is a last resort after cooperative shutdown stalls.
         self.terminate()
-        # Thread confirmed gone (wait succeeded, or it is no longer running)?
+        # Only a confirmed stop makes cross-thread release safe.
         if self.wait(500) or not self.isRunning():
             self._close_capture()
             return True
 
-        # Thread is STILL alive -- releasing the capture here would race a
-        # live grab() (segfault). Leak the handle: the fd stays open on our
-        # own zombie thread, so nothing in this process can reclaim it
-        # (rescan probes run allow_kill=False; kill_device_holders skips our
-        # PID). Recovery is a physical replug (fresh udev node) or a restart.
+        # Preserve process safety: the live thread may still be inside OpenCV.
         logging.error(
             "Camera %s capture thread could not be terminated; leaking its fd "
             "(held by our own zombie thread -- not reclaimable in-process). "
@@ -620,25 +565,24 @@ class CaptureWorker(QThread):
         return False
 
     def is_healthy(self) -> bool:
-        """Check if the worker thread is alive and responsive.
-        
-        Returns True if thread is running and has emitted a frame recently.
+        """Return whether the worker thread is alive and within its frame window.
+
+        The initial five-second grace starts when ``run`` starts. After the first
+        frame, health instead requires an emission within the last five seconds.
+        This does not report the camera's current online status.
         """
         if not self.isRunning():
             return False
-        # Check if we've emitted a frame in the last 5 seconds
         if self._last_emit > 0:
             return (time.time() - self._last_emit) < 5.0
         return (time.time() - self._start_ts) < 5.0
 
     def get_fourcc(self) -> str:
-        """Return the cached FOURCC string (thread-safe, no lock needed for reads)."""
+        """Return the latest immutable FOURCC snapshot, or ``"unknown"``."""
         return self._fourcc
 
 
-# ============================================================
-# CAMERA DISCOVERY
-# ============================================================
+# Capture probing
 
 
 def test_single_camera(
@@ -649,21 +593,17 @@ def test_single_camera(
     post_kill_retries: int = 2,
     post_kill_delay: float = 0.25,
 ) -> Optional[int]:
-    """Try to open and grab a frame from one camera.
+    """Probe one V4L2 source and return its numeric index when usable.
 
-    `cam_index` accepts two forms:
-      - int: a /dev/videoN index. Behavior is byte-identical to before
-        device-path support -- opens `cv2.VideoCapture(cam_index,
-        cv2.CAP_V4L2)` directly and returns `cam_index` on success.
-      - str: a device path (e.g. a `/dev/v4l/by-path/...` symlink or a
-        `/dev/videoN` path). Resolved via `os.path.realpath` FIRST; if
-        the resolved node doesn't exist we fail fast (return None)
-        without probing at all. `kill_device_holders` (if triggered) is
-        given the RESOLVED path, since lsof/fuser can't match a symlink.
-        On success we return the NUMERIC index parsed from the resolved
-        `/dev/videoN` node (matching `video(\\d+)$`) so existing
-        int-typed callers keep working unchanged; a resolved path that
-        isn't a `/dev/videoN` node returns None (V4L2-only).
+    Integer inputs are opened directly. String inputs are resolved first and
+    must point to an existing ``/dev/videoN``-style node; successful string
+    probes still return ``N`` to keep the result type uniform. The resolved path
+    is also used for optional holder cleanup because device tools do not match
+    the by-path symlink reliably.
+
+    After the normal retries fail, holder cleanup and the shorter post-cleanup
+    retry sequence run only when both ``allow_kill`` and
+    ``KILL_DEVICE_HOLDERS`` are enabled.
     """
     if isinstance(cam_index, str):
         resolved = os.path.realpath(cam_index)
@@ -720,7 +660,7 @@ def test_single_camera(
 
 
 def get_video_indexes() -> list[int]:
-    """List integer indices for /dev/video* devices."""
+    """Return numeric suffixes from the current ``/dev/video*`` nodes."""
     video_devices = glob_module.glob("/dev/video*")
     indexes = []
     for device in sorted(video_devices):
@@ -732,37 +672,32 @@ def get_video_indexes() -> list[int]:
     return indexes
 
 
-# ============================================================
-# CAMERA IDENTITY
-# ============================================================
+# Stable camera identity
 #
-# Slots must not be assigned by sorted /dev/video* index: USB enumeration
-# order is unstable across reboots/replugs, which can silently swap which
-# physical camera lands in which tile (safety-critical for a driver-facing
-# blindspot monitor). CameraIdentity anchors slot assignment to the USB
-# port path reported under /dev/v4l/by-path instead, which is stable for
-# a given physical cable/port regardless of enumeration order.
+# ``/dev/videoN`` indexes can change after a reboot or replug. Slot assignment
+# therefore follows the USB port path so the dashboard does not silently
+# show a different camera in a safety-relevant position.
 
-# Module-level so tests can monkeypatch core.camera.BY_PATH_DIR.
+# Kept configurable at module scope for alternate discovery roots and tests.
 BY_PATH_DIR = "/dev/v4l/by-path"
 
-# Emitted once per process the first time by-path discovery comes up
-# empty while numeric /dev/video* nodes exist.
+# Avoid repeating the same degraded-identity warning on every rescan.
 _by_path_degraded_warned = False
 
 
 @dataclass(frozen=True)
 class CameraIdentity:
-    """Stable physical identity for one camera.
+    """Represent a by-path camera group or an ungrouped numeric capture node.
 
-    `port_path` is the USB port path derived from the /dev/v4l/by-path
-    entry name (that entry's name minus its trailing "-video-indexN"
-    suffix), or the pseudo-key "index:N" in fallback mode when no by-path
-    entries exist. It is the stable key: any dict/bookkeeping code
-    elsewhere (slot assignment, cooldowns, etc.) MUST key on this string,
-    never on a CameraIdentity instance or its `index` -- `index` and
-    `device_path` are just a snapshot taken at discovery time and can go
-    stale after a replug.
+    For a grouped identity, ``port_path`` is the by-path entry name without
+    ``-video-indexN`` and provides the stable bookkeeping key for slot
+    assignment, cooldowns, and reattach memory. ``device_path`` is the by-path
+    symlink that the capture worker re-resolves on each open, while ``index`` is
+    the discovery-time ``/dev/videoN`` snapshot.
+
+    A numeric node without a by-path entry instead uses ``index:N`` as a
+    degraded key and has no ``device_path``. Such a fallback is not grouped by
+    physical camera, and its key and index may change after a replug.
     """
 
     port_path: str
@@ -771,29 +706,27 @@ class CameraIdentity:
 
     @property
     def stream_target(self) -> Union[int, str]:
-        """Value to pass as a capture source (by-path symlink, else index)."""
+        """Return the stable by-path source, or the fallback numeric index."""
         return self.device_path if self.device_path is not None else self.index
 
 
 def _natural_key(s: str) -> list[Union[str, int]]:
-    """Natural-sort key: splits digit runs into ints.
+    """Build a key that orders numeric path components by numeric value.
 
-    Plain lexicographic sorting gets USB port paths wrong, e.g.
-    "usb-0:1.10" would sort before "usb-0:1.2". Splitting digit runs out
-    as ints fixes that ("1.2" < "1.10" numerically).
+    For example, USB port ``1.2`` sorts before ``1.10``.
     """
     return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", s)]
 
 
 def _identity_sort_key(identity: "CameraIdentity") -> tuple:
-    """Sort by-path identities (natural port order) before fallback ones (by index)."""
+    """Order stable by-path identities first, then numeric fallbacks."""
     if identity.device_path is not None:
         return (0, _natural_key(identity.port_path))
     return (1, identity.index)
 
 
 def _warn_by_path_degraded_once() -> None:
-    """Log the "degraded to enumeration order" warning at most once per process."""
+    """Warn once that slot order is falling back to capture-node indexes."""
     global _by_path_degraded_warned
     if not _by_path_degraded_warned:
         logging.warning(
@@ -806,19 +739,14 @@ def _warn_by_path_degraded_once() -> None:
 def list_by_path_nodes(
     by_path_dir: Optional[str] = None,
 ) -> dict[str, list[tuple[int, str]]]:
-    """Group /dev/v4l/by-path entries by physical USB port path.
+    """Group valid by-path entries by their USB port path.
 
-    Returns {port_path: [(video_index, entry_name), ...]}, each group's
-    nodes sorted ascending by index. A port_path is a by-path entry name
-    with its trailing "-video-indexN" suffix stripped. Entries that don't
-    match that naming pattern, whose resolved target isn't a /dev/videoN
-    node, or whose resolved target doesn't exist (a dangling symlink --
-    the device was unplugged but the by-path node hasn't been cleaned up
-    yet), are skipped. A missing/unreadable directory (or one with no
-    matching entries) returns {}.
+    The result is ``{port_path: [(video_index, entry_name), ...]}``, with each
+    group ordered by its resolved ``/dev/videoN`` index. Malformed entries,
+    dangling links, and links whose targets are not video nodes are ignored.
+    Missing, unreadable, or empty directories return an empty mapping.
 
-    `by_path_dir=None` means "use BY_PATH_DIR", read from the module
-    attribute at call time so tests can monkeypatch it.
+    With no explicit directory, ``BY_PATH_DIR`` is read at call time.
     """
     directory = by_path_dir if by_path_dir is not None else BY_PATH_DIR
     try:
@@ -853,15 +781,12 @@ def _test_identity(
     by_path_dir: Optional[str],
     **probe_kwargs: Any,
 ) -> Optional[CameraIdentity]:
-    """Probe one physical group's candidate nodes, ascending, for the capture node.
+    """Return the first working capture node in one USB port path group.
 
-    UVC devices commonly expose a metadata node alongside the real
-    capture node in the same by-path group; the metadata node fails
-    grab(). The first node (in ascending index order) that passes
-    `test_single_camera` wins and becomes the identity. If every node
-    fails, returns None. `node_indexes` entries are (video_index,
-    entry_name); entry_name is None for fallback (no-by-path) candidates,
-    which yields device_path=None.
+    UVC cameras often expose metadata and capture nodes under the same port.
+    Probing in ascending index order filters out metadata nodes that cannot
+    grab frames. ``node_indexes`` contains ``(video_index, entry_name)`` pairs;
+    a ``None`` entry name represents a numeric fallback without a by-path link.
     """
     directory = by_path_dir if by_path_dir is not None else BY_PATH_DIR
     for index, entry_name in node_indexes:
@@ -879,18 +804,13 @@ def probe_group_fallback(
     exclude_index: int,
     **probe_kwargs: Any,
 ) -> Optional[CameraIdentity]:
-    """Probe a by-path group's REMAINING nodes after its provisional node failed.
+    """Probe the remaining nodes after a rescan's provisional node fails.
 
-    `discover_camera_identities` uses a group's LOWEST node as the
-    provisional capture node, but that node may be a UVC metadata node that
-    fails grab() while the real capture node has a higher index. This
-    re-derives the group's nodes for `port_path` (from BY_PATH_DIR at call
-    time) and probes the nodes other than `exclude_index` (the one already
-    probed) ascending via `_test_identity`, exactly as startup does.
-    Returns the rebuilt identity for whichever node passes, else None --
-    including when the port has no by-path group at all (e.g. fallback
-    "index:N" identities, which have a single node and nothing to expand).
-    `probe_kwargs` are passed through to `test_single_camera`.
+    Non-probing discovery selects a group's lowest node, which may be a UVC
+    metadata node. This reloads the group from ``BY_PATH_DIR``, excludes the
+    node already tested, and applies the same ascending probe used at startup.
+    Numeric fallback identities have no group to expand and return ``None``.
+    Additional keyword arguments are forwarded to ``test_single_camera``.
     """
     nodes = list_by_path_nodes().get(port_path)
     if not nodes:
@@ -904,17 +824,12 @@ def probe_group_fallback(
 
 
 def discover_camera_identities(by_path_dir: Optional[str] = None) -> list[CameraIdentity]:
-    """Cheap, non-probing camera identity discovery (used by the rescan tick).
+    """Build the inexpensive identity snapshot used by periodic rescans.
 
-    Combines /dev/v4l/by-path groups with orphan /dev/video* nodes not
-    covered by any by-path group. No probing is done here: a by-path
-    group's LOWEST node is used as the provisional index/device_path
-    (probing to pick the real capture node happens in
-    find_working_camera_identities). Orphan numeric nodes become fallback
-    identities (port_path "index:N", device_path None).
-
-    Sorted: by-path identities first (natural port_path order), then
-    fallback identities (by index).
+    Each by-path group contributes its lowest node as a provisional capture
+    node; this function does not open devices. Numeric nodes not represented by
+    a group become ``index:N`` fallback identities. Results place by-path
+    identities in natural USB port path order before index-ordered fallbacks.
     """
     directory = by_path_dir if by_path_dir is not None else BY_PATH_DIR
     groups = list_by_path_nodes(directory)
@@ -947,13 +862,13 @@ def discover_camera_identities(by_path_dir: Optional[str] = None) -> list[Camera
 
 
 def find_working_camera_identities(by_path_dir: Optional[str] = None) -> list[CameraIdentity]:
-    """Probing camera identity discovery, used at startup.
+    """Discover and verify working camera identities for startup.
 
-    Mirrors find_working_cameras()'s two-round structure, but round 1
-    submits one probe per PHYSICAL GROUP (via _test_identity) instead of
-    per node, so a UVC metadata node never shadows the real capture node.
-    Round 2 re-confirms each surviving identity's resolved index with the
-    existing no-kill confirmation pattern; failures drop the identity.
+    The first concurrent pass probes one USB port path group at a time, allowing
+    ``_test_identity`` to distinguish a real capture node from sibling metadata
+    nodes. Numeric fallback nodes cannot be grouped by physical camera and are
+    probed independently. A second pass rechecks each survivor without killing
+    device holders; an unstable candidate that fails confirmation is omitted.
     """
     directory = by_path_dir if by_path_dir is not None else BY_PATH_DIR
     groups = list_by_path_nodes(directory)
@@ -1002,7 +917,7 @@ def find_working_camera_identities(by_path_dir: Optional[str] = None) -> list[Ca
             except Exception:
                 logging.exception("Exception testing camera group %s", port_path)
 
-    # Second pass to confirm survivors without killing holders.
+    # Confirmation must be non-destructive: another failure drops the candidate.
     if survivors:
         logging.info("Round 2 - Double-check (no pre-kill)...")
         confirmed: list[CameraIdentity] = []
@@ -1040,33 +955,21 @@ def find_working_camera_identities(by_path_dir: Optional[str] = None) -> list[Ca
     return survivors
 
 
-# ============================================================
-# SLOT ASSIGNMENT (DETERMINISTIC TILE BINDING)
-# ============================================================
+# Deterministic slot assignment
 #
-# Pure functions: no Qt, no cv2, no I/O other than logging. SAFETY RULE
-# that drives the precedence below: a pinned slot must NEVER surface a
-# different camera than its pin. An honest empty/reserved tile beats
-# showing the wrong camera in a safety-relevant tile, so a pin that
-# matches nothing stays None and is never backfilled by another camera.
+# These helpers have no capture or Qt side effects. An unmatched pinned slot
+# remains a placeholder: showing no camera is safer than showing the wrong
+# physical camera in a safety-relevant slot.
 
 
 def _pin_matches(pin: str, port_path: str) -> bool:
-    """Shared predicate: does `pin` (a [slots] config value) match `port_path`?
+    """Return whether a configured pin identifies this USB port path.
 
-    `index:N` pins are the fallback pseudo-key form (used when there is
-    no /dev/v4l/by-path) and must match `port_path` EXACTLY -- otherwise
-    pin "index:1" would wrongly claim "index:10" via substring matching.
-
-    Any other pin (the documented use is the stable "usb-0:1.3" port tail)
-    must match at component boundaries, not as a plain substring: the match
-    must end at ':' (the USB interface suffix, e.g. "...usb-0:1.3:1.0") or
-    at end-of-string, and must not start in the middle of a digit/letter
-    run OR right after '.' (the inside of a dotted port number). Otherwise
-    pin "usb-0:1.1" would also claim "usb-0:1.10" (10+ port hub) or
-    "usb-0:1.1.2" (chained hub), and a bare-fragment pin "1.1" would claim
-    "usb-0:2.1.1" (a different hub's port 1) -- the WRONG camera in a
-    pinned, safety-relevant tile.
+    ``index:N`` fallbacks require exact equality so ``index:1`` cannot claim
+    ``index:10``. By-path pins may be stable port tails such as
+    ``usb-0:1.3``, but matches must start and end at component boundaries.
+    This prevents a pin for port ``1.1`` from claiming ``1.10``, a nested
+    ``1.1.2`` port, or the trailing fragment of another dotted port path.
     """
     if pin.startswith("index:"):
         return pin == port_path
@@ -1083,23 +986,18 @@ def assign_slots(
     slot_count: int,
     pins: dict[int, str],
 ) -> list[Optional[CameraIdentity]]:
-    """Deterministically map discovered identities to `slot_count` tiles.
+    """Map startup identities to a fixed-length list of camera slots.
 
-    Returns exactly `slot_count` entries. Precedence:
-      1. Pinned slots claim first, ascending slot index. Each pin claims
-         the first unclaimed identity whose port_path matches the pin
-         (see `_pin_matches`). If several identities match one pin, the
-         natural-sort-first one (by port_path) wins and a WARNING
-         ("ambiguous pin") is logged.
-      2. Remaining identities (in their given order -- discovery order is
-         already sorted) fill the remaining UNPINNED slots, ascending.
-      3. A pinned slot whose pin matched nothing stays None -- NEVER
-         backfilled by an unpinned camera (safety rule above).
-      4. Identities left over once all slots are filled/reserved are
-         dropped, with an INFO log.
+    Pinned slots claim matching identities first in slot order. If one pin
+    matches multiple identities, natural USB port path order selects the winner
+    and a warning records the ambiguity. Remaining identities retain their
+    input order while filling unpinned slots. Unmatched pinned slots stay
+    ``None`` placeholders, and identities beyond available slots are logged and
+    omitted.
     """
     slots: list[Optional[CameraIdentity]] = [None] * slot_count
-    claimed: set[int] = set()  # id() of identities already placed in a slot
+    # Track object identity so one discovered record cannot occupy two slots.
+    claimed: set[int] = set()
 
     for slot_index in sorted(pins):
         if not (0 <= slot_index < slot_count):
@@ -1142,18 +1040,12 @@ def choose_slot_for_identity(
     pins: dict[int, str],
     last_slot_by_port: dict[str, int],
 ) -> Optional[int]:
-    """Pick a slot for one identity during rescan/reattach (pure, no side effects).
+    """Choose a free slot for one discovered identity without mutating the inputs.
 
-    Precedence, first hit wins:
-      1. A free PINNED slot whose pin matches `identity.port_path` (lowest
-         index if several match).
-      2. `last_slot_by_port[identity.port_path]`, if that slot is free AND
-         is either unpinned or its pin still matches this identity -- a
-         replug returns to its previous tile, but never steals a slot now
-         reserved for a different port.
-      3. The lowest free UNPINNED slot.
-      4. None -- the only free slots are pinned to other ports, so the
-         camera waits rather than stealing a reserved tile.
+    A matching pinned slot has priority, followed by the identity's remembered
+    slot when it is still compatible, then the lowest unpinned slot. ``None``
+    means every free slot has a nonmatching reservation, so the identity waits
+    for a later rescan instead of taking a reserved slot.
     """
     free_set = set(free_slot_indexes)
 
@@ -1179,11 +1071,10 @@ def choose_slot_for_identity(
 
 
 def find_working_cameras() -> list[int]:
-    """Return a list of camera indices that can capture frames.
+    """Return capture-node indexes for callers that do not need identities.
 
-    Delegates to find_working_camera_identities() (by-path aware, dedupes
-    UVC metadata nodes from the real capture node per physical port) and
-    returns just the resolved /dev/videoN indices, for callers that don't
-    need full CameraIdentity objects.
+    By-path discovery groups sibling UVC nodes and returns the first working
+    capture node from each USB port path. Numeric fallback nodes cannot be
+    grouped by physical camera, so each working orphan is returned independently.
     """
     return [identity.index for identity in find_working_camera_identities()]

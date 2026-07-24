@@ -1,9 +1,4 @@
-"""
-Configuration management for Camera Dashboard.
-
-Handles loading config from INI files, environment variables,
-and provides default values for all settings.
-"""
+"""Configuration defaults, INI parsing, and logging setup for the dashboard."""
 
 from __future__ import annotations
 
@@ -16,15 +11,11 @@ from logging.handlers import RotatingFileHandler
 from typing import Any, Callable, NamedTuple, Optional
 
 
-# ============================================================
-# DEBUG FLAGS
-# ============================================================
+# Diagnostics
 UI_FPS_LOGGING = False
 
 
-# ============================================================
-# LOGGING DEFAULTS
-# ============================================================
+# Logging
 LOG_LEVEL = "INFO"
 LOG_FILE = "./logs/camera_dashboard.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -35,9 +26,7 @@ CONFIG_PATH = os.environ.get("CAMERA_DASHBOARD_CONFIG", "./config.ini")
 LOG_FILE_ENV = os.environ.get("CAMERA_DASHBOARD_LOG_FILE")
 
 
-# ============================================================
-# PERFORMANCE + RECOVERY TUNING
-# ============================================================
+# Performance and capture recovery
 DYNAMIC_FPS_ENABLED = True
 PERF_CHECK_INTERVAL_MS = 2000
 MIN_DYNAMIC_FPS = 10
@@ -48,36 +37,29 @@ CPU_TEMP_THRESHOLD_C = 75.0
 STRESS_HOLD_COUNT = 3
 RECOVER_HOLD_COUNT = 3
 
-# Stale frame detection + bounded auto-restart policy.
+# A stale capture worker may restart only within this rate-limited budget.
 STALE_FRAME_TIMEOUT_SEC = 1.5
 RESTART_COOLDOWN_SEC = 5.0
 MAX_RESTARTS_PER_WINDOW = 3
 RESTART_WINDOW_SEC = 30.0
 
-# First-frame watchdog: how long a freshly (re)attached worker may go
-# without ever delivering a frame before the widget treats it as wedged
-# and calls _restart_capture_if_stale() itself (covers a hang in the
-# worker's first grab(), which its own reconnect loop does not see).
+# Unlike the stale-frame timeout, this catches a capture worker blocked before
+# its first frame, when no previous frame timestamp exists.
 FIRST_FRAME_TIMEOUT_SEC = 10.0
 
 
-# ============================================================
-# CAMERA RESCAN (HOT-PLUG SUPPORT)
-# ============================================================
+# Hot-plug discovery
 RESCAN_INTERVAL_MS = 15000
 FAILED_CAMERA_COOLDOWN_SEC = 30.0
 
 
-# ============================================================
-# APP SETTINGS
-# ============================================================
+# Dashboard
 CAMERA_SLOT_COUNT = 3
 HEALTH_LOG_INTERVAL_SEC = 30.0
 KILL_DEVICE_HOLDERS = True
 
-# Optional [slots] pinning: {slot_index: pin_substring}. Parsed by
-# _parse_slot_pins(); consumed by core.camera's assign_slots /
-# choose_slot_for_identity. Empty when no [slots] section is configured.
+# Maps zero-based slot indexes to configured USB port path match strings.
+# Unmatched pins remain reserved rather than accepting another camera.
 SLOT_PINS: dict[int, str] = {}
 
 PROFILE_CAPTURE_WIDTH = 640
@@ -85,19 +67,15 @@ PROFILE_CAPTURE_HEIGHT = 480
 PROFILE_CAPTURE_FPS = 25
 PROFILE_UI_FPS = 20
 
-# GStreamer pipeline support
+# Prefer the low-latency GStreamer path when the OpenCV build supports it.
 USE_GSTREAMER = True
 
-# Render overhead compensation (ms)
+# Milliseconds subtracted from the UI timer interval to offset render work.
 RENDER_OVERHEAD_MS = 3
 
 
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
 def _as_bool(value: Any, default: bool) -> bool:
-    """Parse a value as boolean."""
+    """Return a permissively parsed boolean, or ``default`` if invalid."""
     if value is None:
         return default
     if isinstance(value, bool):
@@ -116,7 +94,7 @@ def _as_int(
     min_value: Optional[int] = None,
     max_value: Optional[int] = None,
 ) -> int:
-    """Parse a value as integer with optional bounds."""
+    """Return a bounded integer, or ``default`` if conversion fails."""
     try:
         if value is None:
             return default
@@ -136,7 +114,7 @@ def _as_float(
     min_value: Optional[float] = None,
     max_value: Optional[float] = None,
 ) -> float:
-    """Parse a value as float with optional bounds."""
+    """Return a bounded float, or ``default`` if conversion fails."""
     try:
         if value is None:
             return default
@@ -151,16 +129,12 @@ def _as_float(
 
 
 def _parse_slot_pins(parser: configparser.ConfigParser) -> dict[int, str]:
-    """Parse the optional [slots] pinning section into {slot_index: pin}.
+    """Parse ``[slots]`` into a zero-based ``{slot_index: port_match}`` map.
 
-    Keys must fullmatch `slot(\\d+)` with the index in
-    [0, CAMERA_SLOT_COUNT - 1] (the already-applied value: call this
-    AFTER the table loop has finalized CAMERA_SLOT_COUNT). Values are
-    stripped and must be non-empty. Invalid key format, an out-of-range
-    index, or an empty value are skipped with a warning. Two different
-    slots pinned to the identical value are both kept (matching is
-    resolved at assignment time), but logged since only one can actually
-    match a camera.
+    Valid keys use ``slotN`` and must fit the already-applied
+    ``CAMERA_SLOT_COUNT``. Invalid or empty entries are ignored with a warning.
+    Duplicate match strings are retained because assignment resolves conflicts,
+    but they are warned about because one camera cannot occupy both slots.
     """
     pins: dict[int, str] = {}
     if not parser.has_section("slots"):
@@ -196,7 +170,7 @@ def _parse_slot_pins(parser: configparser.ConfigParser) -> dict[int, str]:
 
 
 def load_config(path: Optional[str] = None) -> configparser.ConfigParser:
-    """Load configuration from INI file."""
+    """Read an INI file, returning an empty parser when the path is absent."""
     if path is None:
         path = CONFIG_PATH
     parser = configparser.ConfigParser()
@@ -206,20 +180,12 @@ def load_config(path: Optional[str] = None) -> configparser.ConfigParser:
 
 
 class _ConfigEntry(NamedTuple):
-    """One row of the apply_config table:
+    """Describe one INI value that maps to a module-level setting.
 
-    (section, key, global_name, converter, default, min_value, max_value)
-
-    - section/key: where to read the value from the INI parser.
-    - global_name: module-level global the parsed value is assigned to.
-    - converter: _as_bool / _as_int / _as_float.
-    - default: the global's defined default; used as a safety-net fallback
-      if the global were ever missing (it shouldn't be - normal operation
-      reads the global's *current* value, mirroring the original code's
-      self-referential `fallback=GLOBAL` / `default=GLOBAL` pattern so
-      re-applying config is sticky rather than resetting on a missing key).
-    - min_value/max_value: bounds forwarded to _as_int/_as_float; unused
-      (and not passed) for _as_bool entries, which take no bounds.
+    ``default`` is only a defensive fallback if ``global_name`` is missing.
+    Normally, conversion falls back to the setting's current value, so applying
+    a second parser does not reset settings whose keys are absent. Bounds apply
+    only to numeric converters.
     """
 
     section: str
@@ -231,10 +197,8 @@ class _ConfigEntry(NamedTuple):
     max_value: Optional[float] = None
 
 
-# Every config key that follows the read -> convert (+ optional bounds) ->
-# assign-to-global pattern. Keys with special handling (raw string
-# passthrough for LOG_LEVEL/LOG_FILE, the LOG_FILE_ENV override) are NOT
-# listed here and stay as explicit code in apply_config below.
+# String settings and environment overrides stay in ``apply_config`` because
+# this table is limited to values handled by the shared converters.
 _CONFIG_TABLE: tuple[_ConfigEntry, ...] = (
     _ConfigEntry("logging", "max_bytes", "LOG_MAX_BYTES", _as_int, LOG_MAX_BYTES, min_value=1024),
     _ConfigEntry("logging", "backup_count", "LOG_BACKUP_COUNT", _as_int, LOG_BACKUP_COUNT, min_value=1),
@@ -271,10 +235,9 @@ _CONFIG_TABLE: tuple[_ConfigEntry, ...] = (
 
 
 def apply_config(parser: configparser.ConfigParser) -> None:
-    """Apply loaded configuration to global settings."""
-    # LOG_LEVEL/LOG_FILE are raw string passthroughs (no converter), so they
-    # stay outside the table and need the `global` statement for direct
-    # assignment. The table loop below assigns via globals()[...] instead.
+    """Update module settings from ``parser`` while preserving missing values."""
+    # These settings are assigned directly; table-backed settings are updated
+    # through ``globals()`` using each entry's ``global_name``.
     global LOG_LEVEL, LOG_FILE, SLOT_PINS
 
     if parser.has_section("logging"):
@@ -294,9 +257,8 @@ def apply_config(parser: configparser.ConfigParser) -> None:
             )
         globals()[entry.global_name] = value
 
-    # SLOT_PINS is a custom parser (not a converter table row) that must
-    # run AFTER the loop above so CAMERA_SLOT_COUNT is final; always
-    # assigned as a fresh dict, never mutated in place.
+    # Parse pins after ``CAMERA_SLOT_COUNT`` and replace the mapping atomically
+    # so callers retaining the previous dictionary do not observe mutation.
     SLOT_PINS = _parse_slot_pins(parser)
 
     if LOG_FILE_ENV:
@@ -304,7 +266,7 @@ def apply_config(parser: configparser.ConfigParser) -> None:
 
 
 def configure_logging() -> None:
-    """Set up logging handlers based on configuration."""
+    """Replace root handlers with the configured rotating-file/stdout sinks."""
     level_name = (LOG_LEVEL or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
@@ -337,12 +299,10 @@ def configure_logging() -> None:
 
 
 def choose_profile() -> tuple[int, int, int, int]:
-    """Pick capture resolution and FPS from configuration.
+    """Return ``(width, height, capture_fps, ui_fps)`` without runtime scaling.
 
-    Resolution and FPS are exactly as configured in config.ini.
-    Dynamic FPS feature will adjust up/down at runtime based on CPU load.
-
-    Returns: (width, height, capture_fps, ui_fps)
+    When dynamic FPS is enabled and its stress or recovery conditions are met,
+    the monitor may adjust live workers later. This function always exposes the
+    configured baseline profile.
     """
-    # Exact values from config - no scaling
     return (PROFILE_CAPTURE_WIDTH, PROFILE_CAPTURE_HEIGHT, PROFILE_CAPTURE_FPS, PROFILE_UI_FPS)
