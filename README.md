@@ -24,7 +24,7 @@ The software has been field-deployed for daily blind-spot monitoring use on carg
 - Stale-frame detection and bounded capture-worker restart attempts.
 - Optional OpenCV GStreamer capture path with V4L2 fallback.
 - Dynamic software FPS throttling based on CPU load and thermal state.
-- INI configuration with environment variable overrides.
+- INI configuration; the config and log file paths can be overridden with environment variables.
 - User systemd service and desktop shortcut for dedicated installations.
 
 ## How It Works
@@ -91,7 +91,7 @@ Note: the current brightness code clamps the effective minimum multiplier to `0.
 
 ## Capture Pipeline
 
-Capture is implemented with OpenCV. When `camera.use_gstreamer = true`, OpenCV has GStreamer support, the host is Linux, and the camera is an integer device index, the app first tries this pipeline:
+Capture is implemented with OpenCV. When `camera.use_gstreamer = true`, OpenCV has GStreamer support, the host is Linux, and the camera source is a local device — an integer index or a `/dev/` path (port-identified cameras open through their resolved `/dev/videoN` node) — the app first tries this pipeline:
 
 ```text
 v4l2src device=/dev/videoN !
@@ -199,6 +199,8 @@ systemctl --user disable camera-dashboard
 
 The service uses `Restart=always` and `RestartSec=5`, so systemd restarts the app about 5 seconds after it exits or crashes. `StartLimitIntervalSec=0` disables systemd's crash-loop lockout, so it keeps retrying indefinitely rather than giving up after repeated failures. `KillSignal=SIGTERM` is caught by the app for a clean Qt shutdown on `systemctl stop`/reboot, same as `Ctrl+C`.
 
+Before each start, the service's `ExecStartPre` steps kill processes holding `/dev/video*`, stop known camera daemons, and wait briefly for the display session, so a stale device holder or slow desktop startup cannot block the dashboard.
+
 ## Configuration
 
 The app reads `config.ini` by default.
@@ -260,6 +262,8 @@ log_interval_sec = 60
 
 `profile.capture_fps` and `profile.ui_fps` are base values used for all camera counts. They are not scaled by camera count; dynamic FPS may adjust them at runtime under stress.
 
+`camera.kill_device_holders = true` lets startup probing terminate other processes that hold a camera device (found via `lsof`/`fuser`) when the device will not open. This suits a dedicated dashboard host that owns its cameras; set it to `false` on a shared desktop. Background rescans never kill holders.
+
 ## Project Layout
 
 ```text
@@ -277,18 +281,25 @@ blindspot_monitoring/
 ├── tests/
 ├── config.ini
 ├── install.sh
+├── pytest.ini
 ├── requirements.txt
-└── test.sh
+├── test.sh
+└── LICENSE.MIT
 ```
 
 ## Development
 
-The repository includes unit tests and a helper script. The helper script expects a `.venv`, but the automated installer does not create one.
+The repository includes a unit test suite. `./test.sh` runs it from a repository-local `.venv`, installing `pytest`/`pytest-qt` into it if they are missing. The automated installer does not create that `.venv`; set it up once with system site packages so it can see distro-provided PyQt6/OpenCV:
 
 ```bash
 python3 -m venv --system-site-packages .venv
+./test.sh
+```
+
+Or run pytest directly from the activated environment:
+
+```bash
 source .venv/bin/activate
-pip install pytest pytest-qt
 python3 -m pytest tests/
 ```
 
