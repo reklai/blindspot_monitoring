@@ -224,6 +224,20 @@ def safe_cleanup(widgets: list[CameraWidget], cleaned_flag: list[bool]) -> None:
             pass
 
 
+def _quiesce_rescan_executor(executor: ThreadPoolExecutor) -> None:
+    """Join in-flight probes and drop queued ones before a restart exec.
+
+    A probe thread opens ``/dev/video*`` descriptors, so one that survives the
+    pre-exec close-on-exec scan can leak an inheritable descriptor into the
+    replacement process under the same PID, where holder cleanup cannot reach
+    it. The join bounds the restart by at most one probe batch tail.
+    """
+    try:
+        executor.shutdown(wait=True, cancel_futures=True)
+    except Exception:
+        pass
+
+
 # Set by _handle_shutdown_signal; read by main()'s startup checkpoints.
 # QApplication.quit() is a documented no-op before app.exec() starts, so a
 # signal delivered during the multi-second startup camera discovery would
@@ -339,7 +353,13 @@ def main() -> None:
     def restart_app():
         """Restart the entire process (used by settings tile)."""
         logging.info("Restart requested from settings.")
+        # ``stop_timers`` and ``rescan_executor`` bind later in this scope; the
+        # settings tile cannot trigger this closure before the event loop runs.
+        stop_timers()
         safe_cleanup(camera_widgets, cleaned_flag)
+        # A live probe could open a camera descriptor after the scan below, so
+        # the executor must be idle before descriptors are enumerated.
+        _quiesce_rescan_executor(rescan_executor)
         # A capture fd leaked by an unkillable worker has no O_CLOEXEC and
         # would survive execv with our SAME pid, keeping the device claimed
         # in the restarted app with no way to reclaim it there

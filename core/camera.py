@@ -132,6 +132,9 @@ class CaptureWorker(QThread):
         self._reconnect_backoff = 1.0
         self._cap: Optional[cv2.VideoCapture] = None
         self._last_emit = 0.0
+        # Emission deadline owned exclusively by the ``run`` thread; ``_last_emit``
+        # stays the health-check timestamp of the last successful emission.
+        self._next_emit_due = 0.0
         self._target_fps = target_fps
         # Upper bound on the emit rate (render rate); None means unbounded.
         self._ui_fps = float(ui_fps) if (ui_fps and ui_fps > 0) else None
@@ -206,13 +209,11 @@ class CaptureWorker(QThread):
                     continue
 
                 now = time.time()
-                with self._fps_lock:
-                    emit_interval = self._emit_interval
                 # Throttle BEFORE retrieve(): frames the throttle drops never
                 # get decoded. On the V4L2 MJPG fallback path retrieve() runs
                 # the JPEG decode, so this skips that work for dropped frames.
                 # (GStreamer decodes in-pipeline regardless -- no effect there.)
-                if now - self._last_emit >= emit_interval:
+                if self._emit_due(now):
                     ret, frame = self._cap.retrieve()
                     if not ret or frame is None:
                         logging.debug(
@@ -434,6 +435,26 @@ class CaptureWorker(QThread):
                     pass
         except Exception:
             logging.exception("Failed to open capture %s", self.stream_link)
+
+    def _emit_due(self, now: float) -> bool:
+        """Decide whether to emit the frame grabbed at ``now``.
+
+        The deadline advances by whole intervals so credit past a deadline
+        carries into the next period; resetting the phase to the emission
+        time would quantize non-divisor capture/UI rate pairs down an entire
+        frame period. A deadline more than one interval behind ``now`` means
+        the stream stalled, so the cadence restarts from ``now`` rather than
+        emitting a burst against the banked backlog.
+        """
+        with self._fps_lock:
+            emit_interval = self._emit_interval
+        if now < self._next_emit_due:
+            return False
+        deadline = self._next_emit_due + emit_interval
+        if deadline < now:
+            deadline = now + emit_interval
+        self._next_emit_due = deadline
+        return True
 
     def _recompute_emit_interval_locked(self) -> None:
         """Recompute `_emit_interval` from `_device_fps` bounded by `_ui_fps`.

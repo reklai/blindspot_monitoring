@@ -653,3 +653,64 @@ class TestRunLoopEmit:
         assert cap.grab.call_count == 4
         assert cap.retrieve.call_count == 1
         assert len(emitted) == 1
+
+
+class TestEmitThrottle:
+    """Software emission throttling preserves phase across skipped frames.
+
+    The capture loop sees one decision per grabbed frame. When the capture and
+    UI rates are not exact divisors, discarding the credit past each deadline
+    quantizes the emit rate down an entire frame period, so these tests pin the
+    long-run average rather than individual frame choices.
+    """
+
+    def _make_worker(self, target_fps: float, ui_fps: float):
+        from core.camera import CaptureWorker
+
+        return CaptureWorker(
+            stream_link=0, parent=None, target_fps=target_fps, ui_fps=ui_fps
+        )
+
+    def test_non_divisor_rates_average_the_ui_bound(self):
+        """25 FPS frames against a 20 FPS bound emit ~20 FPS, not every other frame."""
+        worker = self._make_worker(target_fps=25.0, ui_fps=20.0)
+        assert worker._emit_interval == pytest.approx(0.05)
+
+        base = 1_000_000.0
+        emitted = sum(worker._emit_due(base + i * 0.04) for i in range(50))
+
+        # 2 simulated seconds at 20 FPS; phase-resetting logic yields only 25.
+        assert 38 <= emitted <= 42
+
+    def test_frames_slower_than_interval_emit_every_frame(self):
+        """Frames arriving well past each deadline are never throttled."""
+        worker = self._make_worker(target_fps=25.0, ui_fps=20.0)
+
+        base = 1_000_000.0
+        emitted = sum(worker._emit_due(base + i * 0.1) for i in range(20))
+
+        assert emitted == 20
+
+    def test_stall_does_not_bank_catchup_emissions(self):
+        """A long offline gap restarts the cadence instead of bursting.
+
+        Advancing a deadline by fixed intervals alone would owe hundreds of
+        emissions after a stall and pass every frame through until repaid.
+        """
+        worker = self._make_worker(target_fps=25.0, ui_fps=20.0)
+
+        base = 1_000_000.0
+        for i in range(5):
+            worker._emit_due(base + i * 0.04)
+
+        resume = base + 10.0
+        assert worker._emit_due(resume) is True
+        # The very next frame is inside the restarted interval.
+        assert worker._emit_due(resume + 0.04) is False
+        emitted = 1 + sum(
+            worker._emit_due(resume + 0.04 * i) for i in range(2, 26)
+        )
+
+        # 1 simulated second after resume stays at the 20 FPS average; an
+        # unclamped deadline would emit all 25 frames.
+        assert emitted <= 22

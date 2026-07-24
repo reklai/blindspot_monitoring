@@ -406,3 +406,48 @@ class TestPlanRescanAttachments:
 
         assert attachments == []
         assert PORT_A not in failed_ports
+
+
+class TestQuiesceRescanExecutor:
+    """Restart must leave no probe thread able to open a camera fd.
+
+    The settings-tile restart marks open camera descriptors close-on-exec in
+    a single scan before ``execv``. A probe still running in the rescan
+    executor could open ``/dev/video*`` after that scan, and the inherited
+    descriptor would be unrecoverable because holder cleanup excludes the
+    process's own PID. Quiescing must therefore join in-flight probes and
+    drop queued ones before the scan runs.
+    """
+
+    def test_joins_inflight_probe_before_returning(self):
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        from main import _quiesce_rescan_executor
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        finished = threading.Event()
+
+        def slow_probe():
+            time.sleep(0.2)
+            finished.set()
+
+        executor.submit(slow_probe)
+        _quiesce_rescan_executor(executor)
+
+        assert finished.is_set()
+
+    def test_drops_queued_probe_batch_instead_of_running_it(self):
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        from main import _quiesce_rescan_executor
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        executor.submit(time.sleep, 0.2)
+        queued = executor.submit(time.sleep, 0.2)
+
+        _quiesce_rescan_executor(executor)
+
+        assert queued.cancelled()
