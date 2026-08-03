@@ -146,6 +146,15 @@ Skip package update/upgrade if needed:
 sudo ./install.sh --skip-update
 ```
 
+To disable onboard Wi-Fi and Bluetooth on a Raspberry Pi (optional, separate from install):
+
+```bash
+chmod +x disable.sh
+sudo ./disable.sh
+```
+
+This writes `dtoverlay=disable-wifi` and `dtoverlay=disable-bt` to `/boot/firmware/config.txt`. Reboot for the change to take effect.
+
 ### Manual Run
 
 After installing the required system dependencies:
@@ -247,6 +256,7 @@ blindspot_monitoring/
 ├── tests/
 ├── config.ini
 ├── install.sh
+├── disable.sh
 ├── requirements.txt
 └── test.sh
 ```
