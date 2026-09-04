@@ -191,3 +191,23 @@ class TestDynamicFps:
             step.assert_not_called()
             dashboard.adjust_fps()
             step.assert_called_once_with(-1)
+
+
+@pytest.mark.usefixtures("qapp")
+class TestShutdown:
+    def test_rescan_result_after_shutdown_is_dropped(self, dashboard):
+        received = []
+        dashboard._rescan_finished.connect(received.append)
+        dashboard.shutdown()
+
+        class DoneFuture:
+            def result(self):
+                return [(1, 1)]
+
+        dashboard._on_rescan_done(DoneFuture())
+        assert received == []
+
+    def test_shutdown_is_idempotent_and_stops_timers(self, dashboard):
+        dashboard.shutdown()
+        dashboard.shutdown()
+        assert not dashboard.rescan_timer.isActive()

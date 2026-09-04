@@ -36,6 +36,11 @@ PLACEHOLDER_DISCONNECTED = "DISCONNECTED"
 PLACEHOLDER_CONNECTING = "CONNECTING..."
 PLACEHOLDER_STYLE = "color: #bbbbbb; font-size: 24px;"
 
+# Workers that ignored stop() are parked here for the life of the process.
+# Deleting a running QThread aborts the process, so they must outlive their
+# tile; keeping a reference is the only safe thing left to do with them.
+_parked_workers: list[CaptureWorker] = []
+
 
 class FullscreenOverlay(QtWidgets.QWidget):
     """Frameless top-level window that shows one tile's video full screen."""
@@ -365,15 +370,22 @@ class CameraWidget(QtWidgets.QWidget):
     def _retire_worker(self, worker: CaptureWorker) -> bool:
         """Stop a worker and release it. Returns False if it would not stop.
 
-        A worker that ignores stop() is left connected and undeleted: it may
-        still be blocked in the driver and could resume delivering frames,
-        and deleting a running QThread aborts the process.
+        A worker that ignores stop() is left connected (it may still be
+        blocked in the driver and could resume delivering frames) but is
+        detached from this tile and parked, because deleting a running
+        QThread aborts the process.
         """
         try:
             worker.stop()
         except Exception:
             logging.exception("Error stopping worker for %s", self.camera_stream_link)
         if worker.isRunning():
+            try:
+                worker.setParent(None)
+            except RuntimeError:
+                pass
+            if worker not in _parked_workers:
+                _parked_workers.append(worker)
             return False
         for signal, slot in (
             (worker.frame_ready, self.on_frame),

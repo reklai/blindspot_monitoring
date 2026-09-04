@@ -481,3 +481,24 @@ class TestSettingsControls:
         tile.set_night_mode_button_label(True)
         assert controls.night_mode_button.text() == "Nightmode: On"
         tile.cleanup()
+
+
+class TestUnstoppableWorker:
+    @pytest.mark.requires_display
+    def test_worker_that_will_not_stop_is_parked_not_deleted(self, qapp):
+        from unittest.mock import MagicMock, patch
+        from ui import widgets
+        from ui.widgets import CameraWidget
+        stuck = MagicMock()
+        stuck.isRunning.return_value = True
+        with patch("ui.widgets.CaptureWorker", return_value=stuck):
+            tile = CameraWidget(320, 240, stream_link=3, enable_capture=True, target_fps=20)
+            assert tile._retire_worker(stuck) is False
+        stuck.stop.assert_called_once()
+        stuck.setParent.assert_called_once_with(None)
+        stuck.deleteLater.assert_not_called()
+        stuck.frame_ready.disconnect.assert_not_called()
+        assert stuck in widgets._parked_workers
+        widgets._parked_workers.remove(stuck)
+        tile.worker = None
+        tile.cleanup()

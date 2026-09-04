@@ -377,6 +377,8 @@ class Dashboard(QtCore.QObject):
         except Exception:
             logging.exception("Rescan worker failed")
             results = []
+        if self._shutting_down:
+            return  # the receiver may be mid-teardown; nothing to attach to
         self._rescan_finished.emit(results)
 
     @pyqtSlot(object)
