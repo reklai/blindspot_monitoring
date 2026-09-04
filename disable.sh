@@ -1,37 +1,43 @@
 #!/usr/bin/env bash
+#
+# Disable onboard Wi-Fi and Bluetooth on a Raspberry Pi.
+#
+#   sudo ./disable.sh
+#
+# Adds the device-tree overlays that leave both radios unpowered from boot.
+# On a vehicle unit that is wired or offline they only draw power and add
+# heat; on a unit that needs Wi-Fi for maintenance, do not run this. Takes
+# effect after a reboot, which this script does not do. Safe to re-run: a
+# line that is already present is not added twice.
+
 set -euo pipefail
 
-# Disable onboard Wi-Fi and Bluetooth on Raspberry Pi (device-tree overlays).
-# Takes effect after reboot.
-#
-#   chmod +x disable.sh
-#   sudo ./disable.sh
+CONFIG_TXT="/boot/firmware/config.txt"
 
 if [[ "$EUID" -ne 0 ]]; then
-  echo "This script must be run with sudo."
-  echo "Usage: sudo ./disable.sh"
+  echo "This script must be run with sudo." >&2
+  echo "Usage: sudo ./disable.sh" >&2
   exit 1
 fi
 
-CONFIG_TXT="/boot/firmware/config.txt"
 if [[ ! -f "$CONFIG_TXT" ]]; then
-  echo "Error: $CONFIG_TXT not found (is this a Raspberry Pi with firmware on /boot/firmware?)"
+  echo "Error: $CONFIG_TXT not found (is this a Raspberry Pi with firmware on /boot/firmware?)" >&2
   exit 1
 fi
 
-if ! grep -q "^dtoverlay=disable-wifi$" "$CONFIG_TXT"; then
-  echo "dtoverlay=disable-wifi" >> "$CONFIG_TXT"
-  echo "Added dtoverlay=disable-wifi"
-else
-  echo "dtoverlay=disable-wifi already present"
-fi
+# Append LINE to FILE unless an identical line is already there.
+ensure_line() {
+  local file="$1" line="$2"
+  if grep -qxF "$line" "$file"; then
+    echo "$line already present"
+  else
+    echo "$line" >> "$file"
+    echo "Added $line"
+  fi
+}
 
-if ! grep -q "^dtoverlay=disable-bt$" "$CONFIG_TXT"; then
-  echo "dtoverlay=disable-bt" >> "$CONFIG_TXT"
-  echo "Added dtoverlay=disable-bt"
-else
-  echo "dtoverlay=disable-bt already present"
-fi
+ensure_line "$CONFIG_TXT" "dtoverlay=disable-wifi"
+ensure_line "$CONFIG_TXT" "dtoverlay=disable-bt"
 
 echo
 echo "Onboard Wi-Fi and Bluetooth will be disabled after reboot."

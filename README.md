@@ -115,23 +115,38 @@ sudo ./install.sh
 
 The installer:
 
-- Requires `sudo`.
+- Requires `sudo`; installs for the user who invoked it.
+- On Raspberry Pi systems, edits `/boot/firmware/config.txt` (USB current, KMS overlay) and the EEPROM PSU limit. Both edits are idempotent.
 - Installs system packages with `apt`.
 - Uses system Python packages rather than creating `.venv`.
-- Creates `logs/`.
-- Creates `~/Desktop/CameraDashboard.desktop`.
-- Installs and enables a user service named `camera-dashboard.service`.
-- Enables linger for the invoking user.
-- Kills processes currently using `/dev/video*`.
-- Stops/disables common camera-holding services such as ZoneMinder, Motion, and mjpeg-streamer.
-- On Raspberry Pi systems, may edit `/boot/firmware/config.txt` and EEPROM power settings.
+- Kills processes currently using `/dev/video*` and stops/disables common camera-holding services such as ZoneMinder, Motion, and mjpeg-streamer.
+- Adds the user to the `video` group.
+- Creates `logs/` and `~/Desktop/CameraDashboard.desktop`.
+- Runs `setup-service.sh` to install and enable the user service (see below).
+- Opens camera 0 once as a smoke test.
 - Reboots the machine at the end.
 
-Skip package update/upgrade if needed:
+Options:
 
 ```bash
-sudo ./install.sh --skip-update
+sudo ./install.sh --skip-update    # skip apt update/upgrade
+sudo ./install.sh --no-service     # everything except the systemd service
+sudo ./install.sh --no-reboot      # do not reboot at the end
 ```
+
+### Systemd Service Only
+
+The service setup is its own script, so it can be redone without a full reinstall, for example after moving the checkout or changing the user:
+
+```bash
+sudo ./setup-service.sh                 # install for the invoking user
+./setup-service.sh                      # as the target user, without sudo
+sudo ./setup-service.sh --user alice    # install for another user
+./setup-service.sh --print-unit         # show the unit file it would write
+sudo ./setup-service.sh --remove        # stop, disable, and delete the unit
+```
+
+It writes `~/.config/systemd/user/camera-dashboard.service`, enables linger for the user (root only; without it the service starts at login rather than at boot), reloads the user manager, and enables the unit.
 
 To disable onboard Wi-Fi and Bluetooth on a Raspberry Pi (optional, separate from install):
 
@@ -247,6 +262,7 @@ blindspot_monitoring/
 ├── tests/
 ├── config.ini
 ├── install.sh
+├── setup-service.sh
 ├── disable.sh
 ├── requirements.txt
 └── test.sh
@@ -258,6 +274,13 @@ The repository includes unit tests and a helper script. The helper script expect
 
 ```bash
 python3 -m venv --system-site-packages .venv
+./test.sh                 # installs pytest and pytest-qt into the venv on first run
+./test.sh -k config       # pytest arguments pass through
+```
+
+Or run pytest directly after activating the venv:
+
+```bash
 source .venv/bin/activate
 pip install pytest pytest-qt
 python3 -m pytest tests/
