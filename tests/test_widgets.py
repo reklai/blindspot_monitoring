@@ -338,3 +338,146 @@ class TestDynamicFPS:
         assert widget.ui_render_fps >= config.MIN_DYNAMIC_UI_FPS
         
         widget.cleanup()
+
+
+class TestRenderingRegressions:
+    """Behaviours pinned after the render-path rewrite."""
+
+    def _tile(self, qapp):
+        from ui.widgets import CameraWidget
+        tile = CameraWidget(320, 240, stream_link=None, enable_capture=False)
+        tile.resize(320, 240)
+        tile.show()
+        return tile
+
+    @pytest.mark.requires_display
+    def test_rerender_does_not_compound_brightness(self, qapp):
+        import numpy as np
+        tile = self._tile(qapp)
+        tile.set_brightness(1.5)
+        frame = np.full((48, 64, 3), 100, np.uint8)
+        tile.on_frame(frame)
+        tile._render_latest_frame()
+        first = tile.video_label.pixmap().toImage().pixelColor(5, 5).red()
+        tile.resize(200, 150)  # forces a re-render of the same frame
+        qapp.processEvents()
+        tile._render_latest_frame()
+        second = tile.video_label.pixmap().toImage().pixelColor(5, 5).red()
+        assert first == second == 150
+        assert int(frame[0, 0, 0]) == 100, "source frame must be untouched"
+        tile.cleanup()
+
+    @pytest.mark.requires_display
+    def test_night_mode_repaints_current_frame(self, qapp):
+        import numpy as np
+        tile = self._tile(qapp)
+        tile.on_frame(np.full((48, 64, 3), 100, np.uint8))
+        tile._render_latest_frame()
+        before = tile.video_label.pixmap().toImage().pixelColor(5, 5)
+        assert (before.red(), before.green(), before.blue()) == (100, 100, 100)
+        tile.set_night_mode(True)
+        tile._render_latest_frame()
+        after = tile.video_label.pixmap().toImage().pixelColor(5, 5)
+        assert (after.red(), after.green(), after.blue()) == (160, 0, 0)
+        tile.cleanup()
+
+    @pytest.mark.requires_display
+    def test_unchanged_frame_is_not_repainted(self, qapp):
+        import numpy as np
+        from unittest.mock import patch
+        tile = self._tile(qapp)
+        tile.on_frame(np.zeros((48, 64, 3), np.uint8))
+        tile._render_latest_frame()
+        with patch.object(tile, "_present") as present:
+            tile._render_latest_frame()
+            present.assert_not_called()
+        tile.cleanup()
+
+
+class TestStaleRecovery:
+    @pytest.mark.requires_display
+    def test_stale_frame_restarts_worker_within_budget(self, qapp):
+        import numpy as np
+        from unittest.mock import MagicMock, patch
+        from ui.widgets import CameraWidget
+        def fresh_worker(*args, **kwargs):
+            worker = MagicMock()
+            worker.isRunning.return_value = False
+            return worker
+
+        with patch("ui.widgets.CaptureWorker", side_effect=fresh_worker):
+            tile = CameraWidget(320, 240, stream_link=3, enable_capture=True, target_fps=20)
+            first_worker = tile.worker
+            tile.on_frame(np.zeros((8, 8, 3), np.uint8))
+            tile._last_frame_ts = time.time() - tile._stale_frame_timeout_sec - 1
+            tile._render_latest_frame()
+            first_worker.stop.assert_called_once()
+            assert tile.worker is not first_worker
+            assert tile._latest_frame is None
+            assert tile.restart_budget.last_restart_ts is not None
+            tile.worker = None
+            tile.cleanup()
+
+    @pytest.mark.requires_display
+    def test_should_detach_requires_exhaustion_and_no_frames(self, qapp):
+        import numpy as np
+        from unittest.mock import patch
+        from ui.widgets import CameraWidget
+        with patch("ui.widgets.CaptureWorker") as worker_cls:
+            worker_cls.return_value.isRunning.return_value = False
+            tile = CameraWidget(320, 240, stream_link=3, enable_capture=True, target_fps=20)
+            now = time.time()
+            assert not tile.should_detach(now)
+            with patch.object(tile.restart_budget, "is_beyond_extended_cooldown", return_value=True):
+                assert tile.should_detach(now)
+                tile.on_frame(np.zeros((8, 8, 3), np.uint8))
+                assert not tile.should_detach(now), "a tile receiving frames is not detached"
+            tile.worker = None
+            tile.cleanup()
+
+    @pytest.mark.requires_display
+    def test_detach_then_attach_resets_budget(self, qapp):
+        from unittest.mock import patch
+        from ui.widgets import CameraWidget
+        with patch("ui.widgets.CaptureWorker") as worker_cls:
+            worker_cls.return_value.isRunning.return_value = False
+            tile = CameraWidget(320, 240, stream_link=3, enable_capture=True, target_fps=20)
+            tile.restart_budget.request(time.time())
+            assert tile.detach_camera() == 3
+            assert tile.restart_budget.last_restart_ts is None
+            assert not tile.capture_enabled and tile.worker is None
+            tile.attach_camera(4, 20, (640, 480), ui_fps=15)
+            assert tile.capture_enabled and tile.camera_stream_link == 4
+            assert tile.base_ui_fps == 15
+            tile.worker = None
+            tile.cleanup()
+
+
+class TestSettingsControls:
+    @pytest.mark.requires_display
+    def test_buttons_fire_callbacks_and_highlight(self, qapp):
+        from PyQt6 import QtCore, QtGui
+        from ui.widgets import CameraWidget, SettingsControls
+        calls = []
+        tile = CameraWidget(
+            1, 1, stream_link=None, enable_capture=False, settings_mode=True,
+            on_restart=lambda: calls.append("restart"),
+            on_night_mode_toggle=lambda: calls.append("night"),
+            on_brightness_change=lambda v: calls.append(("brightness", v)),
+        )
+        controls = tile._settings
+        release = QtGui.QMouseEvent(
+            QtCore.QEvent.Type.MouseButtonRelease, QtCore.QPointF(1, 1),
+            QtCore.Qt.MouseButton.LeftButton, QtCore.Qt.MouseButton.LeftButton,
+            QtCore.Qt.KeyboardModifier.NoModifier,
+        )
+        for button in list(controls._actions):
+            controls.eventFilter(button, release)
+        assert "restart" in calls and "night" in calls
+        assert ("brightness", 150) in calls
+        assert controls._brightness_buttons[150].styleSheet() == SettingsControls.SELECTED_STYLE
+        assert controls._brightness_buttons[100].styleSheet() == SettingsControls.BUTTON_STYLE
+
+        tile.set_night_mode_button_label(True)
+        assert controls.night_mode_button.text() == "Nightmode: On"
+        tile.cleanup()
