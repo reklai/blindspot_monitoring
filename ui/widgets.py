@@ -43,7 +43,14 @@ _parked_workers: list[CaptureWorker] = []
 
 
 class FullscreenOverlay(QtWidgets.QWidget):
-    """Frameless top-level window that shows one tile's video full screen."""
+    """Frameless top-level window that shows one tile's video full screen.
+
+    It is a separate top-level window rather than a widget raised inside the
+    grid so it can cover the whole screen without disturbing the grid
+    layout underneath; the tile keeps rendering into whichever label is
+    visible (see CameraWidget._render_target). Created lazily on the first
+    fullscreen request and reused after that.
+    """
 
     def __init__(self, on_click_exit: Callable[[], None]) -> None:
         super().__init__(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
@@ -188,10 +195,11 @@ class SettingsControls(QtCore.QObject):
 class CameraWidget(QtWidgets.QWidget):
     """One tile in the grid. Manages UI input and rendering."""
 
-    # How long a press needs to be to enter "swap mode".
+    # How long a press needs to be to enter "swap mode". Shorter than a
+    # typical OS long-press so a gloved driver does not have to hold on.
     hold_threshold_ms: int = 400
-    # Minimum ms between fullscreen toggles, so a tap and its synthetic
-    # mouse event cannot toggle twice.
+    # Minimum ms between fullscreen toggles. A touch tap arrives as TouchEnd
+    # and again as a synthesised mouse release; without this it toggles twice.
     fullscreen_debounce_ms: int = 200
     # Log interval for the per-tile status line.
     status_log_interval_sec: float = 10.0
@@ -242,6 +250,8 @@ class CameraWidget(QtWidgets.QWidget):
         self.settings_mode = settings_mode
 
         # Gesture state: fullscreen toggle and press-and-hold swap mode.
+        # _press_widget_id records which tile saw the press so a release
+        # delivered to a different tile (finger slid) is ignored.
         self.is_fullscreen = False
         self.grid_position: Optional[tuple[int, int]] = None
         self.swap_active = False
@@ -280,7 +290,11 @@ class CameraWidget(QtWidgets.QWidget):
             layout.addWidget(self.video_label)
 
         # Frame state. `_frame_id` increments per received frame so the
-        # render timer can skip work when nothing changed.
+        # render timer can skip work when nothing changed; `_last_rendered_size`
+        # makes a resize (grid <-> fullscreen) repaint the same frame.
+        # `_last_frame_ts` drives stale detection and is also refreshed when
+        # the worker reports online, which gives a freshly opened device a
+        # full timeout to produce its first frame.
         self._latest_frame: Optional[Frame] = None
         self._frame_id = 0
         self._last_rendered_id = -1
@@ -339,6 +353,8 @@ class CameraWidget(QtWidgets.QWidget):
         self._status_timer.timeout.connect(self._log_status)
         self._status_timer.start()
 
+        # The label covers the whole tile, so input lands on it, not on the
+        # tile; filter both so gestures work whichever one Qt targets.
         self.installEventFilter(self)
         self.video_label.installEventFilter(self)
 
@@ -547,6 +563,8 @@ class CameraWidget(QtWidgets.QWidget):
 
     @pyqtSlot(bool)
     def on_status_changed(self, online: bool) -> None:
+        # Queued from the worker thread. "online" means the device opened;
+        # frames may still take a moment, hence the timestamp refresh.
         if online:
             self.setStyleSheet(self.swap_ready_style if self.swap_active else self.normal_style)
             self.video_label.setText("")
@@ -575,6 +593,10 @@ class CameraWidget(QtWidgets.QWidget):
     def _render_placeholder(self, text: str) -> None:
         if self.settings_mode:
             return
+        # Called every render tick while there is no frame, so skip the label
+        # update unless the text or the target label changed. Swap mode
+        # always re-applies its border style, which setText would otherwise
+        # leave stale.
         if (
             text == self._last_placeholder_text
             and not self.swap_active
@@ -622,6 +644,10 @@ class CameraWidget(QtWidgets.QWidget):
             logging.exception("render frame")
 
     def _handle_stale(self, stale_for: float) -> None:
+        # Dropping the frame matters: with no frame the render loop goes to
+        # the placeholder path and stops calling this, so one stall produces
+        # one restart request, not one per tick. The next frame from the new
+        # worker re-arms stale detection.
         logging.warning(
             "Camera %s: Stale frame detected (no frames for %.1fs)",
             self.camera_stream_link,
@@ -874,7 +900,12 @@ class CameraWidget(QtWidgets.QWidget):
             logging.exception("do_swap")
 
     def reset_style(self) -> None:
-        """Restore border styling and margins after leaving swap mode."""
+        """Restore border styling and margins after leaving swap mode.
+
+        The 2 px margin after a swap (versus 0 px at start-up) is long-standing
+        behaviour; it makes a tile that has been moved look very slightly
+        inset and has not bothered anyone in the field, so it is kept.
+        """
         self.video_label.setStyleSheet("")
         if self.swap_active:
             self._layout.setContentsMargins(6, 6, 6, 6)
@@ -899,6 +930,8 @@ class CameraWidget(QtWidgets.QWidget):
             self.go_fullscreen()
 
     def go_fullscreen(self) -> None:
+        # The overlay is sized to the primary screen explicitly because
+        # showFullScreen alone is not honoured by every compositor.
         if self.is_fullscreen:
             return
         if self._fs_overlay is None:

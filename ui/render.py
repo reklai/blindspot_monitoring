@@ -50,6 +50,8 @@ _IDENTITY_LUT = np.arange(256, dtype=np.uint8)
 
 
 def _qimage(buffer: Frame, fmt: QtGui.QImage.Format) -> QtGui.QImage:
+    # bytesPerLine is passed explicitly because Qt otherwise assumes rows are
+    # padded to 4 bytes, which a NumPy array is not for odd widths.
     height, width = buffer.shape[:2]
     channels = 1 if buffer.ndim == 2 else buffer.shape[2]
     return QtGui.QImage(buffer.data, width, height, width * channels, fmt)
@@ -84,6 +86,8 @@ class FrameStyler:
         self._rebuild_tables()
 
     def _rebuild_tables(self) -> None:
+        # Called only when a setting changes, never per frame. The palette is
+        # a list of QRgb ints because that is what QImage.setColorTable takes.
         if self._brightness == 1.0:
             self._day_lut = _IDENTITY_LUT
             night = _NIGHT_LUT

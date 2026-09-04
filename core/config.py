@@ -83,7 +83,9 @@ PROFILE_UI_FPS = 20
 # GStreamer pipeline support
 USE_GSTREAMER = True
 
-# Render overhead compensation (ms)
+# Render overhead compensation (ms). Subtracted from the render timer
+# period so the achieved UI rate lands on the target instead of just under
+# it. Not an INI option; it is a property of the render path, not a site.
 RENDER_OVERHEAD_MS = 3
 
 
@@ -229,6 +231,8 @@ def apply_config(parser: configparser.ConfigParser) -> None:
     Keys that are absent or unparsable leave the current value untouched, so
     calling this with a partial file only overrides what the file mentions.
     """
+    # Writing through globals() rather than a `global` statement per name
+    # keeps the table the single place a setting is spelled out.
     module_globals = globals()
     for option in _OPTIONS:
         if not parser.has_section(option.section):

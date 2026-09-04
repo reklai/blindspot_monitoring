@@ -1,7 +1,12 @@
 """
-Grid layout helpers for Camera Dashboard.
+Grid shape for a given tile count.
 
-Calculates optimal row/column layouts based on camera count.
+The count passed in includes the settings tile, so the default of three
+camera slots arrives here as 4 and becomes the 2x2 grid the README
+describes. Shapes are hand-picked up to nine tiles because the obvious
+formula (square root) gives ugly results for small counts; beyond nine the
+formula takes over, capped at four columns so tiles stay legible on a
+small dashboard display.
 """
 
 from __future__ import annotations

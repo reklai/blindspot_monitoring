@@ -35,8 +35,11 @@ from ui import CameraWidget, get_smart_grid
 from utils import log_health_summary
 
 #: Render rate for tiles that never show video (settings, empty slots).
+#: They still tick so a placeholder repaints after a fullscreen toggle or a
+#: swap, but 5 Hz keeps that cost invisible.
 IDLE_TILE_UI_FPS = 5
-#: Capture-rate step applied per stress/recovery decision.
+#: Capture-rate step applied per stress/recovery decision. The UI step is
+#: configurable (UI_FPS_STEP); this one never needed to be.
 CAPTURE_FPS_STEP = 2
 
 
@@ -80,7 +83,12 @@ ProbeResults = list[tuple[int, Optional[int]]]
 
 
 def _probe_candidates(candidates: list[int]) -> ProbeResults:
-    """Probe each index once without evicting holders. Runs off the UI thread."""
+    """Probe each index once without evicting holders. Runs off the UI thread.
+
+    Eviction (killing whatever holds the device) is a boot-time measure. At
+    runtime the holder could be one of our own workers mid-reconnect, so the
+    rescan only takes devices that open cleanly.
+    """
     return [
         (idx, test_single_camera(idx, retries=2, retry_delay=0.15, allow_kill=False))
         for idx in candidates
@@ -107,6 +115,10 @@ class Dashboard(QtCore.QObject):
         self.camera_widgets: list[CameraWidget] = []
         self.placeholder_slots: list[CameraWidget] = []
         self.all_widgets: list[CameraWidget] = []
+        # active_indexes: device indexes currently bound to a tile.
+        # failed_indexes: index -> time of last failed probe. The rescan skips
+        # an index until FAILED_CAMERA_COOLDOWN_SEC has passed, so a dead
+        # metadata node or a flaky camera is not re-probed every tick.
         self.active_indexes: set[int] = set(working_cameras)
         self.failed_indexes: dict[int, float] = {
             idx: time.time() for idx in known_indexes - self.active_indexes
@@ -119,18 +131,24 @@ class Dashboard(QtCore.QObject):
         self.window = QtWidgets.QMainWindow()
         self.window.setWindowFlags(QtCore.Qt.WindowType.FramelessWindowHint)
         self.central = QtWidgets.QWidget()
-        # Tiles look this up through parent() to coordinate swap mode.
+        # Swap mode's shared register: the tile currently selected by a long
+        # press, or None. Tiles reach it through parent(), which keeps them
+        # ignorant of the Dashboard. See CameraWidget._handle_release_as_left_click.
         setattr(self.central, "selected_camera", None)
         self.window.setCentralWidget(self.central)
 
         self._build_tiles(working_cameras)
         self._lay_out_grid(screen)
 
+        # The perf timer only runs while at least one camera is attached;
+        # _apply_rescan_results starts it when the first camera hot-plugs in.
         self.perf_timer: Optional[QTimer] = None
         self.stress = StressController(config.STRESS_HOLD_COUNT, config.RECOVER_HOLD_COUNT)
         if config.DYNAMIC_FPS_ENABLED and self.camera_widgets:
             self._ensure_perf_timer()
 
+        # One probe at a time: opening a V4L2 device can block for seconds,
+        # and two probes racing for the same node would fight each other.
         self._rescan_executor = ThreadPoolExecutor(max_workers=1)
         self._rescan_inflight = False
         self._slots_full_logged = False
@@ -172,6 +190,9 @@ class Dashboard(QtCore.QObject):
         )
         self.all_widgets.append(self.settings_tile)
 
+        # choose_profile ignores the count today (the profile is exactly what
+        # config.ini says); the argument is kept so a count-aware profile can
+        # be reintroduced without touching call sites.
         active_count = max(1, min(len(working_cameras), config.CAMERA_SLOT_COUNT))
         cap_w, cap_h, cap_fps, ui_fps = config.choose_profile(active_count)
         logging.info("Profile: %dx%d @ %d FPS (UI %d FPS)", cap_w, cap_h, cap_fps, ui_fps)
@@ -211,6 +232,9 @@ class Dashboard(QtCore.QObject):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        # The grid counts the settings tile: 3 camera slots + settings = 4
+        # tiles = a 2x2 grid. screen_width/height are hints only; the layout
+        # stretch factors below are what actually size the tiles.
         rows, cols = get_smart_grid(len(self.all_widgets))
         tile_w = max(1, screen.width() // cols)
         tile_h = max(1, screen.height() // rows)
@@ -255,7 +279,13 @@ class Dashboard(QtCore.QObject):
             tile.set_brightness(self.brightness)
 
     def restart_app(self) -> None:
-        """Replace this process with a fresh one (settings tile 'Restart')."""
+        """Replace this process with a fresh one (settings tile 'Restart').
+
+        execv keeps the PID, so systemd sees nothing happen. Capture threads
+        are stopped first because an open V4L2 descriptor is inherited across
+        exec and would make the new process's discovery pass find its own
+        cameras busy.
+        """
         logging.info("Restart requested from settings.")
         self.shutdown()
         python = sys.executable
@@ -293,7 +323,14 @@ class Dashboard(QtCore.QObject):
                 logging.info("System stable. Restoring FPS.")
 
     def _step_fps(self, direction: int) -> bool:
-        """Move every camera tile one step down (-1) or up (+1). Returns True if any changed."""
+        """Move every camera tile one step down (-1) or up (+1). Returns True if any changed.
+
+        Each tile remembers its base (profile) rates and its current
+        (adjusted) rates. Lowering clamps at the configured floors; restoring
+        climbs back toward the base, never above it. Capture and UI rates step
+        independently, so one can already be at its limit while the other
+        still moves.
+        """
         _, _, _, profile_ui_fps = config.choose_profile(len(self.camera_widgets))
         changed = False
         for tile in self.camera_widgets:
@@ -323,7 +360,12 @@ class Dashboard(QtCore.QObject):
     # ------------------------------------------------------------------
 
     def rescan_and_attach(self) -> None:
-        """Periodic: free slots of cameras that gave up, probe new devices."""
+        """Periodic: free slots of cameras that gave up, probe new devices.
+
+        Runs every RESCAN_INTERVAL_MS for the life of the process, even when
+        every slot is filled, because the detach check has to keep running
+        for a camera that fails later.
+        """
         now = time.time()
         self._detach_failed_cameras(now)
 
@@ -383,6 +425,9 @@ class Dashboard(QtCore.QObject):
 
     @pyqtSlot(object)
     def _apply_rescan_results(self, results: ProbeResults) -> None:
+        # UI thread. Slots are handed out in grid order (pop(0)), so a camera
+        # that comes back after a detach lands in the first free tile, not
+        # necessarily the one it left.
         self._rescan_inflight = False
         if self._shutting_down:
             return
@@ -458,6 +503,10 @@ def main() -> None:
     # Python only runs signal handlers between bytecodes; the periodic
     # timers guarantee the interpreter gets control often enough.
     signal.signal(signal.SIGINT, lambda *_: QtWidgets.QApplication.quit())
+    # SIGTERM (systemd stop) is left at its default: the process exits at
+    # once and the kernel closes the device handles. Quitting through Qt
+    # would be tidier but adds a shutdown path that can wedge on a stuck
+    # driver, which is worse for a service that systemd restarts anyway.
 
     primary = app.primaryScreen()
     screen = primary.availableGeometry() if primary else QtCore.QRect(0, 0, 1920, 1080)

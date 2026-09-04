@@ -252,7 +252,8 @@ class CaptureWorker(QThread):
 
         # grab() dequeues the newest buffer so the driver never backs up;
         # retrieve() is where the (MJPEG) decode and the copy happen, so it is
-        # only paid for frames that will actually be emitted.
+        # only paid for frames that will actually be emitted. grab() blocks
+        # until the driver has a frame, which is what paces this loop.
         if not cap.grab():
             logging.debug("Camera %s: grab() failed, closing capture", self.stream_link)
             self._close_capture()
@@ -272,8 +273,13 @@ class CaptureWorker(QThread):
                 return
             self._last_emit = now
             self.emit_count += 1
+            # Queued to the UI thread. The array is not copied; Qt just
+            # carries the reference, and the tile keeps it until the next
+            # frame replaces it.
             self.frame_ready.emit(frame)
 
+        # A short yield so the UI thread and the other camera threads get the
+        # GIL between frames; grab() already releases it while blocking.
         self.msleep(1)
 
     def _note_open_failure(self) -> None:
@@ -295,7 +301,15 @@ class CaptureWorker(QThread):
     # ------------------------------------------------------------------
 
     def _open_capture(self) -> bool:
-        """Open the camera through the first backend that delivers a frame."""
+        """Open the camera through the first backend that delivers a frame.
+
+        Order: GStreamer (decodes in a dedicated pipeline thread, lower
+        latency), then V4L2 asking for MJPG (fits USB 2.0 bandwidth at
+        640x480), then YUYV (no decode but 2 bytes/pixel over USB), then
+        whatever the driver picks. Each rung must actually deliver a frame
+        via grab(); isOpened() alone is true for devices that never produce
+        one, such as a UVC metadata node.
+        """
         try:
             cap: Optional[cv2.VideoCapture] = None
             backend = "V4L2"
@@ -362,6 +376,9 @@ class CaptureWorker(QThread):
 
         # Property sets are best-effort: drivers reject what they cannot do
         # and OpenCV may raise for unsupported properties on some builds.
+        # BUFFERSIZE 1 keeps the driver queue shallow so a slow consumer sees
+        # the newest frame, not a backlog. The 2 s timeouts stop a dying
+        # device from blocking this thread indefinitely in open/read.
         def try_set(prop: int, value: float) -> None:
             try:
                 cap.set(prop, value)
@@ -392,6 +409,8 @@ class CaptureWorker(QThread):
                 fps = float(cap.get(cv2.CAP_PROP_FPS))
             except Exception:
                 fps = 0.0
+        # Drivers report 0, -1 or absurd values when they do not know;
+        # anything outside a sane camera range means "unknown".
         if fps <= 1.0 or fps > 240.0:
             fps = self.DEFAULT_CAMERA_FPS
         with self._fps_lock:
@@ -471,8 +490,15 @@ def test_single_camera(
 ) -> Optional[int]:
     """Return ``cam_index`` if the device delivers a frame, else None.
 
-    When ``allow_kill`` is set and the config permits it, a device that will
-    not open gets its holder processes evicted and is probed again.
+    Retries exist because a camera is briefly busy right after USB
+    enumeration and right after another process releases it. When
+    ``allow_kill`` is set and the config permits it, a device that still
+    will not open gets its holder processes evicted and is probed again;
+    that is how the dashboard reclaims a camera from a stale instance of
+    itself after a crash.
+
+    The name starts with ``test_`` for historical reasons; tests refer to it
+    through the module so pytest does not collect it.
     """
     if _probe_with_retries(cam_index, retries, retry_delay):
         return cam_index
