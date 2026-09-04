@@ -96,7 +96,13 @@ def _probe_candidates(candidates: list[int]) -> ProbeResults:
 
 
 class Dashboard(QtCore.QObject):
-    """The running application: window, tiles, timers, and their state."""
+    """The running application: window, tiles, timers, and their state.
+
+    Every method runs on the UI thread except ``_on_rescan_done``, which the
+    probe executor calls on its own thread and which must touch nothing but
+    the shutdown flag and the signal. It is a QObject only so it can own
+    that signal.
+    """
 
     # Carries probe results from the executor thread to the UI thread. A
     # queued signal is the one cross-thread mechanism Qt guarantees here;

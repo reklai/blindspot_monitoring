@@ -84,7 +84,6 @@ class TestRescan:
             applied["thread"] = threading.current_thread()
             applied["results"] = results
 
-        dashboard._apply_rescan_results = apply  # bypass slot; check delivery only
         dashboard._rescan_finished.disconnect()
         dashboard._rescan_finished.connect(apply)
 
@@ -95,7 +94,9 @@ class TestRescan:
         worker = threading.Thread(target=dashboard._on_rescan_done, args=(DoneFuture(),))
         worker.start()
         worker.join()
-        deadline = time.time() + 2.0
+        # Generous deadline: this waits for one queued event, which is
+        # microseconds unless the machine is badly overloaded.
+        deadline = time.time() + 10.0
         while "results" not in applied and time.time() < deadline:
             qapp.processEvents()
         assert applied["results"] == [(3, None)]

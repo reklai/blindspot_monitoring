@@ -162,7 +162,10 @@ class _Option:
 
     ``parse`` receives the raw INI text and the current global value (used as
     the fallback for unparsable input). Bounds are passed through to the
-    numeric parsers; string and boolean options ignore them.
+    numeric parsers; string and boolean options ignore them. ``doc`` is the
+    operator-facing description: units, range, what it interacts with, and
+    when a change takes effect. Every option needs one; it is the only place
+    that knowledge lives.
     """
 
     section: str
@@ -171,6 +174,7 @@ class _Option:
     parse: Callable[..., Any]
     min_value: Optional[float] = None
     max_value: Optional[float] = None
+    doc: str = ""
 
     def coerce(self, raw: Any, current: Any) -> Any:
         if self.parse in (_as_int, _as_float):
@@ -179,40 +183,141 @@ class _Option:
 
 
 _OPTIONS: tuple[_Option, ...] = (
-    # [logging]
-    _Option("logging", "level", "LOG_LEVEL", _as_str),
-    _Option("logging", "file", "LOG_FILE", _as_str),
-    _Option("logging", "max_bytes", "LOG_MAX_BYTES", _as_int, 1024),
-    _Option("logging", "backup_count", "LOG_BACKUP_COUNT", _as_int, 1),
-    _Option("logging", "stdout", "LOG_TO_STDOUT", _as_bool),
-    # [performance]
-    _Option("performance", "dynamic_fps", "DYNAMIC_FPS_ENABLED", _as_bool),
-    _Option("performance", "perf_check_interval_ms", "PERF_CHECK_INTERVAL_MS", _as_int, 250),
-    _Option("performance", "min_dynamic_fps", "MIN_DYNAMIC_FPS", _as_int, 1),
-    _Option("performance", "min_dynamic_ui_fps", "MIN_DYNAMIC_UI_FPS", _as_int, 1),
-    _Option("performance", "ui_fps_step", "UI_FPS_STEP", _as_int, 1),
-    _Option("performance", "cpu_load_threshold", "CPU_LOAD_THRESHOLD", _as_float, 0.1, 1.0),
-    _Option("performance", "cpu_temp_threshold_c", "CPU_TEMP_THRESHOLD_C", _as_float, 30.0, 100.0),
-    _Option("performance", "stress_hold_count", "STRESS_HOLD_COUNT", _as_int, 1),
-    _Option("performance", "recover_hold_count", "RECOVER_HOLD_COUNT", _as_int, 1),
-    _Option("performance", "stale_frame_timeout_sec", "STALE_FRAME_TIMEOUT_SEC", _as_float, 0.5),
-    _Option("performance", "restart_cooldown_sec", "RESTART_COOLDOWN_SEC", _as_float, 1.0),
-    _Option("performance", "max_restarts_per_window", "MAX_RESTARTS_PER_WINDOW", _as_int, 1),
-    _Option("performance", "restart_window_sec", "RESTART_WINDOW_SEC", _as_float, 5.0),
-    # [camera]
-    _Option("camera", "rescan_interval_ms", "RESCAN_INTERVAL_MS", _as_int, 500),
-    _Option("camera", "failed_camera_cooldown_sec", "FAILED_CAMERA_COOLDOWN_SEC", _as_float, 1.0),
-    _Option("camera", "slot_count", "CAMERA_SLOT_COUNT", _as_int, 1, 8),
-    _Option("camera", "kill_device_holders", "KILL_DEVICE_HOLDERS", _as_bool),
-    _Option("camera", "use_gstreamer", "USE_GSTREAMER", _as_bool),
-    # [profile]
-    _Option("profile", "capture_width", "PROFILE_CAPTURE_WIDTH", _as_int, 160, 1920),
-    _Option("profile", "capture_height", "PROFILE_CAPTURE_HEIGHT", _as_int, 120, 1080),
-    _Option("profile", "capture_fps", "PROFILE_CAPTURE_FPS", _as_int, 1, 60),
-    _Option("profile", "ui_fps", "PROFILE_UI_FPS", _as_int, 1, 60),
-    # [health]
-    _Option("health", "log_interval_sec", "HEALTH_LOG_INTERVAL_SEC", _as_float, 5.0),
+    # ---- [logging] -------------------------------------------------------
+    _Option("logging", "level", "LOG_LEVEL", _as_str, doc=(
+        "Root log level: DEBUG, INFO, WARNING, ERROR or CRITICAL. Fielded units "
+        "run ERROR; INFO adds a status line per camera every 10 s and the health "
+        "summary, DEBUG adds every gesture and open attempt. Read at start-up only."
+    )),
+    _Option("logging", "file", "LOG_FILE", _as_str, doc=(
+        "Path of the rotating log file, relative to the working directory. The "
+        "CAMERA_DASHBOARD_LOG_FILE environment variable overrides it. Empty "
+        "disables file logging."
+    )),
+    _Option("logging", "max_bytes", "LOG_MAX_BYTES", _as_int, 1024, doc=(
+        "Size at which the log file rotates. Minimum 1024."
+    )),
+    _Option("logging", "backup_count", "LOG_BACKUP_COUNT", _as_int, 1, doc=(
+        "Rotated files to keep. Total disk use is about max_bytes x (backup_count + 1)."
+    )),
+    _Option("logging", "stdout", "LOG_TO_STDOUT", _as_bool, doc=(
+        "Also log to stdout, which under the systemd service means the journal."
+    )),
+    # ---- [performance] ---------------------------------------------------
+    _Option("performance", "dynamic_fps", "DYNAMIC_FPS_ENABLED", _as_bool, doc=(
+        "Lower capture and UI rates when the CPU is loaded or hot, and restore "
+        "them when it calms. Off means the profile rates are used unconditionally."
+    )),
+    _Option("performance", "perf_check_interval_ms", "PERF_CHECK_INTERVAL_MS", _as_int, 250, doc=(
+        "How often load and temperature are sampled. Each sample is one loadavg "
+        "call and one sysfs read; 2000 is plenty because the load average itself "
+        "only moves on a one-minute time constant. Minimum 250."
+    )),
+    _Option("performance", "min_dynamic_fps", "MIN_DYNAMIC_FPS", _as_int, 1, doc=(
+        "Floor for the capture (emit) rate under stress, per camera. Frames are "
+        "still grabbed at the camera's rate; only decode/emit is reduced."
+    )),
+    _Option("performance", "min_dynamic_ui_fps", "MIN_DYNAMIC_UI_FPS", _as_int, 1, doc=(
+        "Floor for the per-tile render rate under stress."
+    )),
+    _Option("performance", "ui_fps_step", "UI_FPS_STEP", _as_int, 1, doc=(
+        "Render-rate change per stress or recovery decision. The capture rate "
+        "always steps by 2."
+    )),
+    _Option("performance", "cpu_load_threshold", "CPU_LOAD_THRESHOLD", _as_float, 0.1, 1.0, doc=(
+        "1-minute load average divided by core count above which the system "
+        "counts as stressed. 0.75 on a 4-core Pi means loadavg 3.0."
+    )),
+    _Option("performance", "cpu_temp_threshold_c", "CPU_TEMP_THRESHOLD_C", _as_float, 30.0, 100.0, doc=(
+        "SoC temperature above which the system counts as stressed. The Pi "
+        "firmware throttles the CPU itself at 80-85 C, so keep this below that "
+        "to shed load before the hardware does."
+    )),
+    _Option("performance", "stress_hold_count", "STRESS_HOLD_COUNT", _as_int, 1, doc=(
+        "Consecutive stressed samples before rates are lowered one step. With "
+        "the 2 s interval, 3 means about 6 s of sustained stress."
+    )),
+    _Option("performance", "recover_hold_count", "RECOVER_HOLD_COUNT", _as_int, 1, doc=(
+        "Consecutive calm samples before rates are raised one step."
+    )),
+    _Option("performance", "stale_frame_timeout_sec", "STALE_FRAME_TIMEOUT_SEC", _as_float, 0.5, doc=(
+        "Seconds without a new frame before a tile shows DISCONNECTED and asks "
+        "for a worker restart. Must exceed one frame period at the lowest "
+        "dynamic rate (10 FPS = 0.1 s) by a wide margin. Minimum 0.5."
+    )),
+    _Option("performance", "restart_cooldown_sec", "RESTART_COOLDOWN_SEC", _as_float, 1.0, doc=(
+        "Minimum spacing between two worker restarts of the same camera."
+    )),
+    _Option("performance", "max_restarts_per_window", "MAX_RESTARTS_PER_WINDOW", _as_int, 1, doc=(
+        "Restarts allowed per camera within restart_window_sec before the budget "
+        "is exhausted. An exhausted camera waits 2 x restart_window_sec, and if "
+        "it has produced no frame by then its slot is freed for the rescan."
+    )),
+    _Option("performance", "restart_window_sec", "RESTART_WINDOW_SEC", _as_float, 5.0, doc=(
+        "Window for max_restarts_per_window; also sets the extended cooldown "
+        "(2x) after exhaustion. Minimum 5."
+    )),
+    # ---- [camera] ----------------------------------------------------------
+    _Option("camera", "rescan_interval_ms", "RESCAN_INTERVAL_MS", _as_int, 500, doc=(
+        "How often /dev/video* is checked for new cameras and failed cameras "
+        "are considered for detach. Runs for the life of the process. Each "
+        "probe of a new node can block its background thread for a second or "
+        "two, so keep this in the seconds range. Minimum 500."
+    )),
+    _Option("camera", "failed_camera_cooldown_sec", "FAILED_CAMERA_COOLDOWN_SEC", _as_float, 1.0, doc=(
+        "After a probe fails (including the metadata node every UVC camera "
+        "exposes), the index is not probed again for this long."
+    )),
+    _Option("camera", "slot_count", "CAMERA_SLOT_COUNT", _as_int, 1, 8, doc=(
+        "Camera tiles in the grid, in addition to the settings tile. The grid "
+        "shape follows the total: 3 slots + settings = 2x2. Range 1-8."
+    )),
+    _Option("camera", "kill_device_holders", "KILL_DEVICE_HOLDERS", _as_bool, doc=(
+        "At start-up, terminate other processes holding a camera that will not "
+        "open (a crashed previous instance, motion, ffmpeg). Kiosk setting: "
+        "never enable on a shared desktop. Never applied by the runtime rescan."
+    )),
+    _Option("camera", "use_gstreamer", "USE_GSTREAMER", _as_bool, doc=(
+        "Try a GStreamer v4l2src ! jpegdec pipeline before the V4L2 backend. "
+        "Requires an OpenCV build with GStreamer (Debian's python3-opencv has "
+        "it; the PyPI wheel does not). Falls back to V4L2 per camera if the "
+        "pipeline fails to deliver a frame. The V4L2 path is what fielded "
+        "units have run; the GStreamer path is unproven there."
+    )),
+    # ---- [profile] ---------------------------------------------------------
+    _Option("profile", "capture_width", "PROFILE_CAPTURE_WIDTH", _as_int, 160, 1920, doc=(
+        "Requested capture width; the driver may pick the nearest mode it "
+        "supports. Decode and every copy scale with width x height."
+    )),
+    _Option("profile", "capture_height", "PROFILE_CAPTURE_HEIGHT", _as_int, 120, 1080, doc=(
+        "Requested capture height. See capture_width."
+    )),
+    _Option("profile", "capture_fps", "PROFILE_CAPTURE_FPS", _as_int, 1, 60, doc=(
+        "Frames per second requested from the camera and emitted to the UI "
+        "when unstressed. Applies to every camera; not scaled by camera count."
+    )),
+    _Option("profile", "ui_fps", "PROFILE_UI_FPS", _as_int, 1, 60, doc=(
+        "Render rate per tile when unstressed. Rendering faster than "
+        "capture_fps only repaints identical frames."
+    )),
+    # ---- [health] ----------------------------------------------------------
+    _Option("health", "log_interval_sec", "HEALTH_LOG_INTERVAL_SEC", _as_float, 5.0, doc=(
+        "Interval of the one-line health summary (online/stale/placeholder "
+        "counts) at INFO. Minimum 5."
+    )),
 )
+
+
+def option_docs() -> str:
+    """Render every option's documentation as INI-style text (for tooling)."""
+    lines: list[str] = []
+    section = None
+    for option in _OPTIONS:
+        if option.section != section:
+            section = option.section
+            lines.append(f"[{section}]")
+        lines.append(f"# {option.key}: {option.doc}")
+    return "\n".join(lines)
 
 
 def load_config(path: Optional[str] = None) -> configparser.ConfigParser:

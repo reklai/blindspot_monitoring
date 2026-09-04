@@ -256,3 +256,21 @@ class TestOptionTable:
         with patch.object(config, "LOG_FILE_ENV", "/from/env.log"):
             config.apply_config(config.load_config(str(cfg)))
         assert config.LOG_FILE == "/from/env.log"
+
+
+    def test_every_option_is_documented(self):
+        for option in config._OPTIONS:
+            assert len(option.doc) > 40, f"{option.section}.{option.key} needs a real doc string"
+
+    def test_checked_in_config_ini_only_uses_known_keys(self):
+        """A typo in config.ini would otherwise be silently ignored."""
+        parser = config.load_config(str(Path(__file__).parent.parent / "config.ini"))
+        known = {(o.section, o.key) for o in config._OPTIONS}
+        for section in parser.sections():
+            for key in parser[section]:
+                assert (section, key) in known, f"config.ini has unknown key {section}.{key}"
+
+    def test_option_docs_render(self):
+        text = config.option_docs()
+        assert text.startswith("[logging]")
+        assert "# use_gstreamer:" in text

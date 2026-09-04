@@ -14,11 +14,16 @@ guide.
 - **Process shape.** One Python process: a Qt UI thread plus one `QThread`
   per camera. OpenCV releases the GIL inside `grab()`/`retrieve()`, so the
   three decodes run in parallel; everything else contends for the GIL.
-- **Pipeline.** USB -> `v4l2src` -> `jpegdec` (software) -> `videoconvert`
-  -> `appsink` -> OpenCV `retrieve()` (one copy into a fresh NumPy array)
-  -> queued Qt signal -> UI thread styles the frame, converts to `QPixmap`,
-  scales into the tile, `QLabel` paints. The V4L2 fallback does the JPEG
-  decode inside `retrieve()` instead of inside GStreamer.
+- **Pipeline, as fielded.** USB -> V4L2 MJPG -> OpenCV `grab()` ->
+  `retrieve()` (JPEG decode plus one copy into a fresh NumPy array) ->
+  queued Qt signal -> UI thread styles the frame, converts to `QPixmap`,
+  scales into the tile, `QLabel` paints. This is the V4L2 path. The
+  GStreamer path (`v4l2src ! jpegdec ! videoconvert ! appsink`, decode in
+  a pipeline thread) has never run on a unit: until this branch the build
+  check that gates it always answered "no" (it compared the last token of
+  `GStreamer: YES (1.22.0)` with `YES`). The check is fixed and
+  `use_gstreamer` now ships as `false` so the fix does not silently switch
+  backends. Enabling it is avenue 1.
 - **Field constraint.** The code is in daily use. A change that is faster
   but crashes once a week is a regression. Every avenue below is graded on
   risk first.
@@ -40,24 +45,48 @@ scratch comparison in the commit history.
 
 The throttle number is the one that changes what the driver sees: with the
 default profile the old code delivered roughly two thirds of the configured
-rate to the screen. The render numbers matter under stress, when a Pi core
-is already saturated and every 0.1 ms per frame per tile counts.
+rate to the screen. That cuts both ways. Units in the field have been
+decoding and painting about 16 frames per second per camera; with the fix
+they will do the configured 25 and 20, which is more CPU, not less. Measure
+a unit before and after (see the validation steps) and, if the headroom is
+not there, lower `capture_fps` and `ui_fps` deliberately rather than
+relying on the old accident. The render numbers matter under stress, when a
+Pi core is already saturated and every 0.1 ms per frame per tile counts.
 
 Correctness fixes that fell out of the rewrite (each is in a commit message):
 brightness compounding on re-render, hot-plug attach never completing
 (`QTimer.singleShot` from a non-Qt thread), the rescan timer stopping and
-taking the detach check with it, and the restart budget's unreachable
-recovery branch.
+taking the detach check with it, the GStreamer build check, and the
+restart budget's unreachable recovery branch.
+
+Two behaviour changes operators will notice, both intentional:
+
+- **Restart cadence for a flapping camera.** The old budget's "extended
+  cooldown" branch was unreachable, but restarts still resumed as soon as
+  the oldest one aged out of the 30 s window (about 20-30 s after the limit
+  was logged), and the "will retry in 60s" line was wrong. Now an exhausted
+  budget refuses restarts for the full 60 s, after which one recovery
+  attempt is granted and, if no frame has arrived, the slot is freed. The
+  worker's own reconnect loop is unaffected, so an unplugged camera still
+  comes back as soon as it is replugged.
+- **Log lines.** `All camera slots filled, stopping rescan timer` is now
+  `All camera slots filled` (logged once, not every tick), and `Restarted
+  rescan timer for detached camera slot` is gone because the timer never
+  stops. Everything else that is grepped for (`Stale frame detected`,
+  `Restart limit reached`, `Restarting capture`, `thread did not stop`,
+  `Health cameras online=`, `Attached`/`Detached camera`) is unchanged.
 
 ## Where the remaining CPU goes
 
 Per camera per second at the default profile (25 FPS capture, 20 FPS UI),
 in order of cost on a Pi:
 
-1. **MJPEG decode.** 25 decodes/s of 640x480. This is the bulk of the
-   load, and it happens for every frame the camera sends regardless of
-   whether the dashboard wants it (GStreamer path) or only for frames that
-   pass the throttle (V4L2 path, after this branch).
+1. **MJPEG decode.** 25 decodes/s of 640x480 inside `retrieve()`. This
+   is the bulk of the load. After this branch it happens only for frames
+   that pass the throttle, which matters under stress: at the 10 FPS floor
+   with the camera still delivering 25, 60% of the decodes are skipped.
+   (On the GStreamer path, if enabled, decode happens for every frame the
+   camera sends and the throttle only saves the copy; see avenue 1.)
 2. **Colour conversion and copies.** `videoconvert` (I420 -> BGR), the
    `appsink` pull, OpenCV's copy into a NumPy array, Qt's `QImage` ->
    `QPixmap` conversion, and the scale into the tile. Four full-frame
@@ -73,26 +102,35 @@ in order of cost on a Pi:
 Ordering weighs expected gain against risk to a fielded system and the
 effort to validate on the Pi. "Validate" means the checklist at the end.
 
-### 1. Ask the camera for the frame rate you will use (high gain, low risk)
+### 1. Turn on the GStreamer pipeline, with a frame-rate cap (high gain, needs a soak)
 
-On the GStreamer path the camera runs at its native rate (usually 30 FPS)
-and `jpegdec` decodes all of it; the dashboard then throws a third away.
-Adding `framerate=25/1` to the `image/jpeg` caps (and lowering it when
-dynamic FPS lowers the target, which currently only throttles in software)
-makes the camera send fewer frames, so the decode cost drops in proportion.
-Under stress at the 10 FPS floor that is 60% of the decode work gone, on
-exactly the machine that needs it.
+The GStreamer path moves the JPEG decode into a pipeline thread with a
+leaky queue, so the capture thread only copies and the newest frame is
+always the one delivered; that is the latency win the pipeline was written
+for. It has simply never run on a unit. Two things to do before it can:
 
-Risk: some UVC cameras only advertise a few discrete rates and the caps
-negotiation fails. Ship it as another rung in the existing fallback chain
-(with-rate, then without), and log which one won. Changing the rate at
-runtime means rebuilding the pipeline; do it only on the dynamic-FPS step
-boundaries and only if the worker is otherwise healthy, or accept
-software-only throttling below the initial rate. `bench_capture.py` shows
-the effect directly (source FPS vs CPU%).
+1. Add `framerate={fps}/1` to the `image/jpeg` caps. Without it the camera
+   runs at its native rate (usually 30) and `jpegdec` decodes all of it,
+   and there is no throttle-before-retrieve saving because decode is no
+   longer in `retrieve()`. With it the camera sends only what will be
+   shown, and lowering the rate under stress cuts decode in proportion.
+   Some UVC cameras only advertise a few discrete rates and the caps
+   negotiation fails, so keep it as a rung in the fallback chain
+   (with-rate, then without, then V4L2) and log which one won. Changing
+   the rate at runtime means rebuilding the pipeline; do it on dynamic-FPS
+   step boundaries only, or accept software throttling below the initial
+   rate.
+2. Give `_open_gstreamer` the same open/read timeouts the V4L2 rung has,
+   or confirm that `appsink` with `sync=false` cannot block `grab()`
+   indefinitely on a dying device. The old code's own comment warned about
+   crashes when releasing a live pipeline; the 50 ms settle before
+   `release()` is inherited, not validated.
 
-The V4L2 fallback already does this via `CAP_PROP_FPS`; the benchmark on
-the laptop webcam shows the source rate following the target.
+Then flip `use_gstreamer = true` on one unit and run the checklist below.
+`bench_capture.py` shows source FPS against CPU% for both backends.
+
+The V4L2 path already asks the camera for the target rate via
+`CAP_PROP_FPS`; the laptop benchmark shows the source rate following it.
 
 ### 2. Hardware JPEG decode on Pi 4 (high gain, must be proven per unit)
 

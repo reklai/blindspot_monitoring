@@ -20,17 +20,13 @@ import logging
 import time
 from typing import Any, Callable, Optional
 
-import numpy as np
-from numpy.typing import NDArray
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 
 from core import config
 from core.camera import CaptureWorker
 from core.recovery import RestartBudget, RestartVerdict
-from ui.render import FrameStyler
-
-Frame = NDArray[np.uint8]
+from ui.render import Frame, FrameStyler
 
 PLACEHOLDER_DISCONNECTED = "DISCONNECTED"
 PLACEHOLDER_CONNECTING = "CONNECTING..."
@@ -40,6 +36,9 @@ PLACEHOLDER_STYLE = "color: #bbbbbb; font-size: 24px;"
 # Deleting a running QThread aborts the process, so they must outlive their
 # tile; keeping a reference is the only safe thing left to do with them.
 _parked_workers: list[CaptureWorker] = []
+
+# Identity styler used when a tile's own styler raises on a frame.
+_RAW_STYLER = FrameStyler()
 
 
 class FullscreenOverlay(QtWidgets.QWidget):
@@ -158,8 +157,9 @@ class SettingsControls(QtCore.QObject):
         label.setStyleSheet(self.BUTTON_STYLE)
         label.setAttribute(QtCore.Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
         label.installEventFilter(self)
-        if action is not None:
-            self._actions[label] = action
+        # A button with no callback still swallows its presses; otherwise the
+        # press would fall through to the tile and count toward a long-press.
+        self._actions[label] = action if action is not None else (lambda: None)
         return label
 
     def _pick_brightness(self, percent: int) -> None:
@@ -305,6 +305,7 @@ class CameraWidget(QtWidgets.QWidget):
         self._pixmap_cache = QtGui.QPixmap()
         self._scaled_pixmap_cache: Optional[QtGui.QPixmap] = None
         self._styler = FrameStyler()
+        self._styler_failed = False
         self.night_mode_enabled = False
         self.brightness = 1.0
 
@@ -386,23 +387,17 @@ class CameraWidget(QtWidgets.QWidget):
     def _retire_worker(self, worker: CaptureWorker) -> bool:
         """Stop a worker and release it. Returns False if it would not stop.
 
-        A worker that ignores stop() is left connected (it may still be
-        blocked in the driver and could resume delivering frames) but is
-        detached from this tile and parked, because deleting a running
-        QThread aborts the process.
+        UI thread. Either way the worker is disconnected from this tile
+        first: a worker that ignores stop() may still be blocked in the
+        driver, and if that call ever returns its frames must not paint on
+        a tile that has since been given another camera. Such a worker is
+        then unparented and parked rather than deleted, because deleting a
+        running QThread aborts the process.
         """
         try:
             worker.stop()
         except Exception:
             logging.exception("Error stopping worker for %s", self.camera_stream_link)
-        if worker.isRunning():
-            try:
-                worker.setParent(None)
-            except RuntimeError:
-                pass
-            if worker not in _parked_workers:
-                _parked_workers.append(worker)
-            return False
         for signal, slot in (
             (worker.frame_ready, self.on_frame),
             (worker.status_changed, self.on_status_changed),
@@ -413,6 +408,13 @@ class CameraWidget(QtWidgets.QWidget):
                 pass
         try:
             worker.setParent(None)
+        except RuntimeError:
+            pass
+        if worker.isRunning():
+            if worker not in _parked_workers:
+                _parked_workers.append(worker)
+            return False
+        try:
             worker.deleteLater()
         except RuntimeError:
             pass
@@ -508,7 +510,18 @@ class CameraWidget(QtWidgets.QWidget):
             logging.debug("cleanup failed for %s", self.widget_id, exc_info=True)
 
     def _restart_capture_if_stale(self) -> None:
-        """Replace the worker after a stale-frame timeout, within budget."""
+        """Replace the worker after a stale-frame timeout, within budget.
+
+        Known limitation (pre-dates this code): stale detection only runs
+        while a frame is held, so a camera that opens and never delivers a
+        frame is restarted at most once per frame it did deliver. The
+        worker's own reconnect loop covers the unplugged case; this path is
+        for a worker that wedges after streaming. See docs/performance-avenues.md.
+
+        Clocks: budget and staleness use ``time.time()``. A wall-clock step
+        (NTP sync shortly after boot) can therefore trigger one spurious
+        stale restart on every camera; harmless, but expect it in the logs.
+        """
         if not self.capture_enabled or not self.worker:
             return
         now = time.time()
@@ -554,7 +567,12 @@ class CameraWidget(QtWidgets.QWidget):
 
     @pyqtSlot(object)
     def on_frame(self, frame_bgr: Frame) -> None:
-        """Keep the newest frame; the render timer will paint it."""
+        """Keep the newest frame; the render timer will paint it.
+
+        UI thread, via queued connection. From here the tile owns the array:
+        the worker dropped its reference on emit, and the styler never
+        writes to it, so it is safe to hold until the next frame replaces it.
+        """
         if frame_bgr is None:
             return
         self._latest_frame = frame_bgr
@@ -631,7 +649,7 @@ class CameraWidget(QtWidgets.QWidget):
             if self._frame_id == self._last_rendered_id and self._last_rendered_size == target_size:
                 return
 
-            self._pixmap_cache.convertFromImage(self._styler.to_qimage(frame))
+            self._pixmap_cache.convertFromImage(self._style_or_raw(frame))
             self._present(label, target_size)
 
             self._last_rendered_id = self._frame_id
@@ -642,6 +660,25 @@ class CameraWidget(QtWidgets.QWidget):
                 self.frame_count += 1
         except Exception:
             logging.exception("render frame")
+
+    def _style_or_raw(self, frame: Frame) -> QtGui.QImage:
+        """Style the frame; on failure paint it unstyled rather than blank.
+
+        A frame shape the styler cannot handle (a 4-channel buffer from an
+        unusual backend, say) must not turn into a dead tile with an ERROR
+        line 20 times a second. Logged once per tile.
+        """
+        try:
+            return self._styler.to_qimage(frame)
+        except Exception:
+            if not self._styler_failed:
+                self._styler_failed = True
+                logging.warning(
+                    "Camera %s: styling failed, showing raw frames",
+                    self.camera_stream_link,
+                    exc_info=True,
+                )
+            return _RAW_STYLER.to_qimage(frame)
 
     def _handle_stale(self, stale_for: float) -> None:
         # Dropping the frame matters: with no frame the render loop goes to

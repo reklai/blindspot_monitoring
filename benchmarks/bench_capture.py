@@ -5,8 +5,10 @@ CPU cost of the capture loop against a real camera.
 Runs a CaptureWorker for a few seconds at several emit rates and reports how
 many frames were emitted and how much process CPU time the loop consumed.
 The "unthrottled" row disables the throttle so every grabbed frame is also
-retrieved; the difference to the throttled rows is what throttle-before-
-retrieve saves (the decode on V4L2 MJPG, the copy on GStreamer).
+retrieved, while asking the camera for the highest rate in the list so the
+device configuration matches that row; the difference to the throttled row
+at the same rate is what throttle-before-retrieve saves (the decode on V4L2
+MJPG, the copy on GStreamer).
 
     python3 benchmarks/bench_capture.py --device 0 --seconds 6
     python3 benchmarks/bench_capture.py --device 0 --no-gstreamer
@@ -41,6 +43,9 @@ class _AlwaysAccept(FrameThrottle):
 
 def run_once(device: int, seconds: float, target_fps: float | None, width: int, height: int, unthrottled: bool):
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    # target_fps is always passed so the V4L2 path asks the camera for the
+    # same rate in every row; only the throttle differs between the
+    # unthrottled row and the matching throttled one.
     worker = CaptureWorker(device, target_fps=target_fps, capture_width=width, capture_height=height)
     if unthrottled:
         worker._throttle = _AlwaysAccept(1000.0)
@@ -95,12 +100,15 @@ def main() -> None:
     else:
         width, height = config.PROFILE_CAPTURE_WIDTH, config.PROFILE_CAPTURE_HEIGHT
 
+    rates = [r.strip() for r in args.rates.split(",")]
+    numeric = [float(r) for r in rates if r != "unthrottled"]
+    reference_fps = max(numeric) if numeric else config.PROFILE_CAPTURE_FPS
     print(f"device /dev/video{args.device}, {width}x{height}, {args.seconds:.0f}s per row")
+    print(f"(camera asked for {reference_fps:.0f} FPS in the unthrottled row)")
     print(f"{'emit target':14s} {'source fps':>11s} {'emitted fps':>12s} {'process cpu%':>13s}  fourcc")
-    for rate in args.rates.split(","):
-        rate = rate.strip()
+    for rate in rates:
         unthrottled = rate == "unthrottled"
-        target = None if unthrottled else float(rate)
+        target = reference_fps if unthrottled else float(rate)
         result = run_once(args.device, args.seconds, target, width, height, unthrottled)
         if result is None:
             print(f"{rate:14s} {'no frames':>11s}")

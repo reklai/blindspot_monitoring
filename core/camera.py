@@ -45,6 +45,13 @@ def gstreamer_available() -> bool:
 
     Parsed once from ``cv2.getBuildInformation()`` and cached: the answer
     cannot change while the process runs.
+
+    History: the previous check compared the *last* token of the build line
+    with ``YES``. Debian's OpenCV prints ``GStreamer: YES (1.22.0)``, so the
+    last token was the version and the check always said no; fielded units
+    have therefore only ever run the V4L2 path. This function answers
+    correctly, which is why ``use_gstreamer`` now defaults to false in
+    config.ini: enabling the pipeline is a deliberate, testable step.
     """
     global _gstreamer_available
     if _gstreamer_available is None:
@@ -95,10 +102,20 @@ def _fourcc_to_str(raw: float) -> str:
 class CaptureWorker(QThread):
     """Background thread that captures frames from one camera.
 
-    Signals are emitted from the worker thread; Qt queues them to the
-    receiver's thread, so slots run on the UI thread. Every emitted frame is
-    a fresh array owned by the receiver (``retrieve()`` allocates per call),
-    which is why no pooling or copying happens here.
+    Lifecycle: construct, ``start()``, ``stop()``. A worker is single-use;
+    once stopped it is discarded and the tile builds a new one. Nothing in
+    the codebase restarts a stopped worker, and ``_stop_event`` is never
+    cleared, so do not try.
+
+    Threads: ``run``/``_step``/``_open_*``/``_close_capture`` execute on the
+    worker thread and are the only code that touches the ``cv2.VideoCapture``.
+    ``set_target_fps``, ``stop``, ``is_healthy``, ``get_fourcc`` and the
+    properties are for the UI thread. Signals are emitted from the worker
+    thread; Qt queues them, so connected slots run on the UI thread.
+
+    Frame ownership: every emitted frame is a fresh array (``retrieve()``
+    allocates per call; verified, not assumed). After ``emit`` the worker
+    holds no reference, so the receiver may keep it as long as it likes.
     """
 
     frame_ready = pyqtSignal(object)
@@ -356,12 +373,17 @@ class CaptureWorker(QThread):
         width = int(self.capture_width or 640)
         height = int(self.capture_height or 480)
         pipeline = gstreamer_pipeline(int(self.stream_link), width, height)
+        cap: Optional[cv2.VideoCapture] = None
+        # The whole attempt is guarded, not just the constructor: a pipeline
+        # that opens but throws inside grab() must still fall through to the
+        # V4L2 rungs rather than fail this open cycle outright.
         try:
             cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+            if not cap or not cap.isOpened() or not cap.grab():
+                _release_quietly(cap)
+                return None
         except Exception as exc:
             logging.warning("GStreamer failed for camera %s: %s", self.stream_link, exc)
-            return None
-        if not cap or not cap.isOpened() or not cap.grab():
             _release_quietly(cap)
             return None
         logging.info("GStreamer pipeline opened for camera %s (jpegdec)", self.stream_link)

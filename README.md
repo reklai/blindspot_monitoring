@@ -22,7 +22,7 @@ The software has been field-deployed for daily blind-spot monitoring use on carg
 - Long-press tile swapping for rearranging the display.
 - Runtime camera rescanning for hot-plug workflows.
 - Stale-frame detection and bounded capture-worker restart attempts.
-- Optional OpenCV GStreamer capture path with V4L2 fallback.
+- Optional OpenCV GStreamer capture path with V4L2 fallback (off by default).
 - Dynamic software FPS throttling based on CPU load and thermal state.
 - INI configuration with environment variable overrides.
 - User systemd service and desktop shortcut for dedicated installations.
@@ -69,7 +69,7 @@ Note: the current brightness code clamps the effective minimum multiplier to `0.
 
 ## Capture Pipeline
 
-Capture is implemented with OpenCV. When `camera.use_gstreamer = true`, OpenCV has GStreamer support, the host is Linux, and the camera is an integer device index, the app first tries this pipeline:
+Capture is implemented with OpenCV. The default backend is V4L2, which tries MJPG, then YUYV, then automatic format selection. When `camera.use_gstreamer = true`, OpenCV has GStreamer support, the host is Linux, and the camera is an integer device index, the app first tries this pipeline:
 
 ```text
 v4l2src device=/dev/videoN !
@@ -80,7 +80,9 @@ videoconvert !
 appsink drop=1 max-buffers=1 sync=false
 ```
 
-If that path is unavailable or fails to open, the app falls back to V4L2 and tries MJPG, YUYV, then automatic format selection.
+If that path is unavailable or fails to open, the app falls back to V4L2.
+
+`use_gstreamer` ships as `false`. Earlier releases shipped it as `true` but the GStreamer detection never matched Debian's OpenCV build string, so the V4L2 path is the one that has been running in the field. Turn the pipeline on deliberately, then compare CPU and stability with `benchmarks/bench_capture.py` before relying on it.
 
 Important details:
 
@@ -225,7 +227,7 @@ rescan_interval_ms = 15000
 failed_camera_cooldown_sec = 30.0
 slot_count = 3
 kill_device_holders = true
-use_gstreamer = true
+use_gstreamer = false
 
 [profile]
 capture_width = 640
@@ -306,12 +308,14 @@ Test a similar GStreamer path:
 gst-launch-1.0 v4l2src device=/dev/video0 ! jpegdec ! videoconvert ! autovideosink
 ```
 
-Disable the GStreamer capture path:
+Try the GStreamer capture path (needs Debian's `python3-opencv`, not the PyPI wheel):
 
 ```ini
 [camera]
-use_gstreamer = false
+use_gstreamer = true
 ```
+
+Confirm which backend a camera is using at `INFO` level: `format 640x480 @ 25.0 FPS (V4L2)` or `(GStreamer)` in the log.
 
 Check logs:
 
