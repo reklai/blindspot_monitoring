@@ -247,12 +247,17 @@ blindspot_monitoring/
 ├── core/
 │   ├── camera.py
 │   ├── config.py
-│   └── performance.py
+│   ├── performance.py
+│   ├── recovery.py
+│   └── throttle.py
 ├── ui/
 │   ├── layout.py
+│   ├── render.py
 │   └── widgets.py
 ├── utils/
 │   └── helpers.py
+├── benchmarks/
+├── docs/
 ├── tests/
 ├── config.ini
 ├── install.sh
@@ -270,6 +275,13 @@ python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 pip install pytest pytest-qt
 python3 -m pytest tests/
+```
+
+Two benchmark scripts help judge a machine before changing the profile. The first times the render path per frame; the second runs a real capture loop against a camera and reports source rate, emitted rate, and CPU.
+
+```bash
+QT_QPA_PLATFORM=offscreen python3 benchmarks/bench_render.py --tiles 3 --ui-fps 20
+python3 benchmarks/bench_capture.py --device 0 --seconds 10
 ```
 
 ## Troubleshooting
