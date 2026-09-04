@@ -1,8 +1,14 @@
 """
-Configuration management for Camera Dashboard.
+Configuration for Camera Dashboard.
 
-Handles loading config from INI files, environment variables,
-and provides default values for all settings.
+Settings live as module-level globals so the rest of the code can read
+``config.NAME`` cheaply from any thread and tests can monkeypatch a single
+value. The INI schema is declared once in ``_OPTIONS``; ``apply_config``
+walks that table, so adding a setting means adding one row and one default.
+
+Precedence, lowest to highest: the defaults below, ``config.ini`` (or the
+file named by ``CAMERA_DASHBOARD_CONFIG``), then ``CAMERA_DASHBOARD_LOG_FILE``
+for the log path only.
 """
 
 from __future__ import annotations
@@ -11,8 +17,9 @@ import configparser
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 
 # ============================================================
@@ -81,7 +88,7 @@ RENDER_OVERHEAD_MS = 3
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# VALUE PARSERS
 # ============================================================
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -138,8 +145,76 @@ def _as_float(
     return parsed
 
 
+def _as_str(value: Any, default: str) -> str:
+    """Keep a string setting as-is; only ``None`` falls back to the default."""
+    return default if value is None else str(value)
+
+
+# ============================================================
+# INI SCHEMA
+# ============================================================
+
+@dataclass(frozen=True)
+class _Option:
+    """One INI key bound to one module global.
+
+    ``parse`` receives the raw INI text and the current global value (used as
+    the fallback for unparsable input). Bounds are passed through to the
+    numeric parsers; string and boolean options ignore them.
+    """
+
+    section: str
+    key: str
+    name: str
+    parse: Callable[..., Any]
+    min_value: Optional[float] = None
+    max_value: Optional[float] = None
+
+    def coerce(self, raw: Any, current: Any) -> Any:
+        if self.parse in (_as_int, _as_float):
+            return self.parse(raw, current, self.min_value, self.max_value)
+        return self.parse(raw, current)
+
+
+_OPTIONS: tuple[_Option, ...] = (
+    # [logging]
+    _Option("logging", "level", "LOG_LEVEL", _as_str),
+    _Option("logging", "file", "LOG_FILE", _as_str),
+    _Option("logging", "max_bytes", "LOG_MAX_BYTES", _as_int, 1024),
+    _Option("logging", "backup_count", "LOG_BACKUP_COUNT", _as_int, 1),
+    _Option("logging", "stdout", "LOG_TO_STDOUT", _as_bool),
+    # [performance]
+    _Option("performance", "dynamic_fps", "DYNAMIC_FPS_ENABLED", _as_bool),
+    _Option("performance", "perf_check_interval_ms", "PERF_CHECK_INTERVAL_MS", _as_int, 250),
+    _Option("performance", "min_dynamic_fps", "MIN_DYNAMIC_FPS", _as_int, 1),
+    _Option("performance", "min_dynamic_ui_fps", "MIN_DYNAMIC_UI_FPS", _as_int, 1),
+    _Option("performance", "ui_fps_step", "UI_FPS_STEP", _as_int, 1),
+    _Option("performance", "cpu_load_threshold", "CPU_LOAD_THRESHOLD", _as_float, 0.1, 1.0),
+    _Option("performance", "cpu_temp_threshold_c", "CPU_TEMP_THRESHOLD_C", _as_float, 30.0, 100.0),
+    _Option("performance", "stress_hold_count", "STRESS_HOLD_COUNT", _as_int, 1),
+    _Option("performance", "recover_hold_count", "RECOVER_HOLD_COUNT", _as_int, 1),
+    _Option("performance", "stale_frame_timeout_sec", "STALE_FRAME_TIMEOUT_SEC", _as_float, 0.5),
+    _Option("performance", "restart_cooldown_sec", "RESTART_COOLDOWN_SEC", _as_float, 1.0),
+    _Option("performance", "max_restarts_per_window", "MAX_RESTARTS_PER_WINDOW", _as_int, 1),
+    _Option("performance", "restart_window_sec", "RESTART_WINDOW_SEC", _as_float, 5.0),
+    # [camera]
+    _Option("camera", "rescan_interval_ms", "RESCAN_INTERVAL_MS", _as_int, 500),
+    _Option("camera", "failed_camera_cooldown_sec", "FAILED_CAMERA_COOLDOWN_SEC", _as_float, 1.0),
+    _Option("camera", "slot_count", "CAMERA_SLOT_COUNT", _as_int, 1, 8),
+    _Option("camera", "kill_device_holders", "KILL_DEVICE_HOLDERS", _as_bool),
+    _Option("camera", "use_gstreamer", "USE_GSTREAMER", _as_bool),
+    # [profile]
+    _Option("profile", "capture_width", "PROFILE_CAPTURE_WIDTH", _as_int, 160, 1920),
+    _Option("profile", "capture_height", "PROFILE_CAPTURE_HEIGHT", _as_int, 120, 1080),
+    _Option("profile", "capture_fps", "PROFILE_CAPTURE_FPS", _as_int, 1, 60),
+    _Option("profile", "ui_fps", "PROFILE_UI_FPS", _as_int, 1, 60),
+    # [health]
+    _Option("health", "log_interval_sec", "HEALTH_LOG_INTERVAL_SEC", _as_float, 5.0),
+)
+
+
 def load_config(path: Optional[str] = None) -> configparser.ConfigParser:
-    """Load configuration from INI file."""
+    """Load configuration from an INI file; a missing file yields an empty parser."""
     if path is None:
         path = CONFIG_PATH
     parser = configparser.ConfigParser()
@@ -149,188 +224,21 @@ def load_config(path: Optional[str] = None) -> configparser.ConfigParser:
 
 
 def apply_config(parser: configparser.ConfigParser) -> None:
-    """Apply loaded configuration to global settings."""
-    global LOG_LEVEL, LOG_FILE, LOG_MAX_BYTES, LOG_BACKUP_COUNT, LOG_TO_STDOUT
-    global DYNAMIC_FPS_ENABLED, PERF_CHECK_INTERVAL_MS, MIN_DYNAMIC_FPS
-    global MIN_DYNAMIC_UI_FPS, UI_FPS_STEP, CPU_LOAD_THRESHOLD, CPU_TEMP_THRESHOLD_C
-    global STRESS_HOLD_COUNT, RECOVER_HOLD_COUNT, STALE_FRAME_TIMEOUT_SEC
-    global RESTART_COOLDOWN_SEC, MAX_RESTARTS_PER_WINDOW, RESTART_WINDOW_SEC
-    global RESCAN_INTERVAL_MS, FAILED_CAMERA_COOLDOWN_SEC, CAMERA_SLOT_COUNT
-    global HEALTH_LOG_INTERVAL_SEC, KILL_DEVICE_HOLDERS
-    global PROFILE_CAPTURE_WIDTH, PROFILE_CAPTURE_HEIGHT, PROFILE_CAPTURE_FPS
-    global PROFILE_UI_FPS, USE_GSTREAMER
+    """Copy every recognised INI value into the matching module global.
 
-    if parser.has_section("logging"):
-        LOG_LEVEL = parser.get("logging", "level", fallback=LOG_LEVEL)
-        LOG_FILE = parser.get("logging", "file", fallback=LOG_FILE)
-        LOG_MAX_BYTES = _as_int(
-            parser.get("logging", "max_bytes", fallback=LOG_MAX_BYTES),
-            LOG_MAX_BYTES,
-            min_value=1024,
-        )
-        LOG_BACKUP_COUNT = _as_int(
-            parser.get("logging", "backup_count", fallback=LOG_BACKUP_COUNT),
-            LOG_BACKUP_COUNT,
-            min_value=1,
-        )
-        LOG_TO_STDOUT = _as_bool(
-            parser.get("logging", "stdout", fallback=LOG_TO_STDOUT), LOG_TO_STDOUT
-        )
-
-    if parser.has_section("performance"):
-        DYNAMIC_FPS_ENABLED = _as_bool(
-            parser.get("performance", "dynamic_fps", fallback=DYNAMIC_FPS_ENABLED),
-            DYNAMIC_FPS_ENABLED,
-        )
-        PERF_CHECK_INTERVAL_MS = _as_int(
-            parser.get(
-                "performance", "perf_check_interval_ms", fallback=PERF_CHECK_INTERVAL_MS
-            ),
-            PERF_CHECK_INTERVAL_MS,
-            min_value=250,
-        )
-        MIN_DYNAMIC_FPS = _as_int(
-            parser.get("performance", "min_dynamic_fps", fallback=MIN_DYNAMIC_FPS),
-            MIN_DYNAMIC_FPS,
-            min_value=1,
-        )
-        MIN_DYNAMIC_UI_FPS = _as_int(
-            parser.get(
-                "performance", "min_dynamic_ui_fps", fallback=MIN_DYNAMIC_UI_FPS
-            ),
-            MIN_DYNAMIC_UI_FPS,
-            min_value=1,
-        )
-        UI_FPS_STEP = _as_int(
-            parser.get("performance", "ui_fps_step", fallback=UI_FPS_STEP),
-            UI_FPS_STEP,
-            min_value=1,
-        )
-        CPU_LOAD_THRESHOLD = _as_float(
-            parser.get(
-                "performance", "cpu_load_threshold", fallback=CPU_LOAD_THRESHOLD
-            ),
-            CPU_LOAD_THRESHOLD,
-            min_value=0.1,
-            max_value=1.0,
-        )
-        CPU_TEMP_THRESHOLD_C = _as_float(
-            parser.get(
-                "performance", "cpu_temp_threshold_c", fallback=CPU_TEMP_THRESHOLD_C
-            ),
-            CPU_TEMP_THRESHOLD_C,
-            min_value=30.0,
-            max_value=100.0,
-        )
-        STRESS_HOLD_COUNT = _as_int(
-            parser.get("performance", "stress_hold_count", fallback=STRESS_HOLD_COUNT),
-            STRESS_HOLD_COUNT,
-            min_value=1,
-        )
-        RECOVER_HOLD_COUNT = _as_int(
-            parser.get(
-                "performance", "recover_hold_count", fallback=RECOVER_HOLD_COUNT
-            ),
-            RECOVER_HOLD_COUNT,
-            min_value=1,
-        )
-        STALE_FRAME_TIMEOUT_SEC = _as_float(
-            parser.get(
-                "performance",
-                "stale_frame_timeout_sec",
-                fallback=STALE_FRAME_TIMEOUT_SEC,
-            ),
-            STALE_FRAME_TIMEOUT_SEC,
-            min_value=0.5,
-        )
-        RESTART_COOLDOWN_SEC = _as_float(
-            parser.get(
-                "performance", "restart_cooldown_sec", fallback=RESTART_COOLDOWN_SEC
-            ),
-            RESTART_COOLDOWN_SEC,
-            min_value=1.0,
-        )
-        MAX_RESTARTS_PER_WINDOW = _as_int(
-            parser.get(
-                "performance",
-                "max_restarts_per_window",
-                fallback=MAX_RESTARTS_PER_WINDOW,
-            ),
-            MAX_RESTARTS_PER_WINDOW,
-            min_value=1,
-        )
-        RESTART_WINDOW_SEC = _as_float(
-            parser.get(
-                "performance", "restart_window_sec", fallback=RESTART_WINDOW_SEC
-            ),
-            RESTART_WINDOW_SEC,
-            min_value=5.0,
-        )
-
-    if parser.has_section("camera"):
-        RESCAN_INTERVAL_MS = _as_int(
-            parser.get("camera", "rescan_interval_ms", fallback=RESCAN_INTERVAL_MS),
-            RESCAN_INTERVAL_MS,
-            min_value=500,
-        )
-        FAILED_CAMERA_COOLDOWN_SEC = _as_float(
-            parser.get(
-                "camera",
-                "failed_camera_cooldown_sec",
-                fallback=FAILED_CAMERA_COOLDOWN_SEC,
-            ),
-            FAILED_CAMERA_COOLDOWN_SEC,
-            min_value=1.0,
-        )
-        CAMERA_SLOT_COUNT = _as_int(
-            parser.get("camera", "slot_count", fallback=CAMERA_SLOT_COUNT),
-            CAMERA_SLOT_COUNT,
-            min_value=1,
-            max_value=8,
-        )
-        KILL_DEVICE_HOLDERS = _as_bool(
-            parser.get("camera", "kill_device_holders", fallback=KILL_DEVICE_HOLDERS),
-            KILL_DEVICE_HOLDERS,
-        )
-        USE_GSTREAMER = _as_bool(
-            parser.get("camera", "use_gstreamer", fallback=USE_GSTREAMER), USE_GSTREAMER
-        )
-
-    if parser.has_section("profile"):
-        PROFILE_CAPTURE_WIDTH = _as_int(
-            parser.get("profile", "capture_width", fallback=PROFILE_CAPTURE_WIDTH),
-            PROFILE_CAPTURE_WIDTH,
-            min_value=160,
-            max_value=1920,
-        )
-        PROFILE_CAPTURE_HEIGHT = _as_int(
-            parser.get("profile", "capture_height", fallback=PROFILE_CAPTURE_HEIGHT),
-            PROFILE_CAPTURE_HEIGHT,
-            min_value=120,
-            max_value=1080,
-        )
-        PROFILE_CAPTURE_FPS = _as_int(
-            parser.get("profile", "capture_fps", fallback=PROFILE_CAPTURE_FPS),
-            PROFILE_CAPTURE_FPS,
-            min_value=1,
-            max_value=60,
-        )
-        PROFILE_UI_FPS = _as_int(
-            parser.get("profile", "ui_fps", fallback=PROFILE_UI_FPS),
-            PROFILE_UI_FPS,
-            min_value=1,
-            max_value=60,
-        )
-
-    if parser.has_section("health"):
-        HEALTH_LOG_INTERVAL_SEC = _as_float(
-            parser.get("health", "log_interval_sec", fallback=HEALTH_LOG_INTERVAL_SEC),
-            HEALTH_LOG_INTERVAL_SEC,
-            min_value=5.0,
-        )
+    Keys that are absent or unparsable leave the current value untouched, so
+    calling this with a partial file only overrides what the file mentions.
+    """
+    module_globals = globals()
+    for option in _OPTIONS:
+        if not parser.has_section(option.section):
+            continue
+        current = module_globals[option.name]
+        raw = parser.get(option.section, option.key, fallback=current)
+        module_globals[option.name] = option.coerce(raw, current)
 
     if LOG_FILE_ENV:
-        LOG_FILE = LOG_FILE_ENV
+        module_globals["LOG_FILE"] = LOG_FILE_ENV
 
 
 def configure_logging() -> None:
@@ -367,12 +275,15 @@ def configure_logging() -> None:
 
 
 def choose_profile(camera_count: int) -> tuple[int, int, int, int]:
-    """Pick capture resolution and FPS based on camera count.
-    
-    Resolution and FPS are exactly as configured in config.ini.
-    Dynamic FPS feature will adjust up/down at runtime based on CPU load.
-    
-    Returns: (width, height, capture_fps, ui_fps)
+    """Return the configured capture profile as (width, height, capture_fps, ui_fps).
+
+    ``camera_count`` is accepted for call-site symmetry but does not scale the
+    result: the profile is exactly what config.ini says, and dynamic FPS
+    handles load at runtime.
     """
-    # Exact values from config - no scaling
-    return (PROFILE_CAPTURE_WIDTH, PROFILE_CAPTURE_HEIGHT, PROFILE_CAPTURE_FPS, PROFILE_UI_FPS)
+    return (
+        PROFILE_CAPTURE_WIDTH,
+        PROFILE_CAPTURE_HEIGHT,
+        PROFILE_CAPTURE_FPS,
+        PROFILE_UI_FPS,
+    )

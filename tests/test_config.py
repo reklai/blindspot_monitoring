@@ -190,3 +190,69 @@ class TestConfigDefaults:
         assert 1 <= config.MIN_DYNAMIC_FPS <= 30
         assert 1 <= config.MIN_DYNAMIC_UI_FPS <= 30
         assert config.MIN_DYNAMIC_FPS <= config.PROFILE_CAPTURE_FPS
+
+
+class TestOptionTable:
+    """The INI schema table must stay in sync with the module globals."""
+
+    def test_every_option_maps_to_an_existing_global(self):
+        for option in config._OPTIONS:
+            assert hasattr(config, option.name), option.name
+
+    def test_option_keys_are_unique(self):
+        keys = [(o.section, o.key) for o in config._OPTIONS]
+        assert len(keys) == len(set(keys))
+        names = [o.name for o in config._OPTIONS]
+        assert len(names) == len(set(names))
+
+    def test_apply_config_reads_every_section(self, temp_config_file, save_restore_config):
+        config.apply_config(config.load_config(str(temp_config_file)))
+        assert config.LOG_LEVEL == "INFO"
+        assert config.LOG_FILE == "./logs/test.log" or config.LOG_FILE_ENV
+        assert config.LOG_MAX_BYTES == 1048576
+        assert config.LOG_BACKUP_COUNT == 2
+        assert config.LOG_TO_STDOUT is False
+        assert config.DYNAMIC_FPS_ENABLED is True
+        assert config.MIN_DYNAMIC_FPS == 5
+        assert config.CPU_TEMP_THRESHOLD_C == pytest.approx(75.0)
+        assert config.KILL_DEVICE_HOLDERS is False
+        assert config.USE_GSTREAMER is True
+        assert config.HEALTH_LOG_INTERVAL_SEC == pytest.approx(30.0)
+
+    def test_missing_keys_keep_current_values(self, tmp_path, save_restore_config):
+        config.CAMERA_SLOT_COUNT = 5
+        config.PROFILE_UI_FPS = 17
+        cfg = tmp_path / "partial.ini"
+        cfg.write_text("[camera]\nuse_gstreamer = false\n")
+        config.apply_config(config.load_config(str(cfg)))
+        assert config.USE_GSTREAMER is False
+        assert config.CAMERA_SLOT_COUNT == 5
+        assert config.PROFILE_UI_FPS == 17
+
+    def test_unparsable_values_keep_current_values(self, tmp_path, save_restore_config):
+        cfg = tmp_path / "bad.ini"
+        cfg.write_text("[profile]\ncapture_fps = fast\n[logging]\nstdout = maybe\n")
+        before_fps = config.PROFILE_CAPTURE_FPS
+        before_stdout = config.LOG_TO_STDOUT
+        config.apply_config(config.load_config(str(cfg)))
+        assert config.PROFILE_CAPTURE_FPS == before_fps
+        assert config.LOG_TO_STDOUT == before_stdout
+
+    def test_lower_bounds_are_enforced(self, tmp_path, save_restore_config):
+        cfg = tmp_path / "low.ini"
+        cfg.write_text(
+            "[performance]\nperf_check_interval_ms = 1\nstale_frame_timeout_sec = 0\n"
+            "[camera]\nrescan_interval_ms = 10\n[profile]\ncapture_width = 8\n"
+        )
+        config.apply_config(config.load_config(str(cfg)))
+        assert config.PERF_CHECK_INTERVAL_MS == 250
+        assert config.STALE_FRAME_TIMEOUT_SEC == pytest.approx(0.5)
+        assert config.RESCAN_INTERVAL_MS == 500
+        assert config.PROFILE_CAPTURE_WIDTH == 160
+
+    def test_log_file_env_override_wins(self, tmp_path, save_restore_config):
+        cfg = tmp_path / "log.ini"
+        cfg.write_text("[logging]\nfile = /from/ini.log\n")
+        with patch.object(config, "LOG_FILE_ENV", "/from/env.log"):
+            config.apply_config(config.load_config(str(cfg)))
+        assert config.LOG_FILE == "/from/env.log"
