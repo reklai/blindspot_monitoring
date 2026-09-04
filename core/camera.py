@@ -141,6 +141,10 @@ class CaptureWorker(QThread):
         self._last_emit = 0.0
         # Written by the worker thread, read by the UI thread; a str swap is atomic.
         self._fourcc = "unknown"
+        # Lifetime counters for diagnostics (frames pulled from the driver /
+        # frames handed to the UI). Plain ints: torn reads are impossible.
+        self.grab_count = 0
+        self.emit_count = 0
 
     # ------------------------------------------------------------------
     # UI-thread API
@@ -254,6 +258,7 @@ class CaptureWorker(QThread):
             self._close_capture()
             self._set_online(False)
             return
+        self.grab_count += 1
 
         now = time.time()
         with self._fps_lock:
@@ -266,6 +271,7 @@ class CaptureWorker(QThread):
                 self._set_online(False)
                 return
             self._last_emit = now
+            self.emit_count += 1
             self.frame_ready.emit(frame)
 
         self.msleep(1)
