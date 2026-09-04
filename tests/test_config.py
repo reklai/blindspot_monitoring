@@ -216,16 +216,15 @@ class TestOptionTable:
         assert config.MIN_DYNAMIC_FPS == 5
         assert config.CPU_TEMP_THRESHOLD_C == pytest.approx(75.0)
         assert config.KILL_DEVICE_HOLDERS is False
-        assert config.USE_GSTREAMER is True
         assert config.HEALTH_LOG_INTERVAL_SEC == pytest.approx(30.0)
 
     def test_missing_keys_keep_current_values(self, tmp_path, save_restore_config):
         config.CAMERA_SLOT_COUNT = 5
         config.PROFILE_UI_FPS = 17
         cfg = tmp_path / "partial.ini"
-        cfg.write_text("[camera]\nuse_gstreamer = false\n")
+        cfg.write_text("[camera]\nkill_device_holders = false\n")
         config.apply_config(config.load_config(str(cfg)))
-        assert config.USE_GSTREAMER is False
+        assert config.KILL_DEVICE_HOLDERS is False
         assert config.CAMERA_SLOT_COUNT == 5
         assert config.PROFILE_UI_FPS == 17
 
@@ -273,4 +272,4 @@ class TestOptionTable:
     def test_option_docs_render(self):
         text = config.option_docs()
         assert text.startswith("[logging]")
-        assert "# use_gstreamer:" in text
+        assert "# kill_device_holders:" in text

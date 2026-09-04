@@ -7,11 +7,11 @@ many frames were emitted and how much process CPU time the loop consumed.
 The "unthrottled" row disables the throttle so every grabbed frame is also
 retrieved, while asking the camera for the highest rate in the list so the
 device configuration matches that row; the difference to the throttled row
-at the same rate is what throttle-before-retrieve saves (the decode on V4L2
-MJPG, the copy on GStreamer).
+at the same rate is what throttle-before-retrieve saves (the MJPG decode
+inside retrieve()).
 
     python3 benchmarks/bench_capture.py --device 0 --seconds 6
-    python3 benchmarks/bench_capture.py --device 0 --no-gstreamer
+    python3 benchmarks/bench_capture.py --device 0 --size 320x240
 
 Needs a camera nobody else is using. Uses the same config.ini as the app for
 capture size unless overridden.
@@ -88,13 +88,10 @@ def main() -> None:
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seconds", type=float, default=6.0)
     parser.add_argument("--size", default=None, help="capture size WxH (default from config.ini)")
-    parser.add_argument("--no-gstreamer", action="store_true", help="force the V4L2 path")
     parser.add_argument("--rates", default="unthrottled,25,20,10", help="comma list of emit rates to test")
     args = parser.parse_args()
 
     config.apply_config(config.load_config())
-    if args.no_gstreamer:
-        config.USE_GSTREAMER = False
     if args.size:
         width, height = (int(v) for v in args.size.lower().split("x"))
     else:

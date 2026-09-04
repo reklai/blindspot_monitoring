@@ -29,27 +29,6 @@ class TestGetVideoIndexes:
             assert get_video_indexes() == [0, 2, 10]
 
 
-class TestGStreamerHelpers:
-    def test_pipeline_string(self):
-        pipeline = camera.gstreamer_pipeline(3, 640, 480)
-        assert pipeline.startswith("v4l2src device=/dev/video3 ! image/jpeg,width=640,height=480 !")
-        assert "jpegdec" in pipeline
-        assert pipeline.endswith("appsink drop=1 max-buffers=1 sync=false")
-
-    @pytest.mark.parametrize(
-        "build_info,expected",
-        [
-            ("  Video I/O:\n    GStreamer:                   YES (1.22.0)\n", True),
-            ("  Video I/O:\n    GStreamer:                   NO\n", False),
-            ("  Video I/O:\n    FFMPEG:                      YES\n", False),
-        ],
-    )
-    def test_gstreamer_detection(self, build_info, expected):
-        with patch("core.camera.cv2.getBuildInformation", return_value=build_info), \
-             patch("core.camera._gstreamer_available", None):
-            assert camera.gstreamer_available() is expected
-
-
 class TestTestSingleCamera:
     def test_success(self, mock_video_capture):
         assert probe_camera(0, retries=1, retry_delay=0.01) == 0

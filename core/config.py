@@ -80,9 +80,6 @@ PROFILE_CAPTURE_HEIGHT = 480
 PROFILE_CAPTURE_FPS = 25
 PROFILE_UI_FPS = 20
 
-# GStreamer pipeline support
-USE_GSTREAMER = True
-
 # Render overhead compensation (ms). Subtracted from the render timer
 # period so the achieved UI rate lands on the target instead of just under
 # it. Not an INI option; it is a property of the render path, not a site.
@@ -276,13 +273,6 @@ _OPTIONS: tuple[_Option, ...] = (
         "At start-up, terminate other processes holding a camera that will not "
         "open (a crashed previous instance, motion, ffmpeg). Kiosk setting: "
         "never enable on a shared desktop. Never applied by the runtime rescan."
-    )),
-    _Option("camera", "use_gstreamer", "USE_GSTREAMER", _as_bool, doc=(
-        "Try a GStreamer v4l2src ! jpegdec pipeline before the V4L2 backend. "
-        "Requires an OpenCV build with GStreamer (Debian's python3-opencv has "
-        "it; the PyPI wheel does not). Falls back to V4L2 per camera if the "
-        "pipeline fails to deliver a frame. The V4L2 path is what fielded "
-        "units have run; the GStreamer path is unproven there."
     )),
     # ---- [profile] ---------------------------------------------------------
     _Option("profile", "capture_width", "PROFILE_CAPTURE_WIDTH", _as_int, 160, 1920, doc=(

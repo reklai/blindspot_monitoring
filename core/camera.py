@@ -2,9 +2,9 @@
 Camera capture and discovery.
 
 ``CaptureWorker`` owns one camera on one QThread. It opens the device
-(GStreamer first when allowed, then V4L2 with MJPG, YUYV and automatic
-format), pulls frames as fast as the driver delivers them, and emits only
-the frames the dashboard asked for. Everything that touches the
+through V4L2 (asking for MJPG, then YUYV, then whatever the driver picks),
+pulls frames as fast as the driver delivers them, and emits only the
+frames the dashboard asked for. Everything that touches the
 ``cv2.VideoCapture`` handle runs on the worker thread; the UI thread only
 flips flags, adjusts the target rate under ``_fps_lock`` and reads cached
 strings.
@@ -21,7 +21,6 @@ from __future__ import annotations
 import glob as glob_module
 import logging
 import platform
-import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,55 +34,6 @@ from core.throttle import FrameThrottle
 from utils import kill_device_holders
 
 StreamLink = Union[int, str]
-
-_gstreamer_available: Optional[bool] = None
-_GSTREAMER_BUILD_LINE = re.compile(r"^\s*GStreamer\s*:\s*(\S+)", re.IGNORECASE | re.MULTILINE)
-
-
-def gstreamer_available() -> bool:
-    """Return True if this OpenCV build was compiled with GStreamer.
-
-    Parsed once from ``cv2.getBuildInformation()`` and cached: the answer
-    cannot change while the process runs.
-
-    History: the previous check compared the *last* token of the build line
-    with ``YES``. Debian's OpenCV prints ``GStreamer: YES (1.22.0)``, so the
-    last token was the version and the check always said no; fielded units
-    have therefore only ever run the V4L2 path. This function answers
-    correctly, which is why ``use_gstreamer`` now defaults to false in
-    config.ini: enabling the pipeline is a deliberate, testable step.
-    """
-    global _gstreamer_available
-    if _gstreamer_available is None:
-        try:
-            match = _GSTREAMER_BUILD_LINE.search(cv2.getBuildInformation())
-            _gstreamer_available = bool(match) and match.group(1).upper() == "YES"
-        except Exception:
-            _gstreamer_available = False
-            logging.debug("Could not check GStreamer availability", exc_info=True)
-        logging.info(
-            "GStreamer support %s in OpenCV build",
-            "detected" if _gstreamer_available else "not available",
-        )
-    return bool(_gstreamer_available)
-
-
-def gstreamer_pipeline(device_index: int, width: int, height: int) -> str:
-    """Build the low-latency MJPEG pipeline used for USB cameras.
-
-    ``queue leaky=downstream`` and ``appsink drop=1 max-buffers=1`` together
-    guarantee the sink always holds the newest frame and never blocks the
-    source, which is what a live monitor wants. ``jpegdec`` is the software
-    decoder; there is no hardware JPEG path on the Pi through this route.
-    """
-    return (
-        f"v4l2src device=/dev/video{device_index} ! "
-        f"image/jpeg,width={width},height={height} ! "
-        "queue max-size-buffers=2 leaky=downstream ! "
-        "jpegdec ! videoconvert ! "
-        "appsink drop=1 max-buffers=1 sync=false"
-    )
-
 
 def _release_quietly(cap: Optional[cv2.VideoCapture]) -> None:
     if cap is None:
@@ -150,7 +100,6 @@ class CaptureWorker(QThread):
 
         self._stop_event = threading.Event()
         self._cap: Optional[cv2.VideoCapture] = None
-        self._backend = "V4L2"
         self._online = False
         self._open_fail_count = 0
         self._reconnect_backoff = self.RECONNECT_MIN_SEC
@@ -185,8 +134,9 @@ class CaptureWorker(QThread):
         """Change the emit rate at runtime.
 
         This is software throttling only. The device is deliberately not
-        reconfigured: changing CAP_PROP_FPS restarts a GStreamer pipeline and
-        drops the connection, and the throttle alone is enough to shed load.
+        reconfigured: changing CAP_PROP_FPS on a live V4L2 stream makes some
+        drivers renegotiate and drop frames, and the throttle alone is
+        enough to shed load.
         """
         if fps is None:
             return
@@ -205,8 +155,9 @@ class CaptureWorker(QThread):
 
         The loop closes the capture itself on the way out. If it does not
         exit in time we terminate the thread and release the handle from
-        here; that is a last resort because releasing a live GStreamer
-        pipeline from another thread is not guaranteed safe.
+        here; that is a last resort because releasing a capture from another
+        thread while the driver call is still in flight is not guaranteed
+        safe.
         """
         self._stop_event.set()
         if not self.wait(self.STOP_TIMEOUT_MS):
@@ -318,76 +269,35 @@ class CaptureWorker(QThread):
     # ------------------------------------------------------------------
 
     def _open_capture(self) -> bool:
-        """Open the camera through the first backend that delivers a frame.
+        """Open the camera through the first V4L2 format that delivers a frame.
 
-        Order: GStreamer (decodes in a dedicated pipeline thread, lower
-        latency), then V4L2 asking for MJPG (fits USB 2.0 bandwidth at
-        640x480), then YUYV (no decode but 2 bytes/pixel over USB), then
-        whatever the driver picks. Each rung must actually deliver a frame
-        via grab(); isOpened() alone is true for devices that never produce
-        one, such as a UVC metadata node.
+        Order: MJPG (fits USB 2.0 bandwidth at 640x480), then YUYV (no
+        decode but 2 bytes/pixel over USB), then whatever the driver picks.
+        Each rung must actually deliver a frame via grab(); isOpened() alone
+        is true for devices that never produce one, such as a UVC metadata
+        node.
         """
         try:
             cap: Optional[cv2.VideoCapture] = None
-            backend = "V4L2"
-            if self._gstreamer_eligible():
-                cap = self._open_gstreamer()
+            for fourcc in ("MJPG", "YUYV", None):
+                logging.info("Camera %s: trying V4L2 %s", self.stream_link, fourcc or "auto")
+                cap = self._open_v4l2(fourcc)
                 if cap is not None:
-                    backend = "GStreamer"
-                else:
-                    logging.info(
-                        "Camera %s: GStreamer unavailable, falling back to V4L2",
-                        self.stream_link,
-                    )
-            if cap is None:
-                for fourcc in ("MJPG", "YUYV", None):
-                    logging.info("Camera %s: trying V4L2 %s", self.stream_link, fourcc or "auto")
-                    cap = self._open_v4l2(fourcc)
-                    if cap is not None:
-                        break
+                    break
             if cap is None:
                 logging.warning(
-                    "Camera %s: Failed to open capture (no backend worked)",
+                    "Camera %s: Failed to open capture (no format worked)",
                     self.stream_link,
                 )
                 return False
 
             self._cap = cap
-            self._backend = backend
             self._apply_camera_fps(cap)
-            self._log_opened(cap, backend)
+            self._log_opened(cap)
             return True
         except Exception:
             logging.exception("Failed to open capture %s", self.stream_link)
             return False
-
-    def _gstreamer_eligible(self) -> bool:
-        return (
-            config.USE_GSTREAMER
-            and gstreamer_available()
-            and platform.system() == "Linux"
-            and isinstance(self.stream_link, int)
-        )
-
-    def _open_gstreamer(self) -> Optional[cv2.VideoCapture]:
-        width = int(self.capture_width or 640)
-        height = int(self.capture_height or 480)
-        pipeline = gstreamer_pipeline(int(self.stream_link), width, height)
-        cap: Optional[cv2.VideoCapture] = None
-        # The whole attempt is guarded, not just the constructor: a pipeline
-        # that opens but throws inside grab() must still fall through to the
-        # V4L2 rungs rather than fail this open cycle outright.
-        try:
-            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-            if not cap or not cap.isOpened() or not cap.grab():
-                _release_quietly(cap)
-                return None
-        except Exception as exc:
-            logging.warning("GStreamer failed for camera %s: %s", self.stream_link, exc)
-            _release_quietly(cap)
-            return None
-        logging.info("GStreamer pipeline opened for camera %s (jpegdec)", self.stream_link)
-        return cap
 
     def _open_v4l2(self, fourcc: Optional[str]) -> Optional[cv2.VideoCapture]:
         backend = cv2.CAP_V4L2 if platform.system() == "Linux" else cv2.CAP_ANY
@@ -439,18 +349,17 @@ class CaptureWorker(QThread):
             self._throttle.set_fps(fps)
             self._throttle.reset()
 
-    def _log_opened(self, cap: cv2.VideoCapture, backend: str) -> None:
+    def _log_opened(self, cap: cv2.VideoCapture) -> None:
         try:
             self._fourcc = _fourcc_to_str(cap.get(cv2.CAP_PROP_FOURCC))
             if self._fourcc.strip() and self._fourcc != "MJPG":
                 logging.info("Camera %s using FOURCC=%s", self.stream_link, self._fourcc)
             logging.info(
-                "Camera %s format %dx%d @ %.1f FPS (%s)",
+                "Camera %s format %dx%d @ %.1f FPS (V4L2)",
                 self.stream_link,
                 int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
                 int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
                 float(cap.get(cv2.CAP_PROP_FPS)),
-                backend,
             )
         except Exception:
             pass
@@ -468,15 +377,9 @@ class CaptureWorker(QThread):
         if cap is None:
             return
         try:
-            if self._backend == "GStreamer":
-                # Let the pipeline finish in-flight buffers before teardown;
-                # releasing immediately can crash inside GStreamer.
-                time.sleep(0.05)
             cap.release()
         except Exception:
             logging.debug("Exception during capture release for %s", self.stream_link)
-        finally:
-            self._backend = "V4L2"
 
 
 # ============================================================

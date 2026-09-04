@@ -14,16 +14,11 @@ guide.
 - **Process shape.** One Python process: a Qt UI thread plus one `QThread`
   per camera. OpenCV releases the GIL inside `grab()`/`retrieve()`, so the
   three decodes run in parallel; everything else contends for the GIL.
-- **Pipeline, as fielded.** USB -> V4L2 MJPG -> OpenCV `grab()` ->
-  `retrieve()` (JPEG decode plus one copy into a fresh NumPy array) ->
-  queued Qt signal -> UI thread styles the frame, converts to `QPixmap`,
-  scales into the tile, `QLabel` paints. This is the V4L2 path. The
-  GStreamer path (`v4l2src ! jpegdec ! videoconvert ! appsink`, decode in
-  a pipeline thread) has never run on a unit: until this branch the build
-  check that gates it always answered "no" (it compared the last token of
-  `GStreamer: YES (1.22.0)` with `YES`). The check is fixed and
-  `use_gstreamer` now ships as `false` so the fix does not silently switch
-  backends. Enabling it is avenue 1.
+- **Pipeline.** USB -> V4L2 MJPG -> OpenCV `grab()` -> `retrieve()`
+  (JPEG decode plus one copy into a fresh NumPy array) -> queued Qt signal
+  -> UI thread styles the frame, converts to `QPixmap`, scales into the
+  tile, `QLabel` paints. There is exactly one backend, so every unit runs
+  exactly this path.
 - **Field constraint.** The code is in daily use. A change that is faster
   but crashes once a week is a regression. Every avenue below is graded on
   risk first.
@@ -56,8 +51,8 @@ Pi core is already saturated and every 0.1 ms per frame per tile counts.
 Correctness fixes that fell out of the rewrite (each is in a commit message):
 brightness compounding on re-render, hot-plug attach never completing
 (`QTimer.singleShot` from a non-Qt thread), the rescan timer stopping and
-taking the detach check with it, the GStreamer build check, and the
-restart budget's unreachable recovery branch.
+taking the detach check with it, and the restart budget's unreachable
+recovery branch.
 
 Two behaviour changes operators will notice, both intentional:
 
@@ -85,11 +80,9 @@ in order of cost on a Pi:
    is the bulk of the load. After this branch it happens only for frames
    that pass the throttle, which matters under stress: at the 10 FPS floor
    with the camera still delivering 25, 60% of the decodes are skipped.
-   (On the GStreamer path, if enabled, decode happens for every frame the
-   camera sends and the throttle only saves the copy; see avenue 1.)
-2. **Colour conversion and copies.** `videoconvert` (I420 -> BGR), the
-   `appsink` pull, OpenCV's copy into a NumPy array, Qt's `QImage` ->
-   `QPixmap` conversion, and the scale into the tile. Four full-frame
+2. **Colour conversion and copies.** OpenCV's YUV -> BGR conversion after
+   decode, its copy into a NumPy array, Qt's `QImage` -> `QPixmap`
+   conversion, and the scale into the tile. Three to four full-frame
    passes; each is ~1 ms on a Pi.
 3. **UI thread overhead.** Timer wakeups (20/s per tile), signal delivery,
    `QLabel` repaint, compositor blit. Small individually, but all serialised
@@ -102,48 +95,38 @@ in order of cost on a Pi:
 Ordering weighs expected gain against risk to a fielded system and the
 effort to validate on the Pi. "Validate" means the checklist at the end.
 
-### 1. Turn on the GStreamer pipeline, with a frame-rate cap (high gain, needs a soak)
+### 1. Ask the camera for the frame rate you will use, and keep it there (medium gain, low risk)
 
-The GStreamer path moves the JPEG decode into a pipeline thread with a
-leaky queue, so the capture thread only copies and the newest frame is
-always the one delivered; that is the latency win the pipeline was written
-for. It has simply never run on a unit. Two things to do before it can:
+The opener already sets `CAP_PROP_FPS` to the profile rate, and the
+laptop benchmark shows the camera following it. What it does not do is
+lower that rate when dynamic FPS lowers the target: the throttle then
+drops frames in software, which saves the decode but not the USB
+bandwidth or the driver-side work of receiving frames nobody wants. Some
+V4L2 drivers accept a `CAP_PROP_FPS` change on a live stream and some
+renegotiate (a brief gap of frames). Measure which the fielded cameras
+do with `bench_capture.py` and `v4l2-ctl --list-formats-ext`; if they
+accept it cleanly, apply the dynamic rate to the device on step
+boundaries. If not, leave it; the software throttle is already doing the
+expensive part.
 
-1. Add `framerate={fps}/1` to the `image/jpeg` caps. Without it the camera
-   runs at its native rate (usually 30) and `jpegdec` decodes all of it,
-   and there is no throttle-before-retrieve saving because decode is no
-   longer in `retrieve()`. With it the camera sends only what will be
-   shown, and lowering the rate under stress cuts decode in proportion.
-   Some UVC cameras only advertise a few discrete rates and the caps
-   negotiation fails, so keep it as a rung in the fallback chain
-   (with-rate, then without, then V4L2) and log which one won. Changing
-   the rate at runtime means rebuilding the pipeline; do it on dynamic-FPS
-   step boundaries only, or accept software throttling below the initial
-   rate.
-2. Give `_open_gstreamer` the same open/read timeouts the V4L2 rung has,
-   or confirm that `appsink` with `sync=false` cannot block `grab()`
-   indefinitely on a dying device. The old code's own comment warned about
-   crashes when releasing a live pipeline; the 50 ms settle before
-   `release()` is inherited, not validated.
+### 2. Hardware JPEG decode on Pi 4 (high gain, high effort, must be proven per unit)
 
-Then flip `use_gstreamer = true` on one unit and run the checklist below.
-`bench_capture.py` shows source FPS against CPU% for both backends.
+Pi 4 exposes the VideoCore JPEG decoder as a V4L2 memory-to-memory device
+(driver `bcm2835-codec`). Feeding it the raw MJPG frames from the camera
+and reading back decoded YUV would move the dominant cost off the ARM
+cores. OpenCV cannot drive an M2M device, so this means a separate capture
+implementation: raw V4L2 via `ioctl` (or a small C helper) for both the
+camera and the decoder, with the dashboard receiving decoded frames over a
+shared buffer. Pi 5 dropped that hardware block, so this is a per-model
+option, not a default.
 
-The V4L2 path already asks the camera for the target rate via
-`CAP_PROP_FPS`; the laptop benchmark shows the source rate following it.
-
-### 2. Hardware JPEG decode on Pi 4 (high gain, must be proven per unit)
-
-Pi 4 exposes the VideoCore JPEG decoder as a V4L2 M2M device and GStreamer
-has `v4l2jpegdec` for it. Swapping `jpegdec` for `v4l2jpegdec` moves the
-dominant cost off the ARM cores. Pi 5 dropped that block, so this is a
-per-model option, not a default.
-
-Risk: driver stability over multi-day uptimes with three concurrent streams
-is unproven, and the M2M device is shared, so three pipelines contend for
-it. Same pattern as avenue 1: an opt-in config key, fallback to `jpegdec`
-when the element is missing or the pipeline fails to preroll, and a 24-hour
-soak before it ships. Not worth attempting on Pi 5.
+Risk: driver stability over multi-day uptimes with three concurrent
+streams is unproven, and the M2M device is shared, so three cameras
+contend for it. It would need an opt-in config key, the existing OpenCV
+path as the fallback, and a 24-hour soak before it ships. Not worth
+attempting on Pi 5, and not worth attempting at all until avenues 1, 3
+and 4 have been measured, because the effort is an order of magnitude
+above any of them.
 
 ### 3. Match capture resolution to what is displayed (medium gain, config only)
 
@@ -155,10 +138,11 @@ how much fullscreen is used in the cab and how small an obstacle must be
 recognisable. This is a `config.ini` decision that needs numbers from
 `bench_render.py` and `bench_capture.py` on the actual unit, not code.
 
-A hybrid (capture 640x480, but tell GStreamer to scale to the tile size
-with `videoscale` before `appsink`) trades a cheap GPU-less scale in C for
-the Qt scale in the UI thread. Modest, and it interacts with fullscreen.
-Lower priority.
+A hybrid (capture 640x480, `cv2.resize` to the tile size on the worker
+thread before emitting) moves the scale off the UI thread and shrinks the
+bytes crossing into Qt, at the cost of a second full-frame pass and a
+worse fullscreen picture. Modest, and it interacts with fullscreen. Lower
+priority.
 
 ### 4. Paint frames directly instead of through QLabel (small-medium gain, low risk)
 
@@ -270,8 +254,8 @@ are a recurring cause of blank tiles.
    behaviour, with the old path as the fallback in the chain.
 3. Repeat the benchmarks, then run the app for 24 hours at `WARNING` log
    level and watch for: `Stale frame detected`, `Restart limit reached`,
-   `thread did not stop`, `Killing holders of`, and any GStreamer warnings
-   on stderr.
+   `thread did not stop`, `Killing holders of`, and any OpenCV `WARN`
+   lines on stderr.
 4. Exercise the transitions, not just uptime: unplug and replug each
    camera, use the settings-tile restart, toggle fullscreen and night mode
    at 150% brightness, and run one hot cycle with the enclosure closed.

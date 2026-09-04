@@ -94,7 +94,7 @@ apt install -y \
   libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
   libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0 \
   libqt6gui6 libqt6widgets6 \
-  v4l-utils gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad || true
+  v4l-utils || true
 
 # ---------- 3) kill processes holding cameras ----------
 
