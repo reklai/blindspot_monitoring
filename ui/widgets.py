@@ -516,7 +516,7 @@ class CameraWidget(QtWidgets.QWidget):
         while a frame is held, so a camera that opens and never delivers a
         frame is restarted at most once per frame it did deliver. The
         worker's own reconnect loop covers the unplugged case; this path is
-        for a worker that wedges after streaming. See docs/performance-avenues.md.
+        for a worker that wedges after streaming.
 
         Clocks: budget and staleness use ``time.time()``. A wall-clock step
         (NTP sync shortly after boot) can therefore trigger one spurious

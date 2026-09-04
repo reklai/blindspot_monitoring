@@ -258,7 +258,6 @@ blindspot_monitoring/
 ├── utils/
 │   └── helpers.py
 ├── benchmarks/
-├── docs/
 ├── tests/
 ├── config.ini
 ├── install.sh

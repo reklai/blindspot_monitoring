@@ -20,6 +20,9 @@ htmlcov/
 logs/
 *.log
 
+# Local engineering notes, kept out of the public repo
+docs/
+
 # Editors and OS
 .DS_Store
 .idea/

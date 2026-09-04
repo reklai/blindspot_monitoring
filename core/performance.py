@@ -6,8 +6,8 @@ normalised by core count, and the CPU temperature. Both are cheap reads
 (one libc call, one sysfs file) and run every PERF_CHECK_INTERVAL_MS on the
 UI thread. Note the load average's one-minute time constant: it lags a
 burst of work by tens of seconds, which is why the controller also needs
-STRESS_HOLD_COUNT consecutive samples before acting. See
-docs/performance-avenues.md for the case for a faster signal.
+STRESS_HOLD_COUNT consecutive samples before acting; a /proc/stat delta would
+be a faster signal.
 """
 
 from __future__ import annotations
