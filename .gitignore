@@ -1,8 +1,32 @@
-.venv/
+# Python
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+dist/
+
+# Virtual environments (created per machine, see README "Development")
+.venv/
+venv/
+
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime output (the app writes here; install.sh creates logs/)
 logs/
 *.log
+
+# Local engineering notes, kept out of the public repo
+docs/
+
+# Editors and OS
 .DS_Store
+.idea/
+.vscode/
 *.swp
 *.swo
+*~

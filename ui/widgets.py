@@ -1,32 +1,57 @@
 """
-UI Widgets for Camera Dashboard.
+Tiles for the camera grid.
 
-Contains CameraWidget for camera tiles and FullscreenOverlay for fullscreen view.
+``CameraWidget`` is one tile. It owns a ``CaptureWorker`` when a camera is
+attached, renders that worker's latest frame on a timer, watches for the
+frame stream going stale, and handles the touch/mouse gestures shared by
+every tile (tap for fullscreen, long-press to select for a swap). The same
+class, with ``settings_mode=True``, hosts the settings controls instead of
+a video label; those controls live in ``SettingsControls`` so the tile
+itself only knows that it has no video.
+
+Threading: all methods here run on the UI thread. Frames arrive through a
+queued signal from the worker thread; the render timer picks up whichever
+frame is newest, so a slow render never queues stale pictures.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from collections import deque
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional
 
-import cv2
-import numpy as np
-from numpy.typing import NDArray
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 
 from core import config
 from core.camera import CaptureWorker
+from core.recovery import RestartBudget, RestartVerdict
+from ui.render import Frame, FrameStyler
 
+PLACEHOLDER_DISCONNECTED = "DISCONNECTED"
+PLACEHOLDER_CONNECTING = "CONNECTING..."
+PLACEHOLDER_STYLE = "color: #bbbbbb; font-size: 24px;"
+
+# Workers that ignored stop() are parked here for the life of the process.
+# Deleting a running QThread aborts the process, so they must outlive their
+# tile; keeping a reference is the only safe thing left to do with them.
+_parked_workers: list[CaptureWorker] = []
+
+# Identity styler used when a tile's own styler raises on a frame.
+_RAW_STYLER = FrameStyler()
 
 
 class FullscreenOverlay(QtWidgets.QWidget):
-    """Transparent top-level widget for fullscreen display."""
+    """Frameless top-level window that shows one tile's video full screen.
+
+    It is a separate top-level window rather than a widget raised inside the
+    grid so it can cover the whole screen without disturbing the grid
+    layout underneath; the tile keeps rendering into whichever label is
+    visible (see CameraWidget._render_target). Created lazily on the first
+    fullscreen request and reused after that.
+    """
 
     def __init__(self, on_click_exit: Callable[[], None]) -> None:
-        """Create a full-window view with a centered QLabel."""
         super().__init__(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.on_click_exit = on_click_exit
         self._touch_active = False
@@ -44,13 +69,13 @@ class FullscreenOverlay(QtWidgets.QWidget):
         layout.addWidget(self.label)
 
     def mousePressEvent(self, a0: QtGui.QMouseEvent) -> None:  # type: ignore[override]
-        """Exit fullscreen on left click/tap."""
         if a0.button() == QtCore.Qt.MouseButton.LeftButton:
             self.on_click_exit()
         super().mousePressEvent(a0)
 
     def event(self, a0: QtCore.QEvent) -> bool:  # type: ignore[override]
-        # Only trigger exit on TouchEnd to prevent double-triggering
+        # Exit on TouchEnd only, so a tap does not also arrive as a synthetic
+        # mouse press and exit twice.
         if a0.type() == QtCore.QEvent.Type.TouchBegin:
             self._touch_active = True
             return True
@@ -62,13 +87,126 @@ class FullscreenOverlay(QtWidgets.QWidget):
         return super().event(a0)
 
 
+class SettingsControls(QtCore.QObject):
+    """Restart / night mode / brightness buttons for the settings tile.
+
+    Buttons are styled ``QLabel``s so they get the same touch treatment as
+    the tiles. This object builds them into the tile's layout and filters
+    their input events; the tile keeps receiving presses on the empty area
+    around them, which is how the settings tile joins swap mode.
+    """
+
+    BUTTON_STYLE = (
+        "QLabel { padding: 8px 12px; margin: 2px; background: #333; "
+        "color: white; border-radius: 4px; }"
+    )
+    SELECTED_STYLE = (
+        "QLabel { padding: 8px 12px; margin: 2px; background: #666; "
+        "color: white; border-radius: 4px; font-weight: bold; }"
+    )
+    BRIGHTNESS_PRESETS = (15, 60, 80, 100, 150)
+
+    def __init__(
+        self,
+        tile: QtWidgets.QWidget,
+        layout: QtWidgets.QVBoxLayout,
+        on_restart: Optional[Callable[[], None]],
+        on_night_mode_toggle: Optional[Callable[[], None]],
+        on_brightness_change: Optional[Callable[[int], None]],
+    ) -> None:
+        super().__init__(tile)
+        self._actions: dict[QtCore.QObject, Callable[[], None]] = {}
+        self._touch_active = False
+        self._on_brightness_change = on_brightness_change
+
+        restart = self._button("Restart", on_restart)
+        self.night_mode_button = self._button("Nightmode: Off", on_night_mode_toggle)
+
+        self._brightness_buttons: dict[int, QtWidgets.QLabel] = {}
+        brightness_row = QtWidgets.QHBoxLayout()
+        brightness_row.setSpacing(4)
+        brightness_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        for percent in self.BRIGHTNESS_PRESETS:
+            button = self._button(f"{percent}%", lambda p=percent: self._pick_brightness(p))
+            self._brightness_buttons[percent] = button
+            brightness_row.addWidget(button)
+
+        heading = QtWidgets.QLabel("Brightness")
+        heading.setStyleSheet("color: white; padding: 4px; font-weight: bold;")
+        heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        column = QtWidgets.QVBoxLayout()
+        column.addWidget(restart, alignment=Qt.AlignmentFlag.AlignCenter)
+        column.addSpacing(8)
+        column.addWidget(self.night_mode_button, alignment=Qt.AlignmentFlag.AlignCenter)
+        column.addSpacing(8)
+        column.addWidget(heading, alignment=Qt.AlignmentFlag.AlignCenter)
+        column.addLayout(brightness_row)
+
+        centered = QtWidgets.QHBoxLayout()
+        centered.addStretch(1)
+        centered.addLayout(column, stretch=1)
+        centered.addStretch(1)
+
+        layout.addStretch(1)
+        layout.addLayout(centered)
+        layout.addStretch(1)
+
+    def _button(self, text: str, action: Optional[Callable[[], None]]) -> QtWidgets.QLabel:
+        label = QtWidgets.QLabel(text)
+        label.setStyleSheet(self.BUTTON_STYLE)
+        label.setAttribute(QtCore.Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
+        label.installEventFilter(self)
+        # A button with no callback still swallows its presses; otherwise the
+        # press would fall through to the tile and count toward a long-press.
+        self._actions[label] = action if action is not None else (lambda: None)
+        return label
+
+    def _pick_brightness(self, percent: int) -> None:
+        for value, button in self._brightness_buttons.items():
+            button.setStyleSheet(self.SELECTED_STYLE if value == percent else self.BUTTON_STYLE)
+        if self._on_brightness_change is not None:
+            self._on_brightness_change(percent)
+
+    def set_night_mode_label(self, enabled: bool) -> None:
+        self.night_mode_button.setText("Nightmode: On" if enabled else "Nightmode: Off")
+
+    def eventFilter(self, a0: QtCore.QObject, a1: QtCore.QEvent) -> bool:  # type: ignore[override]
+        action = self._actions.get(a0)
+        if action is None:
+            return super().eventFilter(a0, a1)
+        kind = a1.type()
+        if kind == QtCore.QEvent.Type.TouchBegin:
+            self._touch_active = True
+            return True
+        if kind == QtCore.QEvent.Type.TouchEnd:
+            if self._touch_active:
+                self._touch_active = False
+                action()
+            return True
+        if kind == QtCore.QEvent.Type.MouseButtonPress:
+            return True
+        if kind == QtCore.QEvent.Type.MouseButtonRelease:
+            action()
+            return True
+        return super().eventFilter(a0, a1)
+
+
 class CameraWidget(QtWidgets.QWidget):
     """One tile in the grid. Manages UI input and rendering."""
 
-    # How long a press needs to be to enter "swap mode".
+    # How long a press needs to be to enter "swap mode". Shorter than a
+    # typical OS long-press so a gloved driver does not have to hold on.
     hold_threshold_ms: int = 400
+    # Minimum ms between fullscreen toggles. A touch tap arrives as TouchEnd
+    # and again as a synthesised mouse release; without this it toggles twice.
+    fullscreen_debounce_ms: int = 200
+    # Log interval for the per-tile status line.
+    status_log_interval_sec: float = 10.0
 
-    # Instance type hints
+    normal_style = "background: black;"
+    swap_ready_style = "border: 6px solid #FFFF00; background: black;"
+
     camera_stream_link: Optional[int]
     worker: Optional[CaptureWorker]
     _fs_overlay: Optional[FullscreenOverlay]
@@ -89,11 +227,9 @@ class CameraWidget(QtWidgets.QWidget):
         on_night_mode_toggle: Optional[Callable[[], None]] = None,
         on_brightness_change: Optional[Callable[[int], None]] = None,
     ) -> None:
-        """Initialize tile UI, worker thread, and timers."""
         super().__init__(parent)
         logging.debug("Creating camera %s", stream_link)
 
-        # Widget configuration: touch enabled, expands in grid, dark theme.
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
         self.setMouseTracking(True)
@@ -106,33 +242,26 @@ class CameraWidget(QtWidgets.QWidget):
         self.screen_height = max(1, height)
         self.camera_stream_link = stream_link
         self.widget_id = f"cam{stream_link}_{id(self)}"
-
-        # State used for fullscreen toggle + drag/hold swap mode.
-        self.is_fullscreen = False
-        self.grid_position = None
-        self._press_widget_id = None
-        self._press_time = 0
-        self._grid_parent = None
-        self._touch_active = False
-        self.swap_active = False
-        self._last_fullscreen_toggle_ts = 0.0
-        self._fullscreen_debounce_ms = 200  # Minimum ms between fullscreen toggles
-
-        self._fs_overlay = None
+        self.setObjectName(self.widget_id)
+        self.setStyleSheet(self.normal_style)
 
         self.capture_enabled = bool(enable_capture)
         self.placeholder_text = placeholder_text
         self.settings_mode = settings_mode
-        self.night_mode_enabled = False
-        self.brightness = 1.0  # Brightness multiplier: 1.0 = default, <1.0 = darker, >1.0 = brighter
 
-        # Normal state: solid black background; Swap state: yellow border for visual feedback
-        self.normal_style = "background: black;"
-        self.swap_ready_style = "border: 6px solid #FFFF00; background: black;"
-        self.setStyleSheet(self.normal_style)
-        self.setObjectName(self.widget_id)
+        # Gesture state: fullscreen toggle and press-and-hold swap mode.
+        # _press_widget_id records which tile saw the press so a release
+        # delivered to a different tile (finger slid) is ignored.
+        self.is_fullscreen = False
+        self.grid_position: Optional[tuple[int, int]] = None
+        self.swap_active = False
+        self._fs_overlay = None
+        self._press_widget_id: Optional[str] = None
+        self._press_time = 0.0
+        self._grid_parent: Optional[QtCore.QObject] = None
+        self._touch_active = False
+        self._last_fullscreen_toggle_ts = 0.0
 
-        # QLabel displays video frames or placeholder text; touch events enabled for interaction
         self.video_label = QtWidgets.QLabel(self)
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_label.setScaledContents(True)
@@ -143,205 +272,153 @@ class CameraWidget(QtWidgets.QWidget):
         self.video_label.setMinimumSize(1, 1)
         self.video_label.setMouseTracking(True)
         self.video_label.setObjectName(f"{self.widget_id}_label")
-        self.video_label.setAttribute(
-            QtCore.Qt.WidgetAttribute.WA_AcceptTouchEvents, True
-        )
+        self.video_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
 
-        # Zero margins/spacing creates seamless grid layout with no borders between tiles
+        # Zero margins so tiles butt up against each other with no seams.
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self._layout = layout  # Reference for swap mode margin changes
+        self._layout = layout
 
-        # Settings tile provides controls: Restart, Nightmode toggle, and Brightness adjustment
+        self._settings: Optional[SettingsControls] = None
         if self.settings_mode:
-            self.video_label.setText("")  # Hide placeholder text
-            self.video_label.setFixedSize(0, 0)  # Remove from layout
-
-            # Styled QLabels act as touch-friendly buttons
-            btn_style = "QLabel { padding: 8px 12px; margin: 2px; background: #333; color: white; border-radius: 4px; }"
-
-            # Map object names to callbacks for event handling
-            self._label_buttons = {}
-
-            def add_setting_button(text: str, callback):
-                label = QtWidgets.QLabel(text)
-                label.setStyleSheet(btn_style)
-                label.setAttribute(QtCore.Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
-                label.installEventFilter(self)
-                label.setObjectName(f"btn_{text}")
-                self._label_buttons[label.objectName()] = callback
-                return label
-
-            restart_label = add_setting_button("Restart", on_restart)
-            night_mode_label = add_setting_button("Nightmode: Off", on_night_mode_toggle)
-            self.night_mode_button = night_mode_label
-
-            # Brightness adjustment: 5 levels from dim to max
-            brightness_layout = QtWidgets.QHBoxLayout()
-            brightness_layout.setSpacing(4)
-            self._brightness_buttons = {}
-            brightness_values = [15, 60, 80, 100, 150]
-            brightness_labels = ["15%", "60%", "80%", "100%", "150%"]
-
-            # Propagate brightness changes to all camera widgets
-            self._on_brightness_change = on_brightness_change
-
-            def brightness_callback(v):
-                self._set_brightness_value(v)
-                if self._on_brightness_change:
-                    self._on_brightness_change(v)
-
-            for val, label in zip(brightness_values, brightness_labels):
-                btn = QtWidgets.QLabel(label)
-                btn = QtWidgets.QLabel(label)
-                btn.setStyleSheet(btn_style)
-                btn.setAttribute(QtCore.Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
-                btn.installEventFilter(self)
-                btn.setObjectName(f"brightness_{val}")
-                self._brightness_buttons[val] = btn
-                # Map button to callback for touch handling
-                self._label_buttons[btn.objectName()] = lambda v=val, cb=brightness_callback: cb(v)
-                brightness_layout.addWidget(btn)
-
-            self._current_brightness = 100
-
-            # Header label above brightness buttons
-            brightness_label = QtWidgets.QLabel("Brightness")
-            brightness_label.setStyleSheet("color: white; padding: 4px; font-weight: bold;")
-            brightness_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-            # Vertical layout: Restart → Nightmode → Brightness controls
-            left_layout = QtWidgets.QVBoxLayout()
-            left_layout.addWidget(restart_label, alignment=Qt.AlignmentFlag.AlignCenter)
-            left_layout.addSpacing(8)
-            left_layout.addWidget(night_mode_label, alignment=Qt.AlignmentFlag.AlignCenter)
-            left_layout.addSpacing(8)
-            left_layout.addWidget(brightness_label, alignment=Qt.AlignmentFlag.AlignCenter)
-            brightness_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            left_layout.addLayout(brightness_layout)
-
-            # Center everything in the settings tile
-            main_layout = QtWidgets.QHBoxLayout()
-            main_layout.addStretch(1)
-            main_layout.addLayout(left_layout, stretch=1)
-            main_layout.addStretch(1)
-
-            # Final layout stack
-            layout.addStretch(1)
-            layout.addLayout(main_layout)
-            layout.addStretch(1)
+            self.video_label.setText("")
+            self.video_label.setFixedSize(0, 0)
+            self._settings = SettingsControls(
+                self, layout, on_restart, on_night_mode_toggle, on_brightness_change
+            )
         else:
             layout.addWidget(self.video_label)
 
-        # Render state, staleness tracking, and caches.
-        self.frame_count = 0
-        self.prev_time = time.time()
-        self._latest_frame = None
-        self._last_placeholder_text = None
-        self._last_placeholder_fullscreen = None
+        # Frame state. `_frame_id` increments per received frame so the
+        # render timer can skip work when nothing changed; `_last_rendered_size`
+        # makes a resize (grid <-> fullscreen) repaint the same frame.
+        # `_last_frame_ts` drives stale detection and is also refreshed when
+        # the worker reports online, which gives a freshly opened device a
+        # full timeout to produce its first frame.
+        self._latest_frame: Optional[Frame] = None
         self._frame_id = 0
         self._last_rendered_id = -1
-        self._last_rendered_size = None
+        self._last_rendered_size: Optional[QtCore.QSize] = None
         self._last_frame_ts = 0.0
-        self._stale_frame_timeout_sec = config.STALE_FRAME_TIMEOUT_SEC
-        self._restart_cooldown_sec = config.RESTART_COOLDOWN_SEC
-        self._restart_window_sec = config.RESTART_WINDOW_SEC
-        self._max_restarts_per_window = config.MAX_RESTARTS_PER_WINDOW
-        self._restart_events = deque(maxlen=config.MAX_RESTARTS_PER_WINDOW * 2)
-        self._last_restart_ts = 0.0
-        self._restart_limit_logged = False
-        self._last_status_log_ts = 0.0
-        self._last_status_log_interval_sec = 10.0
+        self._last_placeholder_text: Optional[str] = None
+        self._last_placeholder_fullscreen: Optional[bool] = None
         self._pixmap_cache = QtGui.QPixmap()
-        self._scaled_pixmap_cache = None
-        self._scaled_pixmap_cache_size = None
-        self._night_gray = None
-        self._night_bgr = None
-        # Pre-computed LUT for night mode brightness (1.6x gain, clamped to 255)
-        self._night_lut = np.clip(np.arange(256, dtype=np.float32) * 1.6, 0, 255).astype(np.uint8)
-        # Brightness LUT - computed dynamically based on brightness setting
-        self._brightness_lut = np.arange(256, dtype=np.uint8)  # identity by default
+        self._scaled_pixmap_cache: Optional[QtGui.QPixmap] = None
+        self._styler = FrameStyler()
+        self._styler_failed = False
+        self.night_mode_enabled = False
+        self.brightness = 1.0
 
-        # Base FPS is the desired target; current FPS is adjusted dynamically.
+        # Stale-frame recovery.
+        self._stale_frame_timeout_sec = config.STALE_FRAME_TIMEOUT_SEC
+        self.restart_budget = RestartBudget(
+            cooldown_sec=config.RESTART_COOLDOWN_SEC,
+            window_sec=config.RESTART_WINDOW_SEC,
+            max_per_window=config.MAX_RESTARTS_PER_WINDOW,
+        )
+        self._last_status_log_ts = 0.0
+
+        # Diagnostics counters for optional UI FPS logging.
+        self.frame_count = 0
+        self.prev_time = time.time()
+
+        # Base FPS is what the profile asked for; current is after dynamic adjustment.
         self.base_target_fps = target_fps
         self.current_target_fps = target_fps
 
-        # Start capture worker in background thread (if enabled)
         self.worker = None
         if self.capture_enabled and stream_link is not None:
-            cap_w, cap_h = (
-                request_capture_size if request_capture_size else (None, None)
-            )
-            self.worker = CaptureWorker(
-                stream_link,
-                parent=self,
-                target_fps=target_fps,
-                capture_width=cap_w,
-                capture_height=cap_h,
-            )
-            self.worker.frame_ready.connect(self.on_frame)
-            self.worker.status_changed.connect(self.on_status_changed)
-            self.worker.start()
+            self._start_worker(stream_link, target_fps, request_capture_size)
         elif not self.settings_mode:
-            # No capture: set placeholder immediately
-            self._latest_frame = None
-            self._render_placeholder(self.placeholder_text or "DISCONNECTED")
+            self._render_placeholder(self.placeholder_text or PLACEHOLDER_DISCONNECTED)
 
-        # Timer to render latest frame at a stable UI FPS.
-        # Compensate for render overhead to hit actual target FPS.
-        if not self.settings_mode:
-            self.ui_render_fps = max(1, int(ui_fps))
-            self.base_ui_fps = self.ui_render_fps  # Store original for FPS recovery
-            interval = max(1, int(1000 / self.ui_render_fps) - config.RENDER_OVERHEAD_MS)
-            self.render_timer = QTimer(self)
-            self.render_timer.setInterval(interval)
-            self.render_timer.timeout.connect(self._render_latest_frame)
-            self.render_timer.start()
-        else:
+        # Render timer: paints the newest frame at a steady UI rate.
+        if self.settings_mode:
             self.ui_render_fps = 0
             self.base_ui_fps = 0
             self.render_timer = None
-
-        # Optional UI FPS diagnostics (only for real cameras)
-        if self.capture_enabled and not self.settings_mode and config.UI_FPS_LOGGING:
-            self.ui_timer = QTimer(self)
-            self.ui_timer.setInterval(1000)
-            self.ui_timer.timeout.connect(self._print_fps)
-            self.ui_timer.start()
         else:
-            self.ui_timer = None
+            self.ui_render_fps = max(1, int(ui_fps))
+            self.base_ui_fps = self.ui_render_fps
+            self.render_timer = QTimer(self)
+            self.render_timer.setInterval(self._render_interval_ms(self.ui_render_fps))
+            self.render_timer.timeout.connect(self._render_latest_frame)
+            self.render_timer.start()
 
-        # Periodic status logging for observability.
+        self.ui_timer: Optional[QTimer] = None
+        if self.capture_enabled and not self.settings_mode and config.UI_FPS_LOGGING:
+            self._start_fps_logging()
+
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(5000)
         self._status_timer.timeout.connect(self._log_status)
         self._status_timer.start()
 
+        # The label covers the whole tile, so input lands on it, not on the
+        # tile; filter both so gestures work whichever one Qt targets.
         self.installEventFilter(self)
         self.video_label.installEventFilter(self)
 
         logging.debug("Widget %s ready", self.widget_id)
 
-    def _exit_app(self) -> None:
-        """Exit the application gracefully."""
-        app = QtWidgets.QApplication.instance()
-        if app:
-            app.quit()
+    # ------------------------------------------------------------------
+    # Worker lifecycle
+    # ------------------------------------------------------------------
 
-    def _ensure_fullscreen_overlay(self) -> None:
-        """Create fullscreen overlay only when needed."""
-        if self._fs_overlay is None:
-            self._fs_overlay = FullscreenOverlay(self.exit_fullscreen)
+    def _start_worker(
+        self,
+        stream_link: int,
+        target_fps: Optional[float],
+        request_capture_size: Optional[tuple[Optional[int], Optional[int]]],
+    ) -> None:
+        cap_w, cap_h = request_capture_size if request_capture_size else (None, None)
+        worker = CaptureWorker(
+            stream_link,
+            parent=self,
+            target_fps=target_fps,
+            capture_width=cap_w,
+            capture_height=cap_h,
+        )
+        worker.frame_ready.connect(self.on_frame)
+        worker.status_changed.connect(self.on_status_changed)
+        worker.start()
+        self.worker = worker
 
-    def _apply_ui_fps(self, ui_fps: int) -> None:
-        """Update UI render timer to match camera UI FPS.
+    def _retire_worker(self, worker: CaptureWorker) -> bool:
+        """Stop a worker and release it. Returns False if it would not stop.
 
-        Compensates for render overhead to achieve actual target FPS.
+        UI thread. Either way the worker is disconnected from this tile
+        first: a worker that ignores stop() may still be blocked in the
+        driver, and if that call ever returns its frames must not paint on
+        a tile that has since been given another camera. Such a worker is
+        then unparented and parked rather than deleted, because deleting a
+        running QThread aborts the process.
         """
-        self.ui_render_fps = max(1, int(ui_fps))
-        if self.render_timer:
-            interval = max(1, int(1000 / self.ui_render_fps) - config.RENDER_OVERHEAD_MS)
-            self.render_timer.setInterval(interval)
+        try:
+            worker.stop()
+        except Exception:
+            logging.exception("Error stopping worker for %s", self.camera_stream_link)
+        for signal, slot in (
+            (worker.frame_ready, self.on_frame),
+            (worker.status_changed, self.on_status_changed),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        try:
+            worker.setParent(None)
+        except RuntimeError:
+            pass
+        if worker.isRunning():
+            if worker not in _parked_workers:
+                _parked_workers.append(worker)
+            return False
+        try:
+            worker.deleteLater()
+        except RuntimeError:
+            pass
+        return True
 
     def attach_camera(
         self,
@@ -350,14 +427,11 @@ class CameraWidget(QtWidgets.QWidget):
         request_capture_size: tuple[int, int],
         ui_fps: Optional[int] = None,
     ) -> None:
-        """Attach a camera to an existing placeholder slot."""
+        """Turn a placeholder tile into a live camera tile."""
         if self.capture_enabled and self.worker:
             return
 
-        self._restart_events.clear()
-        self._restart_limit_logged = False
-        self._last_restart_ts = 0.0
-
+        self.restart_budget.reset()
         self.capture_enabled = True
         self.camera_stream_link = stream_link
         self.base_target_fps = target_fps
@@ -365,494 +439,218 @@ class CameraWidget(QtWidgets.QWidget):
 
         if ui_fps is not None:
             self._apply_ui_fps(ui_fps)
-            self.base_ui_fps = max(1, int(ui_fps))  # Store original for FPS recovery
+            self.base_ui_fps = max(1, int(ui_fps))
 
-        cap_w, cap_h = request_capture_size if request_capture_size else (None, None)
-        self.worker = CaptureWorker(
-            stream_link,
-            parent=self,
-            target_fps=target_fps,
-            capture_width=cap_w,
-            capture_height=cap_h,
-        )
-        self.worker.frame_ready.connect(self.on_frame)
-        self.worker.status_changed.connect(self.on_status_changed)
-        self.worker.start()
-
+        self._start_worker(stream_link, target_fps, request_capture_size)
         if self.ui_timer is None and config.UI_FPS_LOGGING:
-            self.ui_timer = QTimer(self)
-            self.ui_timer.setInterval(1000)
-            self.ui_timer.timeout.connect(self._print_fps)
-            self.ui_timer.start()
+            self._start_fps_logging()
 
         self._latest_frame = None
-        self._render_placeholder("CONNECTING...")
+        self._render_placeholder(PLACEHOLDER_CONNECTING)
         logging.info("Attached camera %s to widget %s", stream_link, self.widget_id)
 
-    def eventFilter(self, a0: QtCore.QObject, a1: QtCore.QEvent) -> bool:  # type: ignore[override]
-        """Route touch/click events to appropriate handlers: settings buttons or camera widgets."""
-        # Settings tile: handle touch/click on Restart, Nightmode, and Brightness buttons
-        if self.settings_mode and isinstance(a0, QtWidgets.QLabel):
-            obj_name = a0.objectName()
-            if obj_name in self._label_buttons:
-                if a1.type() == QtCore.QEvent.Type.TouchBegin:
-                    self._touch_active = True
-                    self._press_time = time.time() * 1000.0
-                    return True
-                if a1.type() == QtCore.QEvent.Type.TouchEnd:
-                    if self._touch_active:
-                        self._touch_active = False
-                        callback = self._label_buttons.get(obj_name)
-                        if callback:
-                            callback()
-                    return True
-                if a1.type() == QtCore.QEvent.Type.MouseButtonPress:
-                    return True
-                if a1.type() == QtCore.QEvent.Type.MouseButtonRelease:
-                    callback = self._label_buttons.get(obj_name)
-                    if callback:
-                        callback()
-                    return True
+    def detach_camera(self) -> Optional[int]:
+        """Turn a live camera tile back into a placeholder.
 
-        # Allow standard button event processing
-        if isinstance(a0, QtWidgets.QPushButton):
-            return super().eventFilter(a0, a1)
-
-        if a0 not in (self, self.video_label) or a1 is None:
-            return super().eventFilter(a0, a1)
-
-        if a1.type() == QtCore.QEvent.Type.TouchBegin:
-            return self._on_touch_begin(a1)
-        if a1.type() == QtCore.QEvent.Type.TouchEnd:
-            return self._on_touch_end(a1)
-
-        if a1.type() == QtCore.QEvent.Type.MouseButtonPress:
-            return self._on_mouse_press(a1)
-        if a1.type() == QtCore.QEvent.Type.MouseButtonRelease:
-            return self._on_mouse_release(a1)
-        return super().eventFilter(a0, a1)
-
-    def _on_touch_begin(self, event: Any) -> bool:
-        """Record touch-down timestamp and source widget."""
-        try:
-            if not event.points():
-                return True
-            if len(event.points()) == 1:
-                self._touch_active = True
-                self._press_time = time.time() * 1000.0
-                self._press_widget_id = self.widget_id
-                self._grid_parent = self.parent()
-                logging.debug("Touch begin %s", self.widget_id)
-        except Exception:
-            logging.exception("touch begin")
-        return True
-
-    def _on_touch_end(self, event: Any) -> bool:
-        """Handle touch-up as a click/hold action."""
-        try:
-            if not self._touch_active:
-                return True
-            self._touch_active = False
-            self._handle_release_as_left_click()
-        except Exception:
-            logging.exception("touch end")
-        return True
-
-    def _handle_release_as_left_click(self) -> bool:
+        Returns the detached camera index, or None if there was nothing to
+        detach.
         """
-        Unified release handler:
-        - short tap: fullscreen toggle
-        - long press: swap select
-        - swap if another camera is selected
+        if not self.capture_enabled or self.settings_mode:
+            return None
+
+        detached_index = self.camera_stream_link
+        if self.worker is not None:
+            self._retire_worker(self.worker)
+            self.worker = None
+
+        self.capture_enabled = False
+        self.camera_stream_link = None
+        self._latest_frame = None
+        self._last_frame_ts = 0.0
+        self._frame_id = 0
+        self._last_rendered_id = -1
+        self.restart_budget.reset()
+        self._render_placeholder(self.placeholder_text or PLACEHOLDER_DISCONNECTED)
+
+        logging.info("Detached camera %s from widget %s", detached_index, self.widget_id)
+        return detached_index
+
+    def should_detach(self, now: float) -> bool:
+        """True when restarts are exhausted, the extended cooldown has passed,
+        and the camera is still not delivering frames."""
+        return (
+            self.capture_enabled
+            and self._latest_frame is None
+            and self.restart_budget.is_beyond_extended_cooldown(now)
+        )
+
+    def cleanup(self) -> None:
+        """Stop timers and the worker; safe to call more than once."""
+        try:
+            for timer in (self.render_timer, self.ui_timer, self._status_timer):
+                if timer is not None and timer.isActive():
+                    timer.stop()
+
+            worker = getattr(self, "worker", None)
+            if worker is not None:
+                self._retire_worker(worker)
+                self._latest_frame = None
+                self.worker = None
+
+            if self._fs_overlay is not None:
+                try:
+                    self._fs_overlay.hide()
+                    self._fs_overlay.setParent(None)
+                    self._fs_overlay.deleteLater()
+                except RuntimeError:
+                    pass
+                self._fs_overlay = None
+                self.is_fullscreen = False
+        except Exception:
+            logging.debug("cleanup failed for %s", self.widget_id, exc_info=True)
+
+    def _restart_capture_if_stale(self) -> None:
+        """Replace the worker after a stale-frame timeout, within budget.
+
+        Known limitation (pre-dates this code): stale detection only runs
+        while a frame is held, so a camera that opens and never delivers a
+        frame is restarted at most once per frame it did deliver. The
+        worker's own reconnect loop covers the unplugged case; this path is
+        for a worker that wedges after streaming.
+
+        Clocks: budget and staleness use ``time.time()``. A wall-clock step
+        (NTP sync shortly after boot) can therefore trigger one spurious
+        stale restart on every camera; harmless, but expect it in the logs.
         """
-        try:
-            if not self._press_widget_id or self._press_widget_id != self.widget_id:
-                return True
-
-            hold_time = (time.time() * 1000.0) - self._press_time
-            logging.debug("Release %s hold=%dms", self.widget_id, int(hold_time))
-
-            swap_parent = self._grid_parent
-            if not swap_parent or not hasattr(swap_parent, "selected_camera"):
-                if self.settings_mode:
-                    self._reset_mouse_state()
-                    return True
-                self._reset_mouse_state()
-                self.toggle_fullscreen()
-                return True
-
-            selected = getattr(swap_parent, "selected_camera", None)
-
-            # Cancel swap if tapping the already-selected widget
-            if selected == self:
-                logging.debug("Clear swap %s", self.widget_id)
-                setattr(swap_parent, "selected_camera", None)
-                self.swap_active = False
-                self.reset_style()
-                self._reset_mouse_state()
-                return True
-
-            # Complete swap: tap a different widget while one is selected
-            if selected and selected != self and not self.is_fullscreen:
-                other = selected
-                logging.debug("SWAP %s <-> %s", other.widget_id, self.widget_id)
-                self.do_swap(other, self, swap_parent)
-                other.swap_active = False
-                other.reset_style()
-                setattr(swap_parent, "selected_camera", None)
-                self._reset_mouse_state()
-                return True
-
-            # Long press: initiate swap mode (allowed for all tiles including settings)
-            if hold_time >= self.hold_threshold_ms and not self.is_fullscreen:
-                logging.debug("ENTER swap %s", self.widget_id)
-                setattr(swap_parent, "selected_camera", self)
-                self.swap_active = True
-                self._layout.setContentsMargins(6, 6, 6, 6)  # Expand margin for yellow border
-                self.setStyleSheet(self.swap_ready_style)
-                self._reset_mouse_state()
-                return True
-
-            # Settings tile: don't allow fullscreen on short tap
-            if self.settings_mode:
-                self._reset_mouse_state()
-                return True
-
-            logging.debug("Short tap fullscreen %s", self.widget_id)
-            self.toggle_fullscreen()
-
-        except Exception:
-            logging.exception("touch release")
-        finally:
-            self._reset_mouse_state()
-        return True
-
-    def _on_mouse_press(self, event: Any) -> bool:
-        """Record mouse down position and time."""
-        try:
-            if event.button() == QtCore.Qt.MouseButton.LeftButton:
-                self._press_time = time.time() * 1000.0
-                self._press_widget_id = self.widget_id
-                self._grid_parent = self.parent()
-                logging.debug("Press %s", self.widget_id)
-            elif event.button() == QtCore.Qt.MouseButton.RightButton:
-                self.toggle_fullscreen()
-        except Exception:
-            logging.exception("mouse press")
-        return True
-
-    def _on_mouse_release(self, event: Any) -> bool:
-        """Handle mouse release as click/hold action."""
-        if event.button() != QtCore.Qt.MouseButton.LeftButton:
-            return True
-        return self._handle_release_as_left_click()
-
-    def _reset_mouse_state(self) -> None:
-        """Clear press state to avoid accidental reuse."""
-        self._press_time = 0
-        self._press_widget_id = None
-        self._grid_parent = None
-
-    def do_swap(
-        self,
-        source: CameraWidget,
-        target: CameraWidget,
-        layout_parent: Any,
-    ) -> None:
-        """Swap two widgets inside the grid layout."""
-        try:
-            source_pos = getattr(source, "grid_position", None)
-            target_pos = getattr(target, "grid_position", None)
-            if source_pos is None or target_pos is None:
-                logging.debug("Swap failed - missing positions")
-                return
-
-            layout = layout_parent.layout()
-            layout.removeWidget(source)
-            layout.removeWidget(target)
-            layout.addWidget(target, *source_pos)
-            layout.addWidget(source, *target_pos)
-            source.grid_position, target.grid_position = target_pos, source_pos
-            logging.debug("Swap complete %s <-> %s", source.widget_id, target.widget_id)
-        except Exception:
-            logging.exception("do_swap")
-
-    def toggle_fullscreen(self) -> None:
-        """Toggle between fullscreen and grid view with debounce protection."""
-        # Debounce rapid toggles to prevent race conditions
-        now = time.time() * 1000.0
-        if (now - self._last_fullscreen_toggle_ts) < self._fullscreen_debounce_ms:
-            logging.debug("Fullscreen toggle debounced for %s", self.widget_id)
+        if not self.capture_enabled or not self.worker:
             return
-        self._last_fullscreen_toggle_ts = now
-
-        if self.is_fullscreen:
-            self.exit_fullscreen()
-        else:
-            self.go_fullscreen()
-
-    def go_fullscreen(self) -> None:
-        """Enter fullscreen mode for this camera."""
-        if self.is_fullscreen:
+        now = time.time()
+        was_exhausted = self.restart_budget.exhausted
+        verdict = self.restart_budget.request(now)
+        if verdict is RestartVerdict.COOLING_DOWN:
             return
-        self._ensure_fullscreen_overlay()
+        if verdict is RestartVerdict.EXHAUSTED:
+            if not was_exhausted:
+                logging.warning(
+                    "Restart limit reached for %s, will retry in %.0fs",
+                    self.camera_stream_link,
+                    self.restart_budget.extended_cooldown_sec,
+                )
+            return
+        if verdict is RestartVerdict.RECOVERED:
+            logging.info(
+                "Extended cooldown passed for %s, attempting recovery",
+                self.camera_stream_link,
+            )
 
-        if self._fs_overlay is None:
+        old_worker = self.worker
+        logging.info("Restarting capture for %s after stale frames", self.camera_stream_link)
+        if not self._retire_worker(old_worker):
+            logging.error(
+                "Old worker for %s still running after stop() - potential resource leak",
+                self.camera_stream_link,
+            )
             return
 
-        screen = QtWidgets.QApplication.primaryScreen()
-        if screen:
-            self._fs_overlay.setGeometry(screen.geometry())
-
-        self._fs_overlay.showFullScreen()
-        self._fs_overlay.raise_()
-        self._fs_overlay.activateWindow()
-        self.is_fullscreen = True
-
-        if self._latest_frame is None and not self.settings_mode:
-            self._render_placeholder(self.placeholder_text or "DISCONNECTED")
-
-    def exit_fullscreen(self) -> None:
-        """Exit fullscreen and return to grid view."""
-        if not self.is_fullscreen:
+        if self.camera_stream_link is None:
             return
-        if self._fs_overlay:
-            self._fs_overlay.hide()
-        self.is_fullscreen = False
+        self._start_worker(
+            self.camera_stream_link,
+            self.current_target_fps or self.base_target_fps,
+            (old_worker.capture_width, old_worker.capture_height),
+        )
+        self._render_placeholder(PLACEHOLDER_CONNECTING)
+
+    # ------------------------------------------------------------------
+    # Frame intake and rendering
+    # ------------------------------------------------------------------
 
     @pyqtSlot(object)
-    def on_frame(self, frame_bgr: NDArray[np.uint8]) -> None:
-        """Receive latest camera frame from worker."""
-        try:
-            if frame_bgr is None:
-                return
-            # Return previous frame to pool before updating _latest_frame.
-            # Note: Both on_frame (signal/slot) and _render_latest_frame (timer)
-            # run on the main thread via Qt's event loop, so no actual race exists.
-            # We return before updating as a defensive pattern for clarity.
-            previous_frame = self._latest_frame
-            if previous_frame is not None and self.worker is not None:
-                try:
-                    self.worker.return_frame(previous_frame)
-                except Exception:
-                    logging.debug("Failed to return frame to pool", exc_info=True)
-            # Now safe to update the latest frame
-            self._latest_frame = frame_bgr
-            self._frame_id += 1
-            self._last_frame_ts = time.time()
-        except Exception:
-            logging.exception("on_frame")
+    def on_frame(self, frame_bgr: Frame) -> None:
+        """Keep the newest frame; the render timer will paint it.
 
-    def _release_current_frame(self, worker: Optional[CaptureWorker] = None) -> None:
-        """Return current frame buffer to pool and clear reference."""
-        if self._latest_frame is None:
+        UI thread, via queued connection. From here the tile owns the array:
+        the worker dropped its reference on emit, and the styler never
+        writes to it, so it is safe to hold until the next frame replaces it.
+        """
+        if frame_bgr is None:
             return
-        if worker is None:
-            worker = self.worker
-        if worker is not None:
-            try:
-                worker.return_frame(self._latest_frame)
-            except Exception:
-                logging.debug("Failed to return frame to pool", exc_info=True)
-        self._latest_frame = None
+        self._latest_frame = frame_bgr
+        self._frame_id += 1
+        self._last_frame_ts = time.time()
 
-    def _dispose_worker(self, worker: CaptureWorker) -> None:
-        """Disconnect and schedule a worker for deletion."""
-        try:
-            worker.frame_ready.disconnect(self.on_frame)
-        except Exception:
-            pass
-        try:
-            worker.status_changed.disconnect(self.on_status_changed)
-        except Exception:
-            pass
-        try:
-            worker.setParent(None)
-            worker.deleteLater()
-        except Exception:
-            pass
+    @pyqtSlot(bool)
+    def on_status_changed(self, online: bool) -> None:
+        # Queued from the worker thread. "online" means the device opened;
+        # frames may still take a moment, hence the timestamp refresh.
+        if online:
+            self.setStyleSheet(self.swap_ready_style if self.swap_active else self.normal_style)
+            self.video_label.setText("")
+            self._last_frame_ts = time.time()
+        else:
+            self._latest_frame = None
+            self._last_rendered_id = -1
+            self._render_placeholder(PLACEHOLDER_DISCONNECTED)
+
+    @staticmethod
+    def _render_interval_ms(ui_fps: int) -> int:
+        # Shave the average render cost off the period so the achieved rate
+        # lands on the target instead of just under it.
+        return max(1, int(1000 / max(1, ui_fps)) - config.RENDER_OVERHEAD_MS)
+
+    def _apply_ui_fps(self, ui_fps: int) -> None:
+        self.ui_render_fps = max(1, int(ui_fps))
+        if self.render_timer:
+            self.render_timer.setInterval(self._render_interval_ms(self.ui_render_fps))
+
+    def _render_target(self) -> tuple[QtWidgets.QLabel, QtCore.QSize]:
+        if self.is_fullscreen and self._fs_overlay is not None:
+            return self._fs_overlay.label, self._fs_overlay.size()
+        return self.video_label, self.video_label.size()
 
     def _render_placeholder(self, text: str) -> None:
-        """Render placeholder text when no frame is available."""
         if self.settings_mode:
             return
+        # Called every render tick while there is no frame, so skip the label
+        # update unless the text or the target label changed. Swap mode
+        # always re-applies its border style, which setText would otherwise
+        # leave stale.
         if (
             text == self._last_placeholder_text
             and not self.swap_active
             and self.is_fullscreen == self._last_placeholder_fullscreen
         ):
             return
-        target_label = (
-            self._fs_overlay.label
-            if (self.is_fullscreen and self._fs_overlay)
-            else self.video_label
-        )
-        target_label.setPixmap(QtGui.QPixmap())
-        target_label.setText(text)
-        target_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        target_label.setStyleSheet("color: #bbbbbb; font-size: 24px;")
+        label, _ = self._render_target()
+        label.setPixmap(QtGui.QPixmap())
+        label.setText(text)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet(PLACEHOLDER_STYLE)
         self._last_placeholder_text = text
         self._last_placeholder_fullscreen = self.is_fullscreen
         if self.swap_active:
             self.setStyleSheet(self.swap_ready_style)
 
     def _render_latest_frame(self) -> None:
-        """Convert latest frame to QPixmap and display it."""
         if self.settings_mode:
             return
         try:
-            frame_bgr = self._latest_frame
-            if frame_bgr is None:
-                self._render_placeholder(self.placeholder_text or "DISCONNECTED")
+            frame = self._latest_frame
+            if frame is None:
+                self._render_placeholder(self.placeholder_text or PLACEHOLDER_DISCONNECTED)
                 return
 
-            if (
-                self._last_frame_ts
-                and (time.time() - self._last_frame_ts) > self._stale_frame_timeout_sec
-            ):
-                stale_duration = time.time() - self._last_frame_ts
-                logging.warning(
-                    "Camera %s: Stale frame detected (no frames for %.1fs)",
-                    self.camera_stream_link,
-                    stale_duration,
-                )
-                self._release_current_frame()
-                # Reset frame IDs to ensure placeholder renders on next call
-                self._last_rendered_id = -1
-                self._render_placeholder("DISCONNECTED")
-                self._restart_capture_if_stale()
+            now = time.time()
+            if self._last_frame_ts and (now - self._last_frame_ts) > self._stale_frame_timeout_sec:
+                self._handle_stale(now - self._last_frame_ts)
                 return
 
-            if self.is_fullscreen and self._fs_overlay:
-                target_size = self._fs_overlay.size()
-            else:
-                target_size = self.video_label.size()
-
-            if (
-                self._frame_id == self._last_rendered_id
-                and self._last_rendered_size == target_size
-            ):
+            label, target_size = self._render_target()
+            if self._frame_id == self._last_rendered_id and self._last_rendered_size == target_size:
                 return
 
-            if self.night_mode_enabled:
-                try:
-                    if frame_bgr.ndim == 2:
-                        h, w = frame_bgr.shape
-                    else:
-                        h, w = frame_bgr.shape[:2]
-
-                    # Lazy allocate night mode buffers (only once per resolution)
-                    if self._night_gray is None or self._night_gray.shape != (h, w):
-                        self._night_gray = np.empty((h, w), dtype=np.uint8)
-                    if self._night_bgr is None or self._night_bgr.shape[:2] != (h, w):
-                        # Use contiguous array for efficient Qt buffer access
-                        self._night_bgr = np.zeros((h, w, 3), dtype=np.uint8, order='C')
-
-                    if frame_bgr.ndim == 2:
-                        # Apply brightness LUT directly to grayscale (in-place)
-                        cv2.LUT(frame_bgr, self._night_lut, dst=self._night_gray)
-                    else:
-                        # Convert to grayscale, then apply brightness LUT (in-place)
-                        cv2.cvtColor(
-                            frame_bgr, cv2.COLOR_BGR2GRAY, dst=self._night_gray
-                        )
-                        cv2.LUT(self._night_gray, self._night_lut, dst=self._night_gray)
-
-                    # Optimized: only update red channel, B/G stay zero from allocation
-                    # Use direct slice assignment (faster than np.copyto for this pattern)
-                    self._night_bgr[:, :, 2] = self._night_gray
-                    frame_bgr = self._night_bgr
-                except Exception:
-                    logging.debug("Night mode processing failed", exc_info=True)
-
-            # Apply brightness adjustment (if not 1.0)
-            if self.brightness != 1.0:
-                try:
-                    if frame_bgr.ndim == 2:
-                        temp = np.empty_like(frame_bgr)
-                        cv2.LUT(frame_bgr, self._brightness_lut, dst=temp)
-                        frame_bgr = temp
-                    else:
-                        # Apply to each channel
-                        for i in range(3):
-                            temp = np.empty_like(frame_bgr[:, :, i])
-                            cv2.LUT(frame_bgr[:, :, i], self._brightness_lut, dst=temp)
-                            frame_bgr[:, :, i] = temp
-                except Exception:
-                    logging.debug("Brightness processing failed", exc_info=True)
-
-            # Convert numpy frame to Qt image, handling grayscale or BGR.
-            # Ensure contiguous memory layout for direct buffer access (avoids copy).
-            if not frame_bgr.flags['C_CONTIGUOUS']:
-                frame_bgr = np.ascontiguousarray(frame_bgr)
-
-            if frame_bgr.ndim == 2:
-                h, w = frame_bgr.shape[:2]
-                bytes_per_line = w
-                img = QtGui.QImage(
-                    frame_bgr.data,
-                    w,
-                    h,
-                    bytes_per_line,
-                    QtGui.QImage.Format.Format_Grayscale8,
-                )
-            else:
-                h, w = frame_bgr.shape[:2]
-                ch = frame_bgr.shape[2] if frame_bgr.ndim > 2 else 1
-                bytes_per_line = ch * w
-                img = QtGui.QImage(
-                    frame_bgr.data,
-                    w,
-                    h,
-                    bytes_per_line,
-                    QtGui.QImage.Format.Format_BGR888,
-                )
-
-            self._pixmap_cache.convertFromImage(img)
-
-            # Fullscreen scales to screen size; grid uses label size.
-            if self.is_fullscreen and self._fs_overlay:
-                if target_size.width() > 0 and target_size.height() > 0:
-                    if (
-                        self._scaled_pixmap_cache is None
-                        or self._scaled_pixmap_cache_size != target_size
-                    ):
-                        self._scaled_pixmap_cache = QtGui.QPixmap(target_size)
-                        self._scaled_pixmap_cache_size = target_size
-                    self._scaled_pixmap_cache.fill(Qt.GlobalColor.black)
-                    target_rect = QtCore.QRect(
-                        0, 0, target_size.width(), target_size.height()
-                    )
-                    painter = QtGui.QPainter(self._scaled_pixmap_cache)
-                    painter.drawPixmap(target_rect, self._pixmap_cache)
-                    painter.end()
-                    self._fs_overlay.label.setPixmap(self._scaled_pixmap_cache)
-                else:
-                    self._fs_overlay.label.setPixmap(self._pixmap_cache)
-                self._fs_overlay.label.setText("")
-            else:
-                if (
-                    target_size.width() > 0
-                    and target_size.height() > 0
-                    and self._pixmap_cache.size() != target_size
-                ):
-                    if (
-                        self._scaled_pixmap_cache is None
-                        or self._scaled_pixmap_cache_size != target_size
-                    ):
-                        self._scaled_pixmap_cache = QtGui.QPixmap(target_size)
-                        self._scaled_pixmap_cache_size = target_size
-                    self._scaled_pixmap_cache.fill(Qt.GlobalColor.black)
-                    target_rect = QtCore.QRect(
-                        0, 0, target_size.width(), target_size.height()
-                    )
-                    painter = QtGui.QPainter(self._scaled_pixmap_cache)
-                    painter.drawPixmap(target_rect, self._pixmap_cache)
-                    painter.end()
-                    self.video_label.setPixmap(self._scaled_pixmap_cache)
-                else:
-                    self.video_label.setPixmap(self._pixmap_cache)
-                self.video_label.setText("")
+            self._pixmap_cache.convertFromImage(self._style_or_raw(frame))
+            self._present(label, target_size)
 
             self._last_rendered_id = self._frame_id
             self._last_rendered_size = target_size
@@ -863,23 +661,288 @@ class CameraWidget(QtWidgets.QWidget):
         except Exception:
             logging.exception("render frame")
 
-    @pyqtSlot(bool)
-    def on_status_changed(self, online: bool) -> None:
-        """Update UI when camera goes online or offline."""
-        if online:
-            # Preserve yellow border if swap mode is active
-            self.setStyleSheet(
-                self.swap_ready_style if self.swap_active else self.normal_style
-            )
-            self.video_label.setText("")
-            self._last_frame_ts = time.time()
-        else:
-            self._release_current_frame()
-            self._last_rendered_id = -1
-            self._render_placeholder("DISCONNECTED")
+    def _style_or_raw(self, frame: Frame) -> QtGui.QImage:
+        """Style the frame; on failure paint it unstyled rather than blank.
+
+        A frame shape the styler cannot handle (a 4-channel buffer from an
+        unusual backend, say) must not turn into a dead tile with an ERROR
+        line 20 times a second. Logged once per tile.
+        """
+        try:
+            return self._styler.to_qimage(frame)
+        except Exception:
+            if not self._styler_failed:
+                self._styler_failed = True
+                logging.warning(
+                    "Camera %s: styling failed, showing raw frames",
+                    self.camera_stream_link,
+                    exc_info=True,
+                )
+            return _RAW_STYLER.to_qimage(frame)
+
+    def _handle_stale(self, stale_for: float) -> None:
+        # Dropping the frame matters: with no frame the render loop goes to
+        # the placeholder path and stops calling this, so one stall produces
+        # one restart request, not one per tick. The next frame from the new
+        # worker re-arms stale detection.
+        logging.warning(
+            "Camera %s: Stale frame detected (no frames for %.1fs)",
+            self.camera_stream_link,
+            stale_for,
+        )
+        self._latest_frame = None
+        self._last_rendered_id = -1
+        self._render_placeholder(PLACEHOLDER_DISCONNECTED)
+        self._restart_capture_if_stale()
+
+    def _present(self, label: QtWidgets.QLabel, target_size: QtCore.QSize) -> None:
+        """Put the cached pixmap on ``label``, pre-scaled to ``target_size``.
+
+        Scaling here (rather than letting the label do it on paint) keeps
+        the cost predictable and lets the scaled buffer be reused.
+        """
+        pixmap = self._pixmap_cache
+        if (
+            target_size.width() > 0
+            and target_size.height() > 0
+            and pixmap.size() != target_size
+        ):
+            scaled = self._scaled_pixmap_cache
+            if scaled is None or scaled.size() != target_size:
+                scaled = QtGui.QPixmap(target_size)
+                self._scaled_pixmap_cache = scaled
+            scaled.fill(Qt.GlobalColor.black)
+            painter = QtGui.QPainter(scaled)
+            painter.drawPixmap(QtCore.QRect(QtCore.QPoint(0, 0), target_size), pixmap)
+            painter.end()
+            pixmap = scaled
+        label.setPixmap(pixmap)
+        label.setText("")
+
+    # ------------------------------------------------------------------
+    # Appearance and rate controls (called from the dashboard)
+    # ------------------------------------------------------------------
+
+    def set_night_mode(self, enabled: bool) -> None:
+        self.night_mode_enabled = bool(enabled)
+        self._styler.set_night_mode(self.night_mode_enabled)
+        self._last_rendered_id = -1  # repaint the current frame with the new look
+
+    def set_night_mode_button_label(self, enabled: bool) -> None:
+        if self._settings is not None:
+            self._settings.set_night_mode_label(enabled)
+
+    def set_brightness(self, value: float) -> None:
+        """Set the brightness multiplier (1.0 = as captured); clamped by the styler."""
+        self._styler.set_brightness(value)
+        self.brightness = self._styler.brightness
+        self._last_rendered_id = -1
+
+    def set_dynamic_fps(self, fps: Optional[float]) -> None:
+        """Apply a capture-rate change from the stress monitor."""
+        if fps is None or not self.capture_enabled:
+            return
+        try:
+            fps = max(float(fps), float(config.MIN_DYNAMIC_FPS))
+        except (TypeError, ValueError):
+            return
+        self.current_target_fps = fps
+        if self.worker:
+            self.worker.set_target_fps(fps)
+
+    def set_dynamic_ui_fps(self, ui_fps: int) -> None:
+        """Apply a render-rate change from the stress monitor."""
+        if self.settings_mode:
+            return
+        try:
+            ui_fps = max(int(ui_fps), int(config.MIN_DYNAMIC_UI_FPS))
+        except (TypeError, ValueError):
+            return
+        self._apply_ui_fps(ui_fps)
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    def _start_fps_logging(self) -> None:
+        self.ui_timer = QTimer(self)
+        self.ui_timer.setInterval(1000)
+        self.ui_timer.timeout.connect(self._print_fps)
+        self.ui_timer.start()
+
+    def _print_fps(self) -> None:
+        if not config.UI_FPS_LOGGING:
+            return
+        now = time.time()
+        elapsed = now - self.prev_time
+        if elapsed >= 1.0:
+            logging.info("%s FPS: %.1f", self.widget_id, self.frame_count / elapsed)
+            self.frame_count = 0
+            self.prev_time = now
+
+    def _log_status(self) -> None:
+        if self.settings_mode or self.camera_stream_link is None:
+            return
+        now = time.time()
+        if (now - self._last_status_log_ts) < self.status_log_interval_sec:
+            return
+        self._last_status_log_ts = now
+        logging.info(
+            "Camera %s status online=%s fps=%.1f ui_fps=%d fourcc=%s",
+            self.camera_stream_link,
+            "yes" if self._latest_frame is not None else "no",
+            float(self.current_target_fps or 0),
+            int(self.ui_render_fps or 0),
+            self.worker.get_fourcc() if self.worker is not None else "unknown",
+        )
+
+    # ------------------------------------------------------------------
+    # Gestures: tap = fullscreen, hold = swap select
+    # ------------------------------------------------------------------
+
+    def eventFilter(self, a0: QtCore.QObject, a1: QtCore.QEvent) -> bool:  # type: ignore[override]
+        if a0 not in (self, self.video_label) or a1 is None:
+            return super().eventFilter(a0, a1)
+        kind = a1.type()
+        if kind == QtCore.QEvent.Type.TouchBegin:
+            return self._on_touch_begin(a1)
+        if kind == QtCore.QEvent.Type.TouchEnd:
+            return self._on_touch_end()
+        if kind == QtCore.QEvent.Type.MouseButtonPress:
+            return self._on_mouse_press(a1)
+        if kind == QtCore.QEvent.Type.MouseButtonRelease:
+            return self._on_mouse_release(a1)
+        return super().eventFilter(a0, a1)
+
+    def _begin_press(self) -> None:
+        self._press_time = time.time() * 1000.0
+        self._press_widget_id = self.widget_id
+        self._grid_parent = self.parent()
+
+    def _reset_mouse_state(self) -> None:
+        self._press_time = 0.0
+        self._press_widget_id = None
+        self._grid_parent = None
+
+    def _on_touch_begin(self, event: Any) -> bool:
+        try:
+            points = event.points()
+            if len(points) == 1:
+                self._touch_active = True
+                self._begin_press()
+                logging.debug("Touch begin %s", self.widget_id)
+        except Exception:
+            logging.exception("touch begin")
+        return True
+
+    def _on_touch_end(self) -> bool:
+        try:
+            if self._touch_active:
+                self._touch_active = False
+                self._handle_release_as_left_click()
+        except Exception:
+            logging.exception("touch end")
+        return True
+
+    def _on_mouse_press(self, event: Any) -> bool:
+        try:
+            if event.button() == QtCore.Qt.MouseButton.LeftButton:
+                self._begin_press()
+                logging.debug("Press %s", self.widget_id)
+            elif event.button() == QtCore.Qt.MouseButton.RightButton:
+                self.toggle_fullscreen()
+        except Exception:
+            logging.exception("mouse press")
+        return True
+
+    def _on_mouse_release(self, event: Any) -> bool:
+        if event.button() != QtCore.Qt.MouseButton.LeftButton:
+            return True
+        return self._handle_release_as_left_click()
+
+    def _handle_release_as_left_click(self) -> bool:
+        """Resolve a press/release pair into a tap, a hold, or a swap.
+
+        With a tile already selected for swapping, a tap on any other tile
+        completes the swap and a tap on the selected tile cancels it. Otherwise
+        a hold selects this tile and a tap toggles fullscreen. The settings
+        tile can be swapped but never goes fullscreen.
+        """
+        try:
+            if self._press_widget_id != self.widget_id:
+                return True
+            hold_time = (time.time() * 1000.0) - self._press_time
+            logging.debug("Release %s hold=%dms", self.widget_id, int(hold_time))
+
+            grid = self._grid_parent
+            if grid is None or not hasattr(grid, "selected_camera"):
+                if not self.settings_mode:
+                    self.toggle_fullscreen()
+                return True
+
+            selected = getattr(grid, "selected_camera", None)
+            if selected is self:
+                logging.debug("Clear swap %s", self.widget_id)
+                setattr(grid, "selected_camera", None)
+                self.swap_active = False
+                self.reset_style()
+                return True
+
+            if selected is not None and not self.is_fullscreen:
+                logging.debug("SWAP %s <-> %s", selected.widget_id, self.widget_id)
+                self.do_swap(selected, self, grid)
+                selected.swap_active = False
+                selected.reset_style()
+                setattr(grid, "selected_camera", None)
+                return True
+
+            if hold_time >= self.hold_threshold_ms and not self.is_fullscreen:
+                logging.debug("ENTER swap %s", self.widget_id)
+                setattr(grid, "selected_camera", self)
+                self.swap_active = True
+                self._layout.setContentsMargins(6, 6, 6, 6)  # room for the border
+                self.setStyleSheet(self.swap_ready_style)
+                return True
+
+            if not self.settings_mode:
+                logging.debug("Short tap fullscreen %s", self.widget_id)
+                self.toggle_fullscreen()
+        except Exception:
+            logging.exception("touch release")
+        finally:
+            self._reset_mouse_state()
+        return True
+
+    def do_swap(
+        self,
+        source: CameraWidget,
+        target: CameraWidget,
+        layout_parent: Any,
+    ) -> None:
+        """Exchange two tiles' grid cells."""
+        try:
+            source_pos = source.grid_position
+            target_pos = target.grid_position
+            if source_pos is None or target_pos is None:
+                logging.debug("Swap failed - missing positions")
+                return
+            layout = layout_parent.layout()
+            layout.removeWidget(source)
+            layout.removeWidget(target)
+            layout.addWidget(target, *source_pos)
+            layout.addWidget(source, *target_pos)
+            source.grid_position, target.grid_position = target_pos, source_pos
+            logging.debug("Swap complete %s <-> %s", source.widget_id, target.widget_id)
+        except Exception:
+            logging.exception("do_swap")
 
     def reset_style(self) -> None:
-        """Restore default border styling and margins."""
+        """Restore border styling and margins after leaving swap mode.
+
+        The 2 px margin after a swap (versus 0 px at start-up) is long-standing
+        behaviour; it makes a tile that has been moved look very slightly
+        inset and has not bothered anyone in the field, so it is kept.
+        """
         self.video_label.setStyleSheet("")
         if self.swap_active:
             self._layout.setContentsMargins(6, 6, 6, 6)
@@ -888,261 +951,41 @@ class CameraWidget(QtWidgets.QWidget):
             self._layout.setContentsMargins(2, 2, 2, 2)
             self.setStyleSheet(self.normal_style)
 
-    def _print_fps(self) -> None:
-        """Log rendering FPS for this widget."""
-        if not config.UI_FPS_LOGGING:
-            return
-        try:
-            now = time.time()
-            elapsed = now - self.prev_time
-            if elapsed >= 1.0:
-                fps = self.frame_count / elapsed if elapsed > 0 else 0.0
-                logging.info("%s FPS: %.1f", self.widget_id, fps)
-                self.frame_count = 0
-                self.prev_time = now
-        except Exception:
-            logging.debug("FPS logging exception", exc_info=True)
+    # ------------------------------------------------------------------
+    # Fullscreen
+    # ------------------------------------------------------------------
 
-    def set_dynamic_fps(self, fps: Optional[float]) -> None:
-        """Apply dynamic FPS change from stress monitor."""
-        if fps is None or not self.capture_enabled:
+    def toggle_fullscreen(self) -> None:
+        now = time.time() * 1000.0
+        if (now - self._last_fullscreen_toggle_ts) < self.fullscreen_debounce_ms:
+            logging.debug("Fullscreen toggle debounced for %s", self.widget_id)
             return
-        try:
-            fps = float(fps)
-            if fps < config.MIN_DYNAMIC_FPS:
-                fps = config.MIN_DYNAMIC_FPS
-            self.current_target_fps = fps
-            if self.worker:
-                self.worker.set_target_fps(fps)
-        except Exception:
-            logging.exception("set_dynamic_fps")
-
-    def set_dynamic_ui_fps(self, ui_fps: int) -> None:
-        """Apply dynamic UI FPS change from stress monitor."""
-        if self.settings_mode:
-            return
-        try:
-            ui_fps = int(ui_fps)
-            if ui_fps < config.MIN_DYNAMIC_UI_FPS:
-                ui_fps = config.MIN_DYNAMIC_UI_FPS
-            self._apply_ui_fps(ui_fps)
-        except Exception:
-            logging.exception("set_dynamic_ui_fps")
-
-    def _restart_capture_if_stale(self) -> None:
-        """Restart the capture worker after a stale frame timeout."""
-        if not self.capture_enabled or not self.worker:
-            return
-        now = time.time()
-        if (now - self._last_restart_ts) < self._restart_cooldown_sec:
-            return
-        recent = [
-            t for t in self._restart_events if (now - t) <= self._restart_window_sec
-        ]
-        if len(recent) >= self._max_restarts_per_window:
-            # Don't give up forever - schedule a retry after extended cooldown
-            extended_cooldown = self._restart_window_sec * 2  # 60 seconds
-            if (now - self._last_restart_ts) < extended_cooldown:
-                if not getattr(self, '_restart_limit_logged', False):
-                    logging.warning(
-                        "Restart limit reached for %s, will retry in %.0fs",
-                        self.camera_stream_link,
-                        extended_cooldown
-                    )
-                    self._restart_limit_logged = True
-                return
-            # Extended cooldown passed, clear events and allow restart
-            logging.info(
-                "Extended cooldown passed for %s, attempting recovery",
-                self.camera_stream_link
-            )
-            self._restart_events.clear()
-            self._restart_limit_logged = False
-        
-        self._restart_events.append(now)
-        self._last_restart_ts = now
-        
-        # Store old worker reference to verify cleanup
-        old_worker = self.worker
-        cap_w = getattr(old_worker, "capture_width", None)
-        cap_h = getattr(old_worker, "capture_height", None)
-        target_fps = self.current_target_fps or self.base_target_fps
-        
-        logging.info(
-            "Restarting capture for %s after stale frames", self.camera_stream_link
-        )
-        
-        # Stop old worker and verify it stopped
-        try:
-            old_worker.stop()
-        except Exception:
-            logging.exception("Error stopping old worker for %s", self.camera_stream_link)
-        
-        # Verify old worker is actually stopped before creating new one
-        if old_worker.isRunning():
-            logging.error(
-                "Old worker for %s still running after stop() - potential resource leak",
-                self.camera_stream_link
-            )
-            # Don't create a new worker if old one is still running
-            # This prevents resource conflicts
-            return
-
-        self._dispose_worker(old_worker)
-        
-        # camera_stream_link is guaranteed to be set if capture_enabled is True
-        if self.camera_stream_link is None:
-            return
-        
-        self.worker = CaptureWorker(
-            self.camera_stream_link,
-            parent=self,
-            target_fps=target_fps,
-            capture_width=cap_w,
-            capture_height=cap_h,
-        )
-        self.worker.frame_ready.connect(self.on_frame)
-        self.worker.status_changed.connect(self.on_status_changed)
-        self.worker.start()
-        self._render_placeholder("CONNECTING...")
-
-    def _log_status(self) -> None:
-        """Periodic status log for observability."""
-        if self.settings_mode:
-            return
-        if self.camera_stream_link is None:
-            return
-        now = time.time()
-        if (now - self._last_status_log_ts) < self._last_status_log_interval_sec:
-            return
-        self._last_status_log_ts = now
-        format_fourcc = "unknown"
-        if self.worker is not None:
-            format_fourcc = self.worker.get_fourcc()
-        logging.info(
-            "Camera %s status online=%s fps=%.1f ui_fps=%d fourcc=%s",
-            self.camera_stream_link,
-            "yes" if self._latest_frame is not None else "no",
-            float(self.current_target_fps or 0),
-            int(self.ui_render_fps or 0),
-            format_fourcc,
-        )
-
-    def set_night_mode(self, enabled: bool) -> None:
-        """Enable or disable night mode rendering."""
-        self.night_mode_enabled = bool(enabled)
-
-    def set_night_mode_button_label(self, enabled: bool) -> None:
-        """Update settings tile button label for night mode."""
-        if self.settings_mode and hasattr(self, "night_mode_button"):
-            label = "Nightmode: On" if enabled else "Nightmode: Off"
-            self.night_mode_button.setText(label)
-
-    def set_brightness(self, value: float) -> None:
-        """Apply brightness multiplier to camera output (1.0 = default, <1.0 = darker, >1.0 = brighter)."""
-        self.brightness = max(0.5, min(3.0, value))
-        # Pre-compute LUT for efficient per-pixel brightness adjustment
-        input_vals = np.arange(256, dtype=np.float32)
-        if self.brightness < 1.0:
-            # Darker: squash the input range to a smaller output range
-            max_out = 255 * self.brightness
-            self._brightness_lut = (input_vals * (max_out / 255.0)).astype(np.uint8)
+        self._last_fullscreen_toggle_ts = now
+        if self.is_fullscreen:
+            self.exit_fullscreen()
         else:
-            # Brighter: amplify then clamp to prevent overflow
-            self._brightness_lut = np.clip(input_vals * self.brightness, 0, 255).astype(np.uint8)
-        # Highlight selected button
-        self._update_brightness_buttons()
+            self.go_fullscreen()
 
-    def _set_brightness_value(self, value: int) -> None:
-        """Convert percentage value (15-150) to brightness factor and apply."""
-        self._current_brightness = value
-        brightness_factor = value / 100.0
-        self.set_brightness(brightness_factor)
-        self._update_brightness_buttons()
-
-    def _update_brightness_buttons(self) -> None:
-        """Highlight the currently selected brightness level."""
-        if not hasattr(self, '_brightness_buttons'):
+    def go_fullscreen(self) -> None:
+        # The overlay is sized to the primary screen explicitly because
+        # showFullScreen alone is not honoured by every compositor.
+        if self.is_fullscreen:
             return
-        btn_style = "QLabel { padding: 8px 12px; margin: 2px; background: #333; color: white; border-radius: 4px; }"
-        selected_style = "QLabel { padding: 8px 12px; margin: 2px; background: #666; color: white; border-radius: 4px; font-weight: bold; }"
-        for val, btn in self._brightness_buttons.items():
-            btn.setStyleSheet(selected_style if val == self._current_brightness else btn_style)
+        if self._fs_overlay is None:
+            self._fs_overlay = FullscreenOverlay(self.exit_fullscreen)
+        screen = QtWidgets.QApplication.primaryScreen()
+        if screen:
+            self._fs_overlay.setGeometry(screen.geometry())
+        self._fs_overlay.showFullScreen()
+        self._fs_overlay.raise_()
+        self._fs_overlay.activateWindow()
+        self.is_fullscreen = True
+        if self._latest_frame is None and not self.settings_mode:
+            self._render_placeholder(self.placeholder_text or PLACEHOLDER_DISCONNECTED)
 
-    def cleanup(self) -> None:
-        """Stop the capture worker thread cleanly."""
-        try:
-            if self.render_timer is not None and self.render_timer.isActive():
-                self.render_timer.stop()
-            if self.ui_timer is not None and self.ui_timer.isActive():
-                self.ui_timer.stop()
-            if self._status_timer is not None and self._status_timer.isActive():
-                self._status_timer.stop()
-
-            worker = self.worker if hasattr(self, "worker") else None
-            if worker:
-                try:
-                    worker.frame_ready.disconnect(self.on_frame)
-                except Exception:
-                    pass
-                try:
-                    worker.status_changed.disconnect(self.on_status_changed)
-                except Exception:
-                    pass
-                try:
-                    worker.stop()
-                except Exception:
-                    logging.debug("Error stopping worker during cleanup", exc_info=True)
-                self._release_current_frame(worker)
-                self._dispose_worker(worker)
-                self.worker = None
-
-            if self._fs_overlay is not None:
-                try:
-                    self._fs_overlay.hide()
-                    self._fs_overlay.setParent(None)
-                    self._fs_overlay.deleteLater()
-                except Exception:
-                    pass
-                self._fs_overlay = None
-                self.is_fullscreen = False
-        except Exception:
-            pass
-
-    def detach_camera(self) -> Optional[int]:
-        """Detach camera from this widget and return to placeholder state.
-        
-        Returns the camera index that was detached, or None if not applicable.
-        """
-        if not self.capture_enabled or self.settings_mode:
-            return None
-        
-        detached_index = self.camera_stream_link
-        
-        # Stop capture worker
-        worker = self.worker
-        if worker:
-            try:
-                worker.stop()
-            except Exception:
-                logging.debug("Error stopping worker during detach", exc_info=True)
-            self._release_current_frame(worker)
-            self._dispose_worker(worker)
-            self.worker = None
-        
-        # Reset to placeholder state
-        self.capture_enabled = False
-        self.camera_stream_link = None
-        if self._latest_frame is not None:
-            self._release_current_frame()
-        self._last_frame_ts = 0.0
-        self._frame_id = 0
-        self._last_rendered_id = -1
-        self._restart_events.clear()
-        self._restart_limit_logged = False
-        
-        # Update display
-        self._render_placeholder(self.placeholder_text or "DISCONNECTED")
-        
-        logging.info("Detached camera %s from widget %s", detached_index, self.widget_id)
-        return detached_index
+    def exit_fullscreen(self) -> None:
+        if not self.is_fullscreen:
+            return
+        if self._fs_overlay:
+            self._fs_overlay.hide()
+        self.is_fullscreen = False

@@ -22,7 +22,7 @@ The software has been field-deployed for daily blind-spot monitoring use on carg
 - Long-press tile swapping for rearranging the display.
 - Runtime camera rescanning for hot-plug workflows.
 - Stale-frame detection and bounded capture-worker restart attempts.
-- Optional OpenCV GStreamer capture path with V4L2 fallback.
+- V4L2 capture through OpenCV, preferring MJPG and falling back to YUYV.
 - Dynamic software FPS throttling based on CPU load and thermal state.
 - INI configuration with environment variable overrides.
 - User systemd service and desktop shortcut for dedicated installations.
@@ -69,22 +69,11 @@ Note: the current brightness code clamps the effective minimum multiplier to `0.
 
 ## Capture Pipeline
 
-Capture is implemented with OpenCV. When `camera.use_gstreamer = true`, OpenCV has GStreamer support, the host is Linux, and the camera is an integer device index, the app first tries this pipeline:
-
-```text
-v4l2src device=/dev/videoN !
-image/jpeg,width=W,height=H !
-queue max-size-buffers=2 leaky=downstream !
-jpegdec !
-videoconvert !
-appsink drop=1 max-buffers=1 sync=false
-```
-
-If that path is unavailable or fails to open, the app falls back to V4L2 and tries MJPG, YUYV, then automatic format selection.
+Capture is implemented with OpenCV's V4L2 backend. For each camera the app asks for MJPG first (it fits three cameras on a USB 2.0 bus at 640x480), then YUYV, then whatever format the driver picks, and keeps the first one that actually delivers a frame. Each camera runs on its own thread; frames are grabbed at the camera's rate and only the frames that will be shown are decoded.
 
 Important details:
 
-- `jpegdec` is a software JPEG decoder.
+- MJPG decoding is done in software by OpenCV.
 - The current implementation does not use a hardware JPEG decoder.
 - Dynamic FPS changes are software throttling of emitted frames and UI render rate.
 - Runtime FPS changes do not reconfigure the camera device FPS after opening.
@@ -102,11 +91,9 @@ Runtime:
 
 Optional but recommended:
 
-- OpenCV built with GStreamer support when `camera.use_gstreamer = true`.
-- GStreamer 1.0 packages and good/bad plugins.
 - `v4l-utils` for camera inspection and troubleshooting.
 
-The PyPI `opencv-python` package normally does not include GStreamer support. On Raspberry Pi/Debian systems, this project is intended to use distro OpenCV packages.
+On Raspberry Pi/Debian systems, this project is intended to use the distro OpenCV package.
 
 ## Installation
 
@@ -128,23 +115,38 @@ sudo ./install.sh
 
 The installer:
 
-- Requires `sudo`.
+- Requires `sudo`; installs for the user who invoked it.
+- On Raspberry Pi systems, edits `/boot/firmware/config.txt` (USB current, KMS overlay) and the EEPROM PSU limit. Both edits are idempotent.
 - Installs system packages with `apt`.
 - Uses system Python packages rather than creating `.venv`.
-- Creates `logs/`.
-- Creates `~/Desktop/CameraDashboard.desktop`.
-- Installs and enables a user service named `camera-dashboard.service`.
-- Enables linger for the invoking user.
-- Kills processes currently using `/dev/video*`.
-- Stops/disables common camera-holding services such as ZoneMinder, Motion, and mjpeg-streamer.
-- On Raspberry Pi systems, may edit `/boot/firmware/config.txt` and EEPROM power settings.
+- Kills processes currently using `/dev/video*` and stops/disables common camera-holding services such as ZoneMinder, Motion, and mjpeg-streamer.
+- Adds the user to the `video` group.
+- Creates `logs/` and `~/Desktop/CameraDashboard.desktop`.
+- Runs `setup-service.sh` to install and enable the user service (see below).
+- Opens camera 0 once as a smoke test.
 - Reboots the machine at the end.
 
-Skip package update/upgrade if needed:
+Options:
 
 ```bash
-sudo ./install.sh --skip-update
+sudo ./install.sh --skip-update    # skip apt update/upgrade
+sudo ./install.sh --no-service     # everything except the systemd service
+sudo ./install.sh --no-reboot      # do not reboot at the end
 ```
+
+### Systemd Service Only
+
+The service setup is its own script, so it can be redone without a full reinstall, for example after moving the checkout or changing the user:
+
+```bash
+sudo ./setup-service.sh                 # install for the invoking user
+./setup-service.sh                      # as the target user, without sudo
+sudo ./setup-service.sh --user alice    # install for another user
+./setup-service.sh --print-unit         # show the unit file it would write
+sudo ./setup-service.sh --remove        # stop, disable, and delete the unit
+```
+
+It writes `~/.config/systemd/user/camera-dashboard.service`, enables linger for the user (root only; without it the service starts at login rather than at boot), reloads the user manager, and enables the unit.
 
 To disable onboard Wi-Fi and Bluetooth on a Raspberry Pi (optional, separate from install):
 
@@ -225,7 +227,6 @@ rescan_interval_ms = 15000
 failed_camera_cooldown_sec = 30.0
 slot_count = 3
 kill_device_holders = true
-use_gstreamer = true
 
 [profile]
 capture_width = 640
@@ -247,15 +248,20 @@ blindspot_monitoring/
 ├── core/
 │   ├── camera.py
 │   ├── config.py
-│   └── performance.py
+│   ├── performance.py
+│   ├── recovery.py
+│   └── throttle.py
 ├── ui/
 │   ├── layout.py
+│   ├── render.py
 │   └── widgets.py
 ├── utils/
 │   └── helpers.py
+├── benchmarks/
 ├── tests/
 ├── config.ini
 ├── install.sh
+├── setup-service.sh
 ├── disable.sh
 ├── requirements.txt
 └── test.sh
@@ -267,9 +273,23 @@ The repository includes unit tests and a helper script. The helper script expect
 
 ```bash
 python3 -m venv --system-site-packages .venv
+./test.sh                 # installs pytest and pytest-qt into the venv on first run
+./test.sh -k config       # pytest arguments pass through
+```
+
+Or run pytest directly after activating the venv:
+
+```bash
 source .venv/bin/activate
 pip install pytest pytest-qt
 python3 -m pytest tests/
+```
+
+Two benchmark scripts help judge a machine before changing the profile. The first times the render path per frame; the second runs a real capture loop against a camera and reports source rate, emitted rate, and CPU.
+
+```bash
+QT_QPA_PLATFORM=offscreen python3 benchmarks/bench_render.py --tiles 3 --ui-fps 20
+python3 benchmarks/bench_capture.py --device 0 --seconds 10
 ```
 
 ## Troubleshooting
@@ -288,18 +308,13 @@ Test a camera directly:
 ffplay /dev/video0
 ```
 
-Test a similar GStreamer path:
+List the formats and frame rates a camera offers:
 
 ```bash
-gst-launch-1.0 v4l2src device=/dev/video0 ! jpegdec ! videoconvert ! autovideosink
+v4l2-ctl --device=/dev/video0 --list-formats-ext
 ```
 
-Disable the GStreamer capture path:
-
-```ini
-[camera]
-use_gstreamer = false
-```
+Confirm what a camera settled on at `INFO` level: look for `format 640x480 @ 25.0 FPS (V4L2)` and `fourcc=MJPG` in the log.
 
 Check logs:
 

@@ -1,7 +1,10 @@
 """
-Utility functions for Camera Dashboard.
+Process helpers: evicting whatever holds a camera, and the health log.
 
-Includes system helpers and process management.
+Eviction exists for kiosk deployments where the previous dashboard
+instance (or a stray ffmpeg/motion process) still holds /dev/videoN after a
+crash. It is gated by ``camera.kill_device_holders`` in config.ini and only
+used by the boot-time discovery pass, never by the runtime rescan.
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ def run_cmd(cmd: str, timeout: int = 2) -> tuple[str, str, int]:
 
 
 def get_pids_from_lsof(device_path: str) -> set[int]:
-    """Get PIDs holding device using lsof."""
+    """Get PIDs holding device using lsof (preferred: one PID per line)."""
     out, _, code = run_cmd(f"lsof -t {device_path}")
     if code != 0 or not out:
         return set()
@@ -47,7 +50,11 @@ def get_pids_from_lsof(device_path: str) -> set[int]:
 
 
 def get_pids_from_fuser(device_path: str) -> set[int]:
-    """Get PIDs holding device using fuser."""
+    """Get PIDs holding device using fuser (fallback when lsof is absent).
+
+    fuser's output format varies by version and mixes PIDs with access
+    letters ("1234m"), so every digit run is taken as a PID.
+    """
     out, _, code = run_cmd(f"fuser -v {device_path}")
     if code != 0 or not out:
         return set()
@@ -80,12 +87,17 @@ def kill_device_holders(device_path: str, grace: float = 0.4) -> bool:
     if not pids:
         pids = get_pids_from_fuser(device_path)
 
+    # Never kill ourselves: after a settings-tile restart the new process has
+    # the same PID as the one that opened the device.
     pids.discard(os.getpid())
     if not pids:
         return False
 
     logging.info("Killing holders of %s: %s", device_path, sorted(pids))
 
+    # SIGTERM first, then SIGKILL after a grace period for anything that
+    # ignored it. A holder owned by another user needs sudo; fuser -k covers
+    # every holder at once, so one call is enough.
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)
@@ -116,14 +128,15 @@ def log_health_summary(
     failed_indexes: dict[int, float],
     stale_threshold_sec: float = 10.0,
 ) -> None:
-    """Log a health summary of all cameras.
-    
-    Args:
-        camera_widgets: List of active camera widgets
-        placeholder_slots: List of placeholder widgets
-        active_indexes: Set of active camera indexes
-        failed_indexes: Dict mapping failed camera indexes to failure timestamps
-        stale_threshold_sec: Seconds after which a frame is considered stale
+    """Log a one-line health summary of all cameras.
+
+    Reads the tiles' ``_latest_frame``, ``_last_frame_ts`` and ``worker``
+    directly. That coupling is deliberate: this is the operator's view of
+    the same state the tile uses, and a separate "health" API would drift.
+
+    ``stale_threshold_sec`` is intentionally looser than the tile's own
+    STALE_FRAME_TIMEOUT_SEC: the tile reacts to a 1.5 s gap, this line only
+    reports gaps the tile failed to recover from.
     """
     now = time.time()
     online = 0

@@ -1,7 +1,13 @@
 """
-Performance monitoring for Camera Dashboard.
+System stress inputs for the dynamic-FPS controller.
 
-Handles CPU load and temperature monitoring.
+Two signals, either of which counts as stress: the 1-minute load average
+normalised by core count, and the CPU temperature. Both are cheap reads
+(one libc call, one sysfs file) and run every PERF_CHECK_INTERVAL_MS on the
+UI thread. Note the load average's one-minute time constant: it lags a
+burst of work by tens of seconds, which is why the controller also needs
+STRESS_HOLD_COUNT consecutive samples before acting; a /proc/stat delta would
+be a faster signal.
 """
 
 from __future__ import annotations
@@ -24,6 +30,10 @@ def read_cpu_load_ratio() -> Optional[float]:
 
 def read_cpu_temp_c() -> Optional[float]:
     """Read CPU temperature in Celsius if the system exposes it."""
+    # thermal_zone0 is the SoC sensor on every Raspberry Pi; the hwmon path
+    # covers generic x86 boards used for bench testing. Both report
+    # millidegrees, hence the /1000 below (guarded, since a few drivers
+    # report whole degrees).
     paths = [
         "/sys/class/thermal/thermal_zone0/temp",
         "/sys/class/hwmon/hwmon0/temp1_input",
