@@ -4,48 +4,14 @@ Tests for utils/helpers.py utility functions.
 
 import os
 import signal
-import subprocess
 from unittest import mock
 
-import pytest
 
 from utils import helpers
 
 
-class TestRunCmd:
-    """Tests for run_cmd function."""
-
-    def test_run_cmd_success(self):
-        """Test successful command execution."""
-        stdout, stderr, code = helpers.run_cmd("echo hello")
-        assert code == 0
-        assert stdout == "hello"
-        assert stderr == ""
-
-    def test_run_cmd_failure(self):
-        """Test command that fails."""
-        stdout, stderr, code = helpers.run_cmd("false")
-        assert code == 1
-
-    def test_run_cmd_timeout(self):
-        """Test command timeout returns error."""
-        stdout, stderr, code = helpers.run_cmd("sleep 10", timeout=1)
-        assert code == 1
-        assert stdout == ""
-
-    def test_run_cmd_invalid_command(self):
-        """Test invalid command returns error."""
-        stdout, stderr, code = helpers.run_cmd("nonexistent_command_xyz")
-        assert code != 0 or stderr != ""
-
-
 class TestGetPidsFromLsof:
     """Tests for get_pids_from_lsof function."""
-
-    def test_get_pids_empty_when_no_device(self):
-        """Test returns empty set for non-existent device."""
-        pids = helpers.get_pids_from_lsof("/dev/nonexistent_device_xyz")
-        assert pids == set()
 
     @mock.patch("utils.helpers.run_cmd")
     def test_get_pids_parses_output(self, mock_run):

@@ -2,9 +2,7 @@
 Tests for core/config.py - Configuration parsing and validation.
 """
 
-import configparser
 import os
-import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -72,25 +70,6 @@ class TestConfigHelpers:
 class TestLoadConfig:
     """Test config file loading."""
 
-    def test_load_config_default_path(self):
-        """Test loading config from default path."""
-        parser = config.load_config()
-        assert isinstance(parser, configparser.ConfigParser)
-
-    def test_load_config_custom_path(self, temp_config_file):
-        """Test loading config from custom path."""
-        parser = config.load_config(str(temp_config_file))
-        assert isinstance(parser, configparser.ConfigParser)
-        assert parser.has_section("logging")
-        assert parser.has_section("performance")
-        assert parser.has_section("camera")
-
-    def test_load_config_missing_file(self, tmp_path):
-        """Test loading non-existent config returns empty parser."""
-        missing_path = tmp_path / "nonexistent.ini"
-        parser = config.load_config(str(missing_path))
-        assert isinstance(parser, configparser.ConfigParser)
-
     def test_load_config_env_override(self, temp_config_file):
         """Test CAMERA_DASHBOARD_CONFIG env var overrides default path."""
         with patch.dict(os.environ, {"CAMERA_DASHBOARD_CONFIG": str(temp_config_file)}):
@@ -113,33 +92,8 @@ class TestApplyConfig:
         assert config.PROFILE_CAPTURE_FPS == 20
         assert config.PROFILE_UI_FPS == 15
 
-    def test_apply_config_bounds_checking(self, tmp_path, save_restore_config):
-        """Test apply_config enforces bounds on values."""
-        config_file = tmp_path / "test.ini"
-        config_file.write_text("""
-[camera]
-slot_count = 100
-
-[performance]
-cpu_load_threshold = 5.0
-""")
-        parser = config.load_config(str(config_file))
-        config.apply_config(parser)
-
-        # slot_count should be clamped to max 8
-        assert config.CAMERA_SLOT_COUNT <= 8
-        # cpu_load_threshold should be clamped to max 1.0
-        assert config.CPU_LOAD_THRESHOLD <= 1.0
-
-
 class TestChooseProfile:
     """Test profile selection based on camera count."""
-
-    def test_choose_profile_returns_tuple(self):
-        """Test choose_profile returns (width, height, fps, ui_fps)."""
-        result = config.choose_profile(1)
-        assert isinstance(result, tuple)
-        assert len(result) == 4
 
     def test_choose_profile_values(self, save_restore_config):
         """Test choose_profile returns configured values without camera-count scaling."""

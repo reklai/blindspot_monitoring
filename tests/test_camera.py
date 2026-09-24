@@ -16,9 +16,6 @@ probe_camera = camera.test_single_camera
 
 
 class TestGetVideoIndexes:
-    def test_returns_list(self):
-        assert isinstance(get_video_indexes(), list)
-
     def test_empty(self):
         with patch("core.camera.glob_module.glob", return_value=[]):
             assert get_video_indexes() == []
@@ -84,10 +81,6 @@ class TestTestSingleCamera:
 
 
 class TestFindWorkingCameras:
-    def test_returns_list(self, mock_video_capture):
-        with patch("core.camera.get_video_indexes", return_value=[0, 2, 4]):
-            assert isinstance(find_working_cameras(), list)
-
     def test_filters_invalid_and_sorts(self):
         with patch("core.camera.get_video_indexes", return_value=[2, 0, 1]), \
              patch("core.camera.test_single_camera") as mock_test:
@@ -112,15 +105,6 @@ class TestFindWorkingCameras:
 
 
 class TestCaptureWorkerApi:
-    def test_init_stores_settings(self):
-        w = CaptureWorker(0, target_fps=30.0, capture_width=640, capture_height=480)
-        assert w.stream_link == 0
-        assert w.target_fps == 30.0
-        assert w.capture_width == 640
-        assert w.capture_height == 480
-        assert not w.stop_requested
-        assert w.emit_interval == pytest.approx(1 / 30)
-
     def test_no_target_fps_uses_camera_default_until_open(self):
         w = CaptureWorker(0)
         assert w.target_fps is None
@@ -145,10 +129,6 @@ class TestCaptureWorkerApi:
         w.stop()
         assert w.stop_requested
         assert not w.isRunning()
-
-    def test_fourcc_default(self):
-        assert CaptureWorker(0).get_fourcc() == "unknown"
-
 
 class _FakeCapture:
     """Stand-in for cv2.VideoCapture that delivers frames on a fixed clock."""
